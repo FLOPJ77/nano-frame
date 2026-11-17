@@ -12,3 +12,4 @@ agent.py-ori
 agent-[0-9]*.py
 index.html
 chips.json
+settings.json

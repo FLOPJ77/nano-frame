@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,11 +71,13 @@ init_stdio()
 SOUL_FILE = DATA_DIR / "soul.md"
 CHATS_DIR = DATA_DIR / "chats"
 CHIPS_FILE = DATA_DIR / "chips.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_CHIPS = [
     {"label": "Check CPU, RAM & disk", "prompt": "Check my CPU, RAM, GPU, and free disk space on this PC"},
     {"label": "Check Downloads", "prompt": "List the largest files in my Downloads folder"},
     {"label": "Explain a command", "prompt": "How do I compress a folder with tar and gzip?"},
 ]
+DEFAULT_SETTINGS = {"default_model": "", "sound": "chime"}
 
 
 def seed_soul_if_missing():
@@ -95,6 +98,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/"
 OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
 OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
 OLLAMA_PULL_URL = f"{OLLAMA_HOST}/api/pull"
+OLLAMA_DELETE_URL = f"{OLLAMA_HOST}/api/delete"
 OLLAMA_PS_URL = f"{OLLAMA_HOST}/api/ps"
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3")
 NUM_CTX = int(os.environ.get("AGENT_CTX", "16384"))
@@ -104,7 +108,7 @@ MAX_HISTORY = 16
 MAX_HISTORY_CHARS = 28000
 MAX_STEPS = 8
 
-PRESET_MODELS = ["lfm3", "granite4.2", "gemma4", "qwen3.5", "lfm3-uncensored"]
+PRESET_MODELS = ["lfm3", "granite4.2", "gemma4", "qwen3.5"]
 OLLAMA_LOCK = threading.Lock()
 SERVER_REF = {"server": None}
 
@@ -296,20 +300,42 @@ def find_ollama_executable() -> str:
     return ""
 
 
-def probe_ollama() -> tuple:
+def normalize_model_name(name: str) -> str:
+    n = (name or "").strip()
+    return n[:-7] if n.endswith(":latest") else n
+
+
+def probe_ollama_detailed() -> tuple:
     installed = []
+    details_list = []
+    seen = set()
     try:
         with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=2.5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             for m in data.get("models", []):
-                name = m.get("name", "")
-                if name.endswith(":latest"):
-                    name = name[:-7]
-                if name and name not in installed:
-                    installed.append(name)
-        return True, installed
+                raw_name = str(m.get("name") or "").strip()
+                name = normalize_model_name(raw_name)
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                installed.append(name)
+                det = m.get("details") if isinstance(m.get("details"), dict) else {}
+                details_list.append({
+                    "name": name,
+                    "raw_name": raw_name,
+                    "size": int(m.get("size") or 0),
+                    "modified_at": str(m.get("modified_at") or ""),
+                    "parameter_size": str(det.get("parameter_size") or ""),
+                    "quantization": str(det.get("quantization_level") or ""),
+                })
+        return True, installed, details_list
     except Exception:
-        return False, []
+        return False, [], []
+
+
+def probe_ollama() -> tuple:
+    running, installed, _ = probe_ollama_detailed()
+    return running, installed
 
 
 def try_start_ollama() -> bool:
@@ -349,14 +375,19 @@ def try_start_ollama() -> bool:
 
 
 def get_models_info() -> dict:
-    running, installed = probe_ollama()
+    running, installed, installed_details = probe_ollama_detailed()
+    settings = load_settings()
+    saved_default = settings.get("default_model", "").strip()
+
     merged = list(installed)
     for p in PRESET_MODELS:
         if not any(m == p or m.startswith(p + ":") for m in merged):
             merged.append(p)
+    if saved_default and not any(m == saved_default or m.startswith(saved_default + ":") for m in merged):
+        merged.insert(0, saved_default)
 
-    active_default = DEFAULT_MODEL
-    if "AGENT_MODEL" not in os.environ and installed:
+    active_default = saved_default or DEFAULT_MODEL
+    if not saved_default and "AGENT_MODEL" not in os.environ and installed:
         if not any(m == DEFAULT_MODEL or m.startswith(DEFAULT_MODEL + ":") for m in installed):
             active_default = installed[0]
 
@@ -364,6 +395,7 @@ def get_models_info() -> dict:
         "ollama_running": running,
         "has_ollama_bin": bool(find_ollama_executable()),
         "installed": installed,
+        "installed_details": installed_details,
         "models": merged,
         "default_model": active_default,
         "os": os_label(),
@@ -544,6 +576,30 @@ def stream_pull_model(model_name: str, emit, cancel_check=None):
             emit(ev)
             if ev.get("status") == "success":
                 break
+
+
+def delete_ollama_model(model_name: str):
+    req = urllib.request.Request(
+        OLLAMA_DELETE_URL,
+        data=json.dumps({"name": model_name}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "ignore").strip()
+        except Exception:
+            pass
+        raise RuntimeError(body or f"Ollama HTTP {e.code}")
+
+    settings = load_settings()
+    if normalize_model_name(settings.get("default_model", "")) == normalize_model_name(model_name):
+        settings["default_model"] = ""
+        save_settings(settings)
 
 
 # --- CORE AGENT LOOP ---
@@ -764,6 +820,36 @@ def save_chips(items: list) -> list:
     return cleaned
 
 
+VALID_SOUNDS = ("chime", "ping", "double", "chord", "off")
+
+
+def load_settings() -> dict:
+    out = dict(DEFAULT_SETTINGS)
+    if SETTINGS_FILE.exists():
+        try:
+            raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                dm = str(raw.get("default_model", "")).strip()[:120]
+                snd = str(raw.get("sound", "chime")).strip().lower()
+                out["default_model"] = dm
+                out["sound"] = snd if snd in VALID_SOUNDS else "chime"
+        except Exception:
+            pass
+    return out
+
+
+def save_settings(data: dict) -> dict:
+    cur = load_settings()
+    if isinstance(data, dict):
+        if "default_model" in data:
+            cur["default_model"] = str(data.get("default_model") or "").strip()[:120]
+        if "sound" in data:
+            snd = str(data.get("sound") or "chime").strip().lower()
+            cur["sound"] = snd if snd in VALID_SOUNDS else "chime"
+    SETTINGS_FILE.write_text(json.dumps(cur, indent=2, ensure_ascii=False), encoding="utf-8")
+    return cur
+
+
 # --- CHAT STORAGE ---
 def ensure_chats_dir():
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
@@ -858,7 +944,7 @@ WEB_HTML = r"""<!doctype html>
   svg { display: block; flex-shrink: 0; }
 
   .m-mark {
-    display: inline-grid; grid-template-rows: repeat(5, 1fr); gap: 1.5px;
+    display: inline-grid; grid-template-rows: repeat(5, 1fr); gap: 2px;
     width: 18px; height: 18px; flex-shrink: 0;
   }
   .m-mark span { display: block; border-radius: 1px; background: var(--white); }
@@ -879,6 +965,7 @@ WEB_HTML = r"""<!doctype html>
     display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
   }
   .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 14px; color: var(--white); }
+  .brand-slot { width: 18px; height: 18px; display: grid; place-items: center; flex-shrink: 0; }
   .side-actions { padding: 10px 10px 6px; display: flex; gap: 6px; }
 
   button {
@@ -952,22 +1039,24 @@ WEB_HTML = r"""<!doctype html>
   }
   .icon-btn:hover { background: var(--surface); color: var(--white); border-color: var(--border); }
 
-  /* Model Dropdown */
+  /* Model Dropdown & Symmetrical Header Pills */
   .model-wrap { position: relative; }
-  .model-pill {
-    display: inline-flex; align-items: center; gap: 8px; font-size: 13px;
+  .model-pill, .tools-pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    height: 30px; padding: 0 11px; border-radius: 999px;
+    font-size: 13px; line-height: 1;
     background: var(--surface); border: 1px solid var(--border);
-    padding: 5px 10px 5px 11px; border-radius: 999px; color: var(--white);
   }
+  .model-pill { color: var(--white); }
   .model-pill:hover { border-color: rgba(255,255,255,0.4); }
+  .dot-live, .tools-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
   .dot-live {
-    width: 7px; height: 7px; border-radius: 50%;
     background: var(--m-3); box-shadow: 0 0 3px var(--m-glow);
     opacity: 0.9; transition: background 0.2s, box-shadow 0.2s;
   }
   .caret-svg { color: var(--muted); transition: transform 0.15s; }
   .model-menu {
-    position: absolute; top: calc(100% + 6px); left: 0; min-width: 230px;
+    position: absolute; top: calc(100% + 6px); left: 0; min-width: 235px;
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
     padding: 5px; display: none; flex-direction: column; gap: 2px;
     box-shadow: 0 10px 30px rgba(0,0,0,0.55); z-index: 30;
@@ -982,15 +1071,14 @@ WEB_HTML = r"""<!doctype html>
   .model-opt-left { display: flex; align-items: center; gap: 8px; }
   .opt-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
   .opt-right { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+  .model-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+  .model-add { color: var(--muted); }
+  .model-add:hover { color: var(--white); }
 
   .head-right { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
-  .tools-pill {
-    font-size: 12px; padding: 4px 10px; border-radius: 999px;
-    background: var(--surface); border: 1px solid var(--border); color: var(--muted);
-    display: inline-flex; align-items: center; gap: 6px;
-  }
+  .tools-pill { color: var(--muted); }
   .tools-pill.on { color: var(--white); border-color: rgba(255,255,255,0.28); }
-  .tools-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+  .tools-dot { background: var(--muted); transition: background 0.15s; }
   .tools-pill.on .tools-dot { background: #4ade80; }
   .ctx-badge {
     font-family: var(--font-mono); font-size: 11px; color: var(--muted);
@@ -1250,45 +1338,129 @@ WEB_HTML = r"""<!doctype html>
   #send-btn.stopping { border-color: var(--white); background: rgba(255, 255, 255, 0.08); }
   .hint { max-width: 760px; margin: 6px auto 0; text-align: center; font-size: 11px; color: var(--muted); }
 
-  /* Modals (Soul & Quick Buttons) */
-  #soul-modal, #chips-modal {
+  /* Modals (Soul, Quick Buttons, Settings, Pull Model, Manage Models) */
+  #soul-modal, #chips-modal, #settings-modal, #pull-modal, #models-modal {
     position: fixed; inset: 0; background: rgba(0,0,0,0.72); display: none;
     align-items: center; justify-content: center; padding: 20px; z-index: 40;
   }
-  #soul-box, #chips-box {
+  #soul-box, #chips-box, #settings-box, #pull-box, #models-box {
     width: 100%; max-width: 640px; background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 12px;
+    border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 14px;
   }
+  #settings-box { max-width: 480px; }
+  #pull-box { max-width: 440px; }
+  #models-box { max-width: 560px; }
   #soul-text {
     width: 100%; height: 280px; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 8px; padding: 12px;
     font-family: var(--font-mono); font-size: 13px; line-height: 1.5; resize: vertical;
   }
-  #chips-rows { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }
+  #chips-rows, #models-rows { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }
+  .model-mgr-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 9px;
+  }
+  .model-mgr-info { min-width: 0; display: flex; flex-direction: column; gap: 3px; flex: 1; }
+  .model-mgr-title { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--white); font-weight: 500; min-width: 0; }
+  .model-mgr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .model-mgr-tag {
+    font-size: 10px; padding: 1px 6px; border-radius: 999px;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted); flex-shrink: 0;
+  }
+  .model-mgr-meta { font-size: 11px; color: var(--muted); padding-left: 15px; }
+  .model-mgr-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .model-mgr-actions button { padding: 5px 10px; font-size: 12px; }
+  .btn-danger-arm { border-color: rgba(255, 77, 77, 0.7) !important; color: #ff8080 !important; background: rgba(255, 77, 77, 0.12) !important; }
+  .models-status-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 18px; font-size: 12px; color: var(--muted); }
   .chip-edit-row { display: grid; grid-template-columns: 160px 1fr auto; gap: 8px; align-items: center; }
-  .chip-edit-row input {
+  .chip-edit-row input, #pull-input, .setting-ctrl select {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 7px; padding: 7px 10px; font: inherit; font-size: 13px; min-width: 0;
   }
-  .chip-edit-row input:focus { outline: none; border-color: rgba(255,255,255,0.45); }
+  .chip-edit-row input:focus, #pull-input:focus, .setting-ctrl select:focus {
+    outline: none; border-color: rgba(255,255,255,0.45);
+  }
+  .setting-row {
+    display: grid; grid-template-columns: minmax(0, 1fr) 215px;
+    align-items: center; gap: 14px;
+  }
+  .setting-meta { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .setting-meta b { font-size: 13px; color: var(--white); font-weight: 500; }
+  .setting-meta span { font-size: 11px; color: var(--muted); }
+  .setting-ctrl { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
+  .setting-ctrl select { flex: 1; width: 100%; max-width: 215px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chip-del { padding: 6px 9px; color: var(--muted); }
   .modal-row { display: flex; justify-content: flex-end; gap: 8px; }
   .modal-split { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
   .btn-white { background: var(--white); color: #111; border: none; font-weight: 600; }
   .btn-white:hover { background: #e4e4e7; }
 
+  /* Startup Splash Overlay */
+  #splash-overlay {
+    position: fixed; inset: 0; z-index: 100; background: #050506;
+    display: grid; place-items: center;
+    transition: background 0.8s ease, opacity 0.45s ease;
+  }
+  #splash-overlay.fading { background: transparent; pointer-events: none; }
+  .splash-stage { position: relative; width: 84px; height: 84px; display: grid; place-items: center; }
+  .splash-glide {
+    width: 45px; height: 45px; display: grid; place-items: center;
+    transform-origin: center center;
+  }
+  #splash-overlay #brand-mark {
+    width: 100%; height: 100%; gap: 5px;
+    transform-origin: center center;
+    animation: spinLinesMark 2.2s ease-in-out forwards;
+  }
+  #splash-overlay #brand-mark span {
+    border-radius: 2.5px;
+    transform-origin: left center;
+    animation: extendLine 1.75s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  #splash-overlay #brand-mark span:nth-child(1) { animation-delay: 0.08s; }
+  #splash-overlay #brand-mark span:nth-child(2) { animation-delay: 0.16s; }
+  #splash-overlay #brand-mark span:nth-child(3) { animation-delay: 0.24s; }
+  #splash-overlay #brand-mark span:nth-child(4) { animation-delay: 0.32s; }
+  #splash-overlay #brand-mark span:nth-child(5) { animation-delay: 0.40s; }
+  @keyframes spinLinesMark {
+    0%   { opacity: 0; transform: rotate(-90deg) scale(1.08); }
+    18%  { opacity: 1; transform: rotate(-90deg) scale(1.08); animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1); }
+    82%  { opacity: 1; transform: rotate(0deg)   scale(1.02); animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1); }
+    100% { opacity: 1; transform: rotate(0deg)   scale(1.00); }
+  }
+  @keyframes extendLine {
+    0%   { transform: scaleX(0.35); }
+    62%  { transform: scaleX(1.05); }
+    100% { transform: scaleX(1.00); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #splash-overlay, #splash-overlay * { animation: none !important; transition: none !important; }
+  }
+
   @media (max-width: 720px) {
     aside { position: fixed; top: 0; bottom: 0; left: 0; z-index: 25; }
     .ctx-badge { display: none; }
-    .chip-edit-row { grid-template-columns: 1fr; }
+    .chip-edit-row, .setting-row { grid-template-columns: 1fr; }
+    .setting-ctrl { justify-content: flex-start; }
+    .setting-ctrl select { max-width: none; }
+    .model-mgr-row { flex-direction: column; align-items: stretch; }
+    .model-mgr-actions { justify-content: flex-end; }
   }
 </style>
 </head>
 <body>
+  <div id="splash-overlay" aria-hidden="true">
+    <div class="splash-stage">
+      <div class="splash-glide" id="splash-glide">
+        <div class="m-mark" id="brand-mark"><span></span><span></span><span></span><span></span><span></span></div>
+      </div>
+    </div>
+  </div>
+
   <aside id="sidebar">
     <div class="side-head">
       <div class="brand">
-        <div class="m-mark"><span></span><span></span><span></span><span></span><span></span></div>
+        <div class="brand-slot" id="brand-slot"></div>
         <span>local agent</span>
       </div>
     </div>
@@ -1308,7 +1480,7 @@ WEB_HTML = r"""<!doctype html>
     <header>
       <div class="head-left">
         <button class="icon-btn" onclick="toggleSidebar()" title="Toggle sidebar">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
         </button>
         <div class="model-wrap">
           <button type="button" class="model-pill" id="model-btn" onclick="toggleModelMenu(event)">
@@ -1325,6 +1497,9 @@ WEB_HTML = r"""<!doctype html>
       </div>
       <div class="head-right">
         <span id="ctx-badge" class="ctx-badge" title="Context tokens used in this chat">ctx 0 / __CTX_K__</span>
+        <button type="button" class="icon-btn" onclick="openSettings()" title="Settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
       </div>
     </header>
 
@@ -1397,12 +1572,91 @@ WEB_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <div id="settings-modal">
+    <div id="settings-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>Settings</b>
+        <span style="color:var(--muted);font-size:12px;">Saved locally</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-meta">
+          <b>Default model</b>
+          <span>Used when opening a new session</span>
+        </div>
+        <div class="setting-ctrl">
+          <select id="set-default-model"></select>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-meta">
+          <b>Response sound</b>
+          <span>Plays when window is out of focus</span>
+        </div>
+        <div class="setting-ctrl">
+          <select id="set-sound">
+            <option value="chime">Chime</option>
+            <option value="ping">Ping</option>
+            <option value="double">Double tap</option>
+            <option value="chord">Warm chord</option>
+            <option value="off">Off</option>
+          </select>
+          <button type="button" onclick="testSound()">Test</button>
+        </div>
+      </div>
+      <div class="modal-split">
+        <button type="button" onclick="closeSettings(); openModelsModal();">Manage models...</button>
+        <div class="modal-row">
+          <button type="button" onclick="closeSettings()">Cancel</button>
+          <button type="button" class="btn-white" onclick="saveSettings()">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="pull-modal">
+    <div id="pull-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>Download Ollama model</b>
+        <span style="color:var(--muted);font-size:12px;">LFM · Granite · Gemma · Qwen</span>
+      </div>
+      <input id="pull-input" type="text" placeholder="Model tag, e.g. gemma4, qwen3.5:9b, granite4.2..." onkeydown="if(event.key==='Enter'){event.preventDefault();submitPullModal();}" />
+      <div class="modal-row">
+        <button type="button" onclick="closePullModal()">Cancel</button>
+        <button type="button" class="btn-white" onclick="submitPullModal()">Download</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="models-modal">
+    <div id="models-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <b>Manage installed models</b>
+        <span id="models-summary" style="color:var(--muted);font-size:12px;"></span>
+      </div>
+      <div class="models-status-row" id="models-status-row" style="display:none;">
+        <span id="models-status-text"></span>
+        <div class="pull-bar" id="models-pull-bar" style="width:160px;"><div class="pull-fill" id="models-pull-fill"></div></div>
+      </div>
+      <div id="models-rows"></div>
+      <div class="modal-split">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button type="button" id="models-update-all-btn" onclick="updateAllModels()">Update all</button>
+          <button type="button" onclick="closeModelsModal(); openPullModal();">+ Download model</button>
+        </div>
+        <div class="modal-row">
+          <button type="button" class="btn-white" onclick="closeModelsModal()">Done</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
 <script>
 const MAX_CTX = __NUM_CTX__;
 let currentChatId = null;
 let currentModel = "__MODEL__";
 let availableModels = ["__MODEL__"];
 let installedModels = [];
+let installedModelDetails = [];
 let ollamaRunning = true;
 let pullingModel = false;
 let toolsEnabled = localStorage.getItem("local_agent_tools") !== "0";
@@ -1416,18 +1670,16 @@ const SVG_CLOSE    = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none
 const SVG_CHECK    = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>`;
 
 const MODEL_PALETTES = {
-  "lfm3-uncensored": ["#ff5252", "#ff2a2a", "#ff1414", "#dc0000", "#a80000"],
-  "lfm3":            ["#ede9fe", "#c4b5fd", "#a78bfa", "#8b5cf6", "#7c3aed"],
-  "granite":         ["#dbeafe", "#93c5fd", "#60a5fa", "#3b82f6", "#2563eb"],
-  "gemma":           ["#e0f2fe", "#7dd3fc", "#38bdf8", "#0ea5e9", "#0284c7"],
-  "qwen":            ["#fae8ff", "#f0abfc", "#e879f9", "#d946ef", "#c026d3"],
+  "lfm":     ["#ede9fe", "#c4b5fd", "#a78bfa", "#8b5cf6", "#7c3aed"],
+  "granite": ["#dbeafe", "#93c5fd", "#60a5fa", "#3b82f6", "#2563eb"],
+  "gemma":   ["#e0f2fe", "#7dd3fc", "#38bdf8", "#0ea5e9", "#0284c7"],
+  "qwen":    ["#fae8ff", "#f0abfc", "#e879f9", "#d946ef", "#c026d3"],
 };
 const DEFAULT_PALETTE = ["#fafafa", "#e4e4e7", "#d4d4d8", "#a1a1aa", "#71717a"];
 
 function getModelPalette(name) {
   const n = (name || "").toLowerCase();
-  if (n.includes("uncensored")) return MODEL_PALETTES["lfm3-uncensored"];
-  if (n.includes("lfm3")) return MODEL_PALETTES["lfm3"];
+  if (n.includes("lfm")) return MODEL_PALETTES["lfm"];
   if (n.includes("granite") || n.includes("ganite")) return MODEL_PALETTES["granite"];
   if (n.includes("gemma")) return MODEL_PALETTES["gemma"];
   if (n.includes("qwen")) return MODEL_PALETTES["qwen"];
@@ -1497,6 +1749,31 @@ function updateSetupBanner() {
   banner.classList.remove("show");
 }
 
+async function streamPullRequest(modelName, onProgress) {
+  const res = await fetch("/api/pull", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: modelName }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const ln of lines) {
+      if (!ln.trim()) continue;
+      const ev = JSON.parse(ln);
+      if (ev.error) throw new Error(ev.error);
+      if (onProgress) onProgress(ev);
+    }
+  }
+}
+
 async function pullModel(modelName) {
   if (pullingModel) return;
   pullingModel = true;
@@ -1513,33 +1790,15 @@ async function pullModel(modelName) {
   textEl.textContent = `Downloading ${modelName}...`;
 
   try {
-    const res = await fetch("/api/pull", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: modelName }),
-    });
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      for (const ln of lines) {
-        if (!ln.trim()) continue;
-        const ev = JSON.parse(ln);
-        if (ev.error) throw new Error(ev.error);
-        if (ev.total && ev.completed) {
-          const pct = Math.min(100, Math.round((ev.completed / ev.total) * 100));
-          fill.style.width = pct + "%";
-          textEl.textContent = `Downloading ${modelName}: ${pct}%`;
-        } else if (ev.status) {
-          textEl.textContent = `${modelName}: ${ev.status}`;
-        }
+    await streamPullRequest(modelName, (ev) => {
+      if (ev.total && ev.completed) {
+        const pct = Math.min(100, Math.round((ev.completed / ev.total) * 100));
+        fill.style.width = pct + "%";
+        textEl.textContent = `Downloading ${modelName}: ${pct}%`;
+      } else if (ev.status) {
+        textEl.textContent = `${modelName}: ${ev.status}`;
       }
-    }
+    });
   } catch (err) {
     textEl.textContent = `Failed to pull ${modelName}: ${err.message || err}`;
     pullingModel = false;
@@ -1547,7 +1806,9 @@ async function pullModel(modelName) {
   }
 
   pullingModel = false;
-  await loadModels();
+  currentModel = modelName;
+  modelChosenByUser = true;
+  await loadModels(false);
 }
 
 function renderToolsToggle() {
@@ -1600,6 +1861,8 @@ function handleSendOrStop() {
   }
 }
 
+let modelChosenByUser = false;
+
 function renderModelMenu() {
   const menu = document.getElementById("model-menu");
   menu.innerHTML = "";
@@ -1620,10 +1883,311 @@ function renderModelMenu() {
     btn.onclick = () => selectModel(m);
     menu.appendChild(btn);
   }
+  const sep = document.createElement("div");
+  sep.className = "model-sep";
+  menu.appendChild(sep);
+
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.className = "model-opt model-add";
+  addBtn.innerHTML = `<span class="model-opt-left"><span>+</span><span>Download new model...</span></span>`;
+  addBtn.onclick = (e) => {
+    e.stopPropagation();
+    menu.classList.remove("open");
+    openPullModal();
+  };
+  menu.appendChild(addBtn);
+
+  const mgrBtn = document.createElement("button");
+  mgrBtn.type = "button";
+  mgrBtn.className = "model-opt model-add";
+  mgrBtn.innerHTML = `<span class="model-opt-left"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9m9-9a9 9 0 0 0-9-9m9 9H3m0 0a9 9 0 0 1 9-9m0 18c-2.5 0-4.5-4-4.5-9S9.5 3 12 3m0 18c2.5 0 4.5-4 4.5-9S14.5 3 12 3"/></svg><span>Manage / update models...</span></span>`;
+  mgrBtn.onclick = (e) => {
+    e.stopPropagation();
+    menu.classList.remove("open");
+    openModelsModal();
+  };
+  menu.appendChild(mgrBtn);
+}
+
+function fmtModelSize(bytes) {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1).replace(/\.0$/, "") + " GB";
+  return Math.max(1, Math.round(bytes / 1e6)) + " MB";
+}
+
+function fmtModelAge(iso) {
+  const ts = Date.parse(iso || "");
+  if (Number.isNaN(ts)) return "";
+  const days = Math.floor(Math.max(0, Date.now() - ts) / 86400000);
+  if (days <= 0) return "updated today";
+  if (days === 1) return "1d old";
+  if (days < 30) return `${days}d old`;
+  if (days < 365) return `${Math.floor(days / 30)}mo old`;
+  return `${Math.floor(days / 365)}y old`;
+}
+
+function setModelsStatus(text, pct = null) {
+  const row = document.getElementById("models-status-row");
+  const txt = document.getElementById("models-status-text");
+  const bar = document.getElementById("models-pull-bar");
+  const fill = document.getElementById("models-pull-fill");
+  if (!text) {
+    row.style.display = "none";
+    bar.classList.remove("show");
+    return;
+  }
+  row.style.display = "flex";
+  txt.textContent = text;
+  if (pct === null) {
+    bar.classList.remove("show");
+  } else {
+    bar.classList.add("show");
+    fill.style.width = Math.min(100, Math.max(0, pct)) + "%";
+  }
+}
+
+let armedDeleteModel = "";
+let armedDeleteTimer = null;
+
+function clearArmedDelete() {
+  armedDeleteModel = "";
+  if (armedDeleteTimer) {
+    clearTimeout(armedDeleteTimer);
+    armedDeleteTimer = null;
+  }
+}
+
+function openModelsModal() {
+  clearArmedDelete();
+  if (!pullingModel) setModelsStatus("");
+  document.getElementById("models-modal").style.display = "flex";
+  renderModelsManager();
+  loadModels(false);
+}
+
+function closeModelsModal() {
+  clearArmedDelete();
+  document.getElementById("models-modal").style.display = "none";
+}
+
+function renderModelsManager() {
+  const rowsEl = document.getElementById("models-rows");
+  const summaryEl = document.getElementById("models-summary");
+  const updateAllBtn = document.getElementById("models-update-all-btn");
+  rowsEl.innerHTML = "";
+
+  if (!ollamaRunning) {
+    summaryEl.textContent = "Ollama offline";
+    updateAllBtn.disabled = true;
+    const msg = document.createElement("div");
+    msg.style.cssText = "color:var(--muted);font-size:13px;padding:12px 4px;display:flex;align-items:center;justify-content:space-between;gap:10px;";
+    msg.innerHTML = `<span>Ollama is not running yet. Start it to update or remove local models.</span>`;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "Start / Retry";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "Checking...";
+      await fetch("/api/ollama/start", { method: "POST" }).catch(() => {});
+      await loadModels(false);
+      renderModelsManager();
+    };
+    msg.appendChild(btn);
+    rowsEl.appendChild(msg);
+    return;
+  }
+
+  const items = installedModelDetails.slice().sort((a, b) => {
+    const ta = Date.parse(a.modified_at || "") || 0;
+    const tb = Date.parse(b.modified_at || "") || 0;
+    return ta - tb;
+  });
+
+  const totalBytes = items.reduce((acc, m) => acc + (m.size || 0), 0);
+  const totalTxt = fmtModelSize(totalBytes);
+  summaryEl.textContent = items.length
+    ? `${items.length} installed${totalTxt ? " · " + totalTxt : ""} · oldest first`
+    : "0 installed";
+  updateAllBtn.disabled = pullingModel || items.length === 0;
+
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.style.cssText = "color:var(--muted);font-size:13px;padding:12px 4px;";
+    empty.textContent = "No models downloaded on this PC yet.";
+    rowsEl.appendChild(empty);
+    return;
+  }
+
+  for (const m of items) {
+    const row = document.createElement("div");
+    row.className = "model-mgr-row";
+
+    const info = document.createElement("div");
+    info.className = "model-mgr-info";
+
+    const title = document.createElement("div");
+    title.className = "model-mgr-title";
+    const pal = getModelPalette(m.name);
+    const dot = document.createElement("span");
+    dot.className = "opt-dot";
+    dot.style.background = pal[2];
+    title.appendChild(dot);
+
+    const nm = document.createElement("span");
+    nm.className = "model-mgr-name";
+    nm.textContent = m.name;
+    title.appendChild(nm);
+
+    if (m.name === currentModel || m.raw_name === currentModel) {
+      const tag = document.createElement("span");
+      tag.className = "model-mgr-tag";
+      tag.textContent = "active";
+      title.appendChild(tag);
+    }
+    if (typeof appSettings !== "undefined" && appSettings.default_model && (appSettings.default_model === m.name || appSettings.default_model === m.raw_name)) {
+      const tag = document.createElement("span");
+      tag.className = "model-mgr-tag";
+      tag.textContent = "default";
+      title.appendChild(tag);
+    }
+    info.appendChild(title);
+
+    const meta = document.createElement("div");
+    meta.className = "model-mgr-meta";
+    meta.textContent = [fmtModelSize(m.size), m.parameter_size, m.quantization, fmtModelAge(m.modified_at)].filter(Boolean).join(" · ") || "Installed locally";
+    info.appendChild(meta);
+
+    const acts = document.createElement("div");
+    acts.className = "model-mgr-actions";
+
+    const updBtn = document.createElement("button");
+    updBtn.type = "button";
+    updBtn.textContent = "Update";
+    updBtn.disabled = pullingModel;
+    updBtn.onclick = () => updateInstalledModel(m.name);
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    const isArmed = armedDeleteModel === m.name;
+    delBtn.textContent = isArmed ? "Confirm?" : "Delete";
+    if (isArmed) delBtn.className = "btn-danger-arm";
+    delBtn.disabled = pullingModel;
+    delBtn.onclick = () => {
+      if (armedDeleteModel !== m.name) {
+        clearArmedDelete();
+        armedDeleteModel = m.name;
+        armedDeleteTimer = setTimeout(() => {
+          armedDeleteModel = "";
+          renderModelsManager();
+        }, 3500);
+        renderModelsManager();
+        return;
+      }
+      clearArmedDelete();
+      deleteInstalledModel(m.raw_name || m.name, m.name);
+    };
+
+    acts.appendChild(updBtn);
+    acts.appendChild(delBtn);
+    row.appendChild(info);
+    row.appendChild(acts);
+    rowsEl.appendChild(row);
+  }
+}
+
+async function runModelUpdates(targets) {
+  if (pullingModel || !targets || !targets.length) return;
+  pullingModel = true;
+  clearArmedDelete();
+  renderModelsManager();
+  let updated = 0;
+  try {
+    for (let i = 0; i < targets.length; i++) {
+      const name = targets[i];
+      const prefix = targets.length > 1 ? `(${i + 1}/${targets.length}) ` : "";
+      setModelsStatus(`${prefix}Checking updates for ${name}...`, 0);
+      await streamPullRequest(name, (ev) => {
+        if (ev.total && ev.completed) {
+          const pct = Math.min(100, Math.round((ev.completed / ev.total) * 100));
+          setModelsStatus(`${prefix}Updating ${name}: ${pct}%`, pct);
+        } else if (ev.status) {
+          setModelsStatus(`${prefix}${name}: ${ev.status}`, ev.status === "success" ? 100 : null);
+        }
+      });
+      updated++;
+    }
+    setModelsStatus(
+      targets.length > 1 ? `Checked ${updated} model(s). All up to date.` : `${targets[0]} is up to date.`,
+      null
+    );
+  } catch (err) {
+    const label = targets.length > 1 ? `after ${updated}/${targets.length}` : `for ${targets[0]}`;
+    setModelsStatus(`Update failed ${label}: ${err.message || err}`, null);
+  }
+  pullingModel = false;
+  await loadModels(false);
+}
+
+function updateInstalledModel(modelName) {
+  return runModelUpdates([modelName]);
+}
+
+function updateAllModels() {
+  return runModelUpdates(installedModels.slice());
+}
+
+async function deleteInstalledModel(targetName, displayName) {
+  if (pullingModel) return;
+  setModelsStatus(`Removing ${displayName || targetName}...`, null);
+  try {
+    const res = await fetch("/api/models/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: targetName }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    await loadSettings();
+    await loadModels(false);
+    if (!isModelInstalled(currentModel)) {
+      currentModel = installedModels[0] || availableModels[0] || "__MODEL__";
+      applyModelTheme(currentModel);
+      renderModelMenu();
+      updateSetupBanner();
+    }
+    setModelsStatus(`Deleted ${displayName || targetName}.`, null);
+  } catch (err) {
+    setModelsStatus(`Delete failed: ${err.message || err}`, null);
+  }
+}
+
+function openPullModal() {
+  const inp = document.getElementById("pull-input");
+  inp.value = "";
+  document.getElementById("pull-modal").style.display = "flex";
+  inp.focus();
+}
+
+function closePullModal() {
+  document.getElementById("pull-modal").style.display = "none";
+}
+
+function submitPullModal() {
+  const name = document.getElementById("pull-input").value.trim();
+  if (!name) return;
+  closePullModal();
+  if (!availableModels.includes(name)) availableModels.unshift(name);
+  currentModel = name;
+  modelChosenByUser = true;
+  applyModelTheme(name);
+  renderModelMenu();
+  pullModel(name);
 }
 
 function selectModel(m) {
   currentModel = m;
+  modelChosenByUser = true;
   applyModelTheme(m);
   renderModelMenu();
   updateSetupBanner();
@@ -1647,14 +2211,20 @@ async function loadModels(retryOnBoot = true) {
     ollamaRunning = Boolean(info.ollama_running);
     hasBin = Boolean(info.has_ollama_bin);
     installedModels = Array.isArray(info.installed) ? info.installed : [];
+    installedModelDetails = Array.isArray(info.installed_details) ? info.installed_details : [];
     if (Array.isArray(info.models) && info.models.length) availableModels = info.models;
-    if (!currentChatId && info.default_model && !isModelInstalled(currentModel)) {
-      currentModel = info.default_model;
+    if (!currentChatId && !modelChosenByUser && info.default_model) {
+      if ((typeof appSettings !== "undefined" && appSettings.default_model) || !isModelInstalled(currentModel)) {
+        currentModel = info.default_model;
+      }
     }
   } catch (_) {}
   applyModelTheme(currentModel);
   renderModelMenu();
   updateSetupBanner();
+  if (document.getElementById("models-modal").style.display === "flex") {
+    renderModelsManager();
+  }
   if (!ollamaRunning && hasBin && retryOnBoot) {
     setTimeout(() => loadModels(false), 1500);
   }
@@ -2092,28 +2662,38 @@ function unlockAudio() {
   } catch (_) {}
 }
 
-function playDoneChime() {
+let appSettings = { default_model: "", sound: "chime" };
+
+function playDoneChime(force = false, soundName = appSettings.sound) {
   try {
-    if (!document.hidden && document.hasFocus()) return;
+    if (!soundName || soundName === "off") return;
+    if (!force && !document.hidden && document.hasFocus()) return;
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     if (!audioCtx) audioCtx = new AC();
     if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
     const now = audioCtx.currentTime;
-    [587.33, 880].forEach((freq, idx) => {
+    const patterns = {
+      chime:  [[587.33, 0, 0.24, 0.06], [880, 0.09, 0.26, 0.06]],
+      ping:   [[784, 0, 0.28, 0.06]],
+      double: [[659.25, 0, 0.14, 0.055], [659.25, 0.12, 0.18, 0.055]],
+      chord:  [[523.25, 0, 0.34, 0.04], [659.25, 0.02, 0.34, 0.04], [783.99, 0.04, 0.34, 0.04]],
+    };
+    const notes = patterns[soundName] || patterns.chime;
+    for (const [freq, delay, dur, peak] of notes) {
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
-      const t0 = now + idx * 0.09;
+      const t0 = now + delay;
       osc.type = "sine";
       osc.frequency.setValueAtTime(freq, t0);
       gain.gain.setValueAtTime(0.0001, t0);
-      gain.gain.linearRampToValueAtTime(0.06, t0 + 0.015);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.24);
+      gain.gain.linearRampToValueAtTime(peak, t0 + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
       osc.connect(gain);
       gain.connect(audioCtx.destination);
       osc.start(t0);
-      osc.stop(t0 + 0.25);
-    });
+      osc.stop(t0 + dur + 0.02);
+    }
   } catch (_) {}
 }
 
@@ -2442,11 +3022,141 @@ async function saveChipsModal() {
   closeChipsModal();
 }
 
+async function loadSettings() {
+  try {
+    const res = await fetch("/api/settings");
+    const data = await res.json();
+    if (data && typeof data === "object") {
+      appSettings.default_model = data.default_model || "";
+      appSettings.sound = data.sound || "chime";
+    }
+  } catch (_) {}
+}
+
+function openSettings() {
+  const selModel = document.getElementById("set-default-model");
+  selModel.innerHTML = "";
+  const autoOpt = document.createElement("option");
+  autoOpt.value = "";
+  autoOpt.textContent = "Auto (first installed)";
+  selModel.appendChild(autoOpt);
+
+  const list = availableModels.slice();
+  if (appSettings.default_model && !list.includes(appSettings.default_model)) {
+    list.unshift(appSettings.default_model);
+  }
+  for (const m of list) {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m;
+    selModel.appendChild(opt);
+  }
+  selModel.value = appSettings.default_model || "";
+  document.getElementById("set-sound").value = appSettings.sound || "chime";
+  document.getElementById("settings-modal").style.display = "flex";
+}
+
+function closeSettings() {
+  document.getElementById("settings-modal").style.display = "none";
+}
+
+function testSound() {
+  unlockAudio();
+  const snd = document.getElementById("set-sound").value;
+  playDoneChime(true, snd);
+}
+
+async function saveSettings() {
+  const default_model = document.getElementById("set-default-model").value;
+  const sound = document.getElementById("set-sound").value;
+  const res = await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ default_model, sound }),
+  });
+  const data = await res.json();
+  if (data && data.settings) appSettings = data.settings;
+  if (default_model && !currentChatId) {
+    selectModel(default_model);
+  }
+  closeSettings();
+}
+
 async function quitServer() {
   try {
     await fetch("/api/quit", { method: "POST" });
   } catch (_) {}
   document.body.innerHTML = '<div style="margin:auto;text-align:center;color:#9898a3;font-family:sans-serif;"><h2 style="color:#fff;">Local agent stopped</h2><p>You can close this tab now.</p></div>';
+}
+
+function finishSplashHandoff() {
+  const overlay = document.getElementById("splash-overlay");
+  const mark = document.getElementById("brand-mark");
+  const slot = document.getElementById("brand-slot");
+  if (slot && mark && mark.parentElement !== slot) {
+    slot.appendChild(mark);
+  }
+  if (overlay && overlay.isConnected) overlay.remove();
+}
+
+function waitForSplashIntro() {
+  return new Promise((resolve) => {
+    const mark = document.getElementById("brand-mark");
+    if (!mark) { resolve(); return; }
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    mark.addEventListener("animationend", (e) => {
+      if (e.target === mark && e.animationName === "spinLinesMark") done();
+    });
+    setTimeout(done, 2500);
+  });
+}
+
+function runSplashOutro() {
+  const overlay = document.getElementById("splash-overlay");
+  const glide = document.getElementById("splash-glide");
+  const mark = document.getElementById("brand-mark");
+  const slot = document.getElementById("brand-slot");
+  if (!overlay || !glide || !mark || !slot) {
+    finishSplashHandoff();
+    return;
+  }
+  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    finishSplashHandoff();
+    return;
+  }
+  requestAnimationFrame(() => {
+    const tr = slot.getBoundingClientRect();
+    const mr = mark.getBoundingClientRect();
+    if (!tr || tr.width <= 0 || !mr || mr.width <= 0) {
+      finishSplashHandoff();
+      return;
+    }
+    const scale = tr.width / mr.width;
+    const dx = (tr.left + tr.width / 2) - (mr.left + mr.width / 2);
+    const dy = (tr.top + tr.height / 2) - (mr.top + mr.height / 2);
+    overlay.classList.add("fading");
+    if (typeof glide.animate === "function") {
+      const anim = glide.animate(
+        [
+          { transform: "translate(0px, 0px) scale(1)" },
+          { transform: `translate(${dx}px, ${dy}px) scale(${scale})` },
+        ],
+        { duration: 900, easing: "cubic-bezier(0.22, 1, 0.36, 1)", fill: "forwards" }
+      );
+      let done = false;
+      const complete = () => {
+        if (done) return;
+        done = true;
+        finishSplashHandoff();
+        try { anim.cancel(); } catch (_) {}
+      };
+      anim.finished.then(complete, complete);
+      setTimeout(complete, 1500);
+    } else {
+      finishSplashHandoff();
+    }
+  });
 }
 
 const inpEl = document.getElementById("input");
@@ -2469,8 +3179,16 @@ setSendBtnState(false);
 updateCtxBadge(0, MAX_CTX);
 startQuestionRotation();
 loadChips();
-loadModels();
 loadChatList();
+
+const bootReady = loadSettings().then(() => loadModels());
+if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  finishSplashHandoff();
+} else {
+  const splashMinWait = waitForSplashIntro();
+  const splashMaxWait = new Promise(r => setTimeout(r, 4000));
+  Promise.race([Promise.all([bootReady, splashMinWait]), splashMaxWait]).then(runSplashOutro);
+}
 </script>
 </body>
 </html>
@@ -2569,7 +3287,23 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"chips": load_chips(), "defaults": DEFAULT_CHIPS})
             return
 
+        if self.path == "/api/settings":
+            self.send_json(200, load_settings())
+            return
+
         self.send_json(404, {"error": "Not found"})
+
+    def _handle_delete_model(self, model_name: str):
+        model_name = (model_name or "").strip()
+        if not model_name:
+            self.send_json(400, {"error": "Missing model name"})
+            return
+        try:
+            delete_ollama_model(model_name)
+        except Exception as e:
+            self.send_json(502, {"error": str(e)})
+            return
+        self.send_json(200, {"deleted": model_name})
 
     def do_DELETE(self):
         if self.path.startswith("/api/chats/"):
@@ -2582,9 +3316,18 @@ class WebHandler(BaseHTTPRequestHandler):
                 p.unlink()
             self.send_json(200, {"deleted": cid})
             return
+        if self.path.startswith("/api/models/"):
+            name = urllib.parse.unquote(self.path[len("/api/models/"):])
+            self._handle_delete_model(name)
+            return
         self.send_json(404, {"error": "Not found"})
 
     def do_POST(self):
+        if self.path == "/api/models/delete":
+            data = self.read_json()
+            self._handle_delete_model(data.get("model", ""))
+            return
+
         if self.path == "/api/soul":
             data = self.read_json()
             SOUL_FILE.write_text(data.get("content", ""), encoding="utf-8")
@@ -2595,6 +3338,12 @@ class WebHandler(BaseHTTPRequestHandler):
             data = self.read_json()
             saved = save_chips(data.get("chips", []))
             self.send_json(200, {"ok": True, "chips": saved})
+            return
+
+        if self.path == "/api/settings":
+            data = self.read_json()
+            saved = save_settings(data)
+            self.send_json(200, {"ok": True, "settings": saved})
             return
 
         if self.path == "/api/ollama/start":

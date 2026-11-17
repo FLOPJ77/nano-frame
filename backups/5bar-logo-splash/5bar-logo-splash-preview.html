@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backup — 5-Bar Logo &amp; Splash Animation</title>
+<style>
+  :root {
+    --bg: #111113;
+    --surface: #18181b;
+    --border: #2a2a30;
+    --text: #f4f4f6;
+    --muted: #9898a3;
+    --white: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 28px; padding: 24px;
+  }
+
+  /* 5-bar logo (.m-mark) */
+  .m-mark {
+    display: inline-grid; grid-template-rows: repeat(5, 1fr); gap: 1.5px;
+    width: 18px; height: 18px; flex-shrink: 0;
+  }
+  .m-mark span { display: block; border-radius: 1px; background: var(--white); }
+  .m-mark span:nth-child(1) { opacity: 0.95; width: 65%; }
+  .m-mark span:nth-child(2) { opacity: 0.85; width: 85%; }
+  .m-mark span:nth-child(3) { opacity: 1.00; width: 100%; }
+  .m-mark span:nth-child(4) { opacity: 0.75; width: 80%; }
+  .m-mark span:nth-child(5) { opacity: 0.60; width: 55%; }
+
+  /* Original l33 -> 5-bar cut splash animation */
+  #splash-overlay {
+    position: fixed; inset: 0; z-index: 100; background: #050506;
+    display: grid; place-items: center;
+    transition: background 0.65s ease, opacity 0.4s ease;
+  }
+  #splash-overlay.fading { background: transparent; pointer-events: none; }
+  .splash-stage { position: relative; width: 70px; height: 70px; display: grid; place-items: center; }
+  .splash-loader {
+    height: 45px;
+    --c: no-repeat linear-gradient(#f4f4f6 0 0);
+    background: var(--c) left, var(--c) center, var(--c) right;
+    background-size: 16px 100%;
+    animation: l33-1 1.5s infinite, l33-2 1.5s infinite;
+    transition: opacity 0.28s ease, transform 0.28s ease;
+  }
+  @keyframes l33-1 {
+    0%, 100% { width: 45px; }
+    35%, 65% { width: 65px; }
+  }
+  @keyframes l33-2 {
+    0%, 40%   { transform: rotate(0); }
+    60%, 100% { transform: rotate(90deg); }
+  }
+  #splash-overlay.cutting .splash-loader { opacity: 0; transform: scale(0.9); }
+  #splash-mark {
+    position: absolute; width: 45px; height: 45px; gap: 3px; opacity: 0;
+    transform: translate(0, 0) scale(1);
+    transition: opacity 0.28s ease, transform 0.72s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  #splash-mark span { width: 100%; transition: width 0.42s cubic-bezier(0.22, 1, 0.36, 1); }
+  #splash-overlay.cutting #splash-mark { opacity: 1; }
+  #splash-overlay.cut-done #splash-mark span:nth-child(1) { width: 65%; }
+  #splash-overlay.cut-done #splash-mark span:nth-child(2) { width: 85%; }
+  #splash-overlay.cut-done #splash-mark span:nth-child(3) { width: 100%; }
+  #splash-overlay.cut-done #splash-mark span:nth-child(4) { width: 80%; }
+  #splash-overlay.cut-done #splash-mark span:nth-child(5) { width: 55%; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 26px; display: flex; flex-direction: column; align-items: center; gap: 16px;
+  }
+  .row { display: flex; align-items: center; gap: 14px; }
+  button {
+    background: #222226; color: var(--white); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 14px; cursor: pointer; font: inherit;
+  }
+</style>
+</head>
+<body>
+  <div id="splash-overlay" aria-hidden="true">
+    <div class="splash-stage">
+      <div class="splash-loader"></div>
+      <div class="m-mark" id="splash-mark"><span></span><span></span><span></span><span></span><span></span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="m-mark" id="brand-mark"><span></span><span></span><span></span><span></span><span></span></div>
+      <strong>local agent (5-bar backup)</strong>
+    </div>
+    <div class="row">
+      <div class="m-mark" style="width:30px;height:30px;gap:2px;"><span></span><span></span><span></span><span></span><span></span></div>
+      <span style="color:var(--muted);font-size:13px;">Welcome size (30px)</span>
+    </div>
+    <button onclick="replay()">Replay splash</button>
+  </div>
+
+<script>
+function runOutro() {
+  const overlay = document.getElementById("splash-overlay");
+  const mark = document.getElementById("splash-mark");
+  const target = document.getElementById("brand-mark");
+  if (!overlay || !mark) return;
+  overlay.classList.add("cutting");
+  requestAnimationFrame(() => {
+    overlay.classList.add("cut-done");
+    setTimeout(() => {
+      const tr = target.getBoundingClientRect();
+      const sr = mark.getBoundingClientRect();
+      const scale = tr.width / sr.width;
+      const dx = (tr.left + tr.width / 2) - (sr.left + sr.width / 2);
+      const dy = (tr.top + tr.height / 2) - (sr.top + sr.height / 2);
+      overlay.classList.add("fading");
+      mark.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`;
+      setTimeout(() => {
+        mark.style.opacity = "0";
+        setTimeout(() => { overlay.style.display = "none"; }, 280);
+      }, 740);
+    }, 550);
+  });
+}
+
+function replay() {
+  const overlay = document.getElementById("splash-overlay");
+  const mark = document.getElementById("splash-mark");
+  overlay.className = "";
+  overlay.style.display = "grid";
+  mark.style.opacity = "";
+  mark.style.transform = "translate(0, 0) scale(1)";
+  setTimeout(runOutro, 1650);
+}
+
+setTimeout(runOutro, 1650);
+</script>
+</body>
+</html>
