@@ -918,6 +918,7 @@ WEB_HTML = r"""<!doctype html>
 <title>local agent</title>
 <style>
   :root {
+    color-scheme: dark;
     --bg: #111113;
     --sidebar: #0c0c0e;
     --surface: #18181b;
@@ -938,7 +939,19 @@ WEB_HTML = r"""<!doctype html>
     --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
     --font-mono: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
   }
-  * { box-sizing: border-box; }
+  * {
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: #3a3a42 transparent;
+  }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: #3a3a42; border-radius: 999px;
+    border: 2px solid transparent; background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover { background: #52525b; border: 2px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar-thumb:active { background: #71717a; border: 2px solid transparent; background-clip: padding-box; }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 15px; }
   body { display: flex; overflow: hidden; }
   svg { display: block; flex-shrink: 0; }
@@ -1107,7 +1120,7 @@ WEB_HTML = r"""<!doctype html>
     overflow: hidden; border: 1px solid var(--border); display: none;
   }
   .pull-bar.show { display: block; }
-  .pull-fill { height: 100%; width: 0%; background: var(--m-3); transition: width 0.2s; }
+  .pull-fill { height: 100%; width: 0%; background: var(--white); transition: width 0.2s; }
 
   /* Viewport & Empty-State Centering */
   #stage { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
@@ -1229,6 +1242,7 @@ WEB_HTML = r"""<!doctype html>
   .prose h3 { font-size: 1.05em; }
   .prose ul, .prose ol { margin: 6px 0 12px; padding-left: 22px; }
   .prose li { margin: 4px 0; }
+  .prose li::marker { color: var(--msg-accent, var(--m-2)); font-weight: 600; }
   .prose strong { color: var(--white); font-weight: 600; }
   .prose a { color: var(--white); text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.4); }
   .prose a:hover { border-bottom-color: var(--white); }
@@ -1322,20 +1336,22 @@ WEB_HTML = r"""<!doctype html>
   }
   textarea#input {
     flex: 1; background: transparent; border: none; color: var(--white);
+    caret-color: var(--m-2);
     font: inherit; font-size: 15px; line-height: 22px;
     height: 22px; min-height: 22px; max-height: 180px;
     padding: 0; margin: 0; resize: none; display: block;
   }
+  textarea#input::selection { background: var(--m-glow); color: var(--white); }
   textarea#input:focus { outline: none; }
   textarea#input::placeholder { color: var(--muted); }
   #send-btn {
     width: 34px; height: 34px; border-radius: 6px;
-    border: 1px solid rgba(255, 255, 255, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.24);
     background: transparent; color: var(--white);
     padding: 0; display: grid; place-items: center; flex-shrink: 0;
   }
-  #send-btn:hover { background: rgba(255, 255, 255, 0.1); border-color: var(--white); }
-  #send-btn.stopping { border-color: var(--white); background: rgba(255, 255, 255, 0.08); }
+  #send-btn:hover { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.48); }
+  #send-btn.stopping { border-color: rgba(255, 255, 255, 0.45); background: rgba(255, 255, 255, 0.08); }
   .hint { max-width: 760px; margin: 6px auto 0; text-align: center; font-size: 11px; color: var(--muted); }
 
   /* Modals (Soul, Quick Buttons, Settings, Pull Model, Manage Models) */
@@ -2589,6 +2605,7 @@ function renderMessage(m) {
   }
 
   const msgModel = m.model || currentModel;
+  row.style.setProperty("--msg-accent", getModelPalette(msgModel)[2]);
   const head = document.createElement("div");
   head.className = "asst-head";
   head.innerHTML = `<div class="m-mark"><span></span><span></span><span></span><span></span><span></span></div><span class="asst-name"></span>`;
@@ -2717,6 +2734,7 @@ async function sendMsg() {
   const col = document.getElementById("chat-col");
   const row = document.createElement("div");
   row.className = "msg-row assistant";
+  row.style.setProperty("--msg-accent", pal[2]);
   row.innerHTML = `
     <div class="asst-head">
       <div class="m-mark"><span></span><span></span><span></span><span></span><span></span></div>
