@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""Minimal, fast terminal AI assistant backed by local Ollama."""
+
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+try:
+    import readline  # Arrow keys & history in terminal
+except ImportError:
+    pass
+
+# --- CONFIG ---
+BASE_DIR = Path(__file__).resolve().parent.parent
+SOUL_FILE = Path(os.environ.get("AGENT_SOUL", str(BASE_DIR / "soul.md"))).expanduser()
+CHATS_DIR = Path(os.environ.get("AGENT_CHATS", str(BASE_DIR / "chats"))).expanduser()
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
+OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3")
+NUM_CTX = int(os.environ.get("AGENT_CTX", "16384"))
+MAX_HISTORY = 16
+MAX_HISTORY_CHARS = 28000
+MAX_STEPS = 8
+
+USE_COLOR = sys.stdout.isatty()
+
+
+class C:
+    RESET = "\033[0m" if USE_COLOR else ""
+    BOLD = "\033[1m" if USE_COLOR else ""
+    DIM = "\033[2m" if USE_COLOR else ""
+    WHITE = "\033[97m" if USE_COLOR else ""
+    RED = "\033[91m" if USE_COLOR else ""
+    GREEN = "\033[92m" if USE_COLOR else ""
+    YELLOW = "\033[93m" if USE_COLOR else ""
+    BLUE = "\033[94m" if USE_COLOR else ""
+    MAGENTA = "\033[95m" if USE_COLOR else ""
+    CYAN = "\033[96m" if USE_COLOR else ""
+    GRAY = "\033[90m" if USE_COLOR else ""
+
+
+class Spinner:
+    """Minimal terminal ASCII progress bar."""
+
+    FRAMES = [
+        "[=       ]", "[==      ]", "[===     ]", "[ ===    ]",
+        "[  ===   ]", "[   ===  ]", "[    === ]", "[     ===]",
+        "[      ==]", "[       =]", "[      ==]", "[     ===]",
+        "[    === ]", "[   ===  ]", "[  ===   ]", "[ ===    ]",
+        "[===     ]", "[==      ]",
+    ]
+    RAINBOW = [C.CYAN, C.BLUE, C.MAGENTA, C.GREEN, C.YELLOW]
+
+    def __init__(self, label: str = "thinking", enabled: bool = True):
+        self.label = label
+        self.enabled = enabled and sys.stdout.isatty()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _animate(self):
+        start = time.monotonic()
+        i = 0
+        while not self._stop.is_set():
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            col = self.RAINBOW[(i // 3) % len(self.RAINBOW)]
+            elapsed = time.monotonic() - start
+            sys.stdout.write(
+                f"\r\033[K  {col}{frame}{C.RESET} "
+                f"{C.DIM}{self.label}... {elapsed:.1f}s{C.RESET}"
+            )
+            sys.stdout.flush()
+            i += 1
+            self._stop.wait(0.08)
+
+    def __enter__(self):
+        if self.enabled:
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+            self._thread = threading.Thread(target=self._animate, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.enabled:
+            self._stop.set()
+            if self._thread:
+                self._thread.join()
+            sys.stdout.write("\r\033[K\033[?25h")
+            sys.stdout.flush()
+
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_bash",
+            "description": (
+                "Run a bash command on THIS Linux PC and return stdout/stderr. "
+                "Only use when explicitly asked to inspect or act on this local machine."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The bash command to run"}
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read the contents of a local file on THIS PC. "
+                "Only use when explicitly asked to inspect a local file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write or overwrite text to a local file on THIS PC. "
+                "Only use when explicitly asked to create or modify a local file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "content": {"type": "string", "description": "Content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+]
+
+
+def execute_tool(name: str, args: dict) -> str:
+    try:
+        if name == "run_bash":
+            cmd = args.get("command", "")
+            proc = subprocess.Popen(
+                ["bash", "-c", cmd],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(Path.home()),
+                start_new_session=True,
+            )
+            out_buf = []
+            reader = threading.Thread(
+                target=lambda: out_buf.append(proc.communicate()[0]), daemon=True
+            )
+            reader.start()
+            reader.join(30)
+            if reader.is_alive():
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                return "(command timed out after 30s)"
+            out = (out_buf[0] if out_buf else "").strip()
+            return out[:4000] if out else f"(exit code {proc.returncode}, no output)"
+
+        if name == "read_file":
+            p = Path(args["path"]).expanduser()
+            return p.read_text(encoding="utf-8", errors="replace")[:6000]
+
+        if name == "write_file":
+            p = Path(args["path"]).expanduser()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(args["content"], encoding="utf-8")
+            return f"Wrote {len(args['content'])} chars to {p}"
+
+        return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Tool error: {e}"
+
+
+def load_soul() -> str:
+    if SOUL_FILE.exists():
+        return SOUL_FILE.read_text(encoding="utf-8").strip()
+    return (
+        "You are a concise, direct assistant. "
+        "Answer directly in text by default, and only use run_bash, read_file, or write_file "
+        "when explicitly asked to inspect or modify this local PC."
+    )
+
+
+def parse_xml_tool_fallback(text: str) -> list:
+    calls = []
+    for block in re.findall(r"<tool_call>(.*?)</tool_call>", text, re.S):
+        fn = re.search(r"<function=([^>\s]+)>", block)
+        if not fn:
+            continue
+        args = {}
+        for k, v in re.findall(r"<parameter=([^>\s]+)>(.*?)</parameter>", block, re.S):
+            args[k.strip()] = v.strip()
+        calls.append({"function": {"name": fn.group(1).strip(), "arguments": args}})
+    return calls
+
+
+def clean_reply(raw_content: str) -> str:
+    reply = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.S)
+    reply = re.sub(r"<tool_call>.*?</tool_call>", "", reply, flags=re.S)
+    return reply.strip()
+
+
+def trim_history(history: list):
+    def total_chars():
+        return sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
+
+    while len(history) > 1 and (len(history) > MAX_HISTORY or total_chars() > MAX_HISTORY_CHARS):
+        history.pop(0)
+        while history and history[0].get("role") != "user":
+            history.pop(0)
+
+
+def call_ollama(messages: list, model: str, use_tools: bool = True) -> dict:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "top_k": 50,
+            "repeat_penalty": 1.1,
+            "num_ctx": NUM_CTX,
+        },
+    }
+    if use_tools:
+        payload["tools"] = TOOLS_SCHEMA
+
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Cannot reach Ollama at {OLLAMA_HOST} ({e.reason}). Is 'ollama serve' running?"
+        ) from e
+
+    msg = data.get("message") or {}
+    prompt_tokens = int(data.get("prompt_eval_count") or 0)
+    eval_tokens = int(data.get("eval_count") or 0)
+    used = prompt_tokens + eval_tokens
+    if used <= 0:
+        used = (
+            sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+            + len(msg.get("content") or "")
+        ) // 4
+    return {
+        "content": msg.get("content") or "",
+        "tool_calls": msg.get("tool_calls") or [],
+        "tokens": {"used": used, "max": NUM_CTX},
+    }
+
+
+def list_models() -> list:
+    try:
+        with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+    except Exception:
+        return []
+
+
+def print_tool_call(name: str, args: dict):
+    preview = ", ".join(f"{k}={repr(str(v)[:60])}" for k, v in args.items())
+    tool_col = {"run_bash": C.CYAN, "read_file": C.GREEN, "write_file": C.MAGENTA}.get(name, C.YELLOW)
+    print(f"  {tool_col}[tool]{C.RESET} {tool_col}{C.BOLD}{name}{C.RESET} {C.GRAY}({preview}){C.RESET}")
+
+
+def run_agent(
+    user_text: str,
+    history: list,
+    model: str,
+    use_tools: bool = True,
+    use_spinner: bool = False,
+) -> dict:
+    history.append({"role": "user", "content": user_text})
+    trim_history(history)
+    last_tokens = {"used": 0, "max": NUM_CTX}
+    tools_log = []
+
+    for _ in range(MAX_STEPS):
+        messages = [{"role": "system", "content": load_soul()}] + history
+        with Spinner("thinking", enabled=use_spinner):
+            msg = call_ollama(messages, model=model, use_tools=use_tools)
+
+        last_tokens = msg["tokens"]
+        raw_content = msg["content"]
+        tool_calls = msg["tool_calls"]
+        if use_tools and not tool_calls and "<tool_call>" in raw_content:
+            tool_calls = parse_xml_tool_fallback(raw_content)
+
+        if not tool_calls or not use_tools:
+            reply = clean_reply(raw_content) or "(done)"
+            history.append({"role": "assistant", "content": reply})
+            return {"reply": reply, "tools": tools_log, "tokens": last_tokens}
+
+        history.append({"role": "assistant", "content": raw_content, "tool_calls": tool_calls})
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+
+            print_tool_call(name, args)
+            with Spinner(f"running {name}", enabled=use_spinner):
+                result = execute_tool(name, args)
+
+            tools_log.append({"name": name, "args": args, "result": result})
+            history.append({"role": "tool", "content": result})
+
+    return {"reply": "Stopped: reached max tool steps.", "tools": tools_log, "tokens": last_tokens}
+
+
+def save_chat(ui_log: list, history: list, model: str) -> Path:
+    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    cid = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
+    title = ui_log[0]["text"][:42] if ui_log else cid
+    payload = {
+        "id": cid,
+        "title": title,
+        "model": model,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "history": history,
+        "ui_messages": ui_log,
+    }
+    p = CHATS_DIR / f"{cid}.json"
+    p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def print_banner(model: str, use_tools: bool):
+    t_state = "on" if use_tools else "off"
+    line1 = f"  * {model} cli   |   soul: {SOUL_FILE.name} (live)   |   tools: {t_state}"
+    line2 = "  cmds: /model [name]  /tools  /soul  /save  /clear  exit"
+    width = max(len(line1), len(line2)) + 2
+    border = "-" * width
+    print(f"\n{C.WHITE}+{border}+{C.RESET}")
+    print(f"{C.WHITE}|{C.RESET}{C.BOLD}{line1.ljust(width)}{C.RESET}{C.WHITE}|{C.RESET}")
+    print(f"{C.WHITE}|{C.RESET}{C.GRAY}{line2.ljust(width)}{C.RESET}{C.WHITE}|{C.RESET}")
+    print(f"{C.WHITE}+{border}+{C.RESET}\n")
+
+
+def print_help():
+    print(
+        "Usage: ai [OPTIONS] [PROMPT...]\n\n"
+        "Examples:\n"
+        "  ai                                   Start interactive terminal chat\n"
+        '  ai "how do I compress a folder"      Quick one-shot answer\n'
+        '  ai -n "command to list open ports"   Pure text mode (skip tools)\n'
+        '  ai -m gemma4 "check disk space"      Use a specific Ollama model\n\n'
+        "Options:\n"
+        "  -m, --model NAME   Model name (default: AGENT_MODEL or lfm3)\n"
+        "  -n, --no-tools     Disable local bash/file tools\n"
+        "  -r, --raw          Disable spinner animation\n"
+        "  -h, --help         Show this help message"
+    )
+
+
+def parse_args(argv: list) -> tuple:
+    model = DEFAULT_MODEL
+    use_tools = True
+    raw = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print_help()
+            sys.exit(0)
+        elif arg in ("-n", "--no-tools"):
+            use_tools = False
+            i += 1
+        elif arg in ("-r", "--raw"):
+            raw = True
+            i += 1
+        elif arg in ("-m", "--model"):
+            if i + 1 >= len(argv):
+                sys.exit("Error: --model requires a model name.")
+            model = argv[i + 1]
+            i += 2
+        elif arg == "--":
+            i += 1
+            break
+        else:
+            break
+    return model, use_tools, raw, " ".join(argv[i:]).strip()
+
+
+def main():
+    model, use_tools, raw, one_shot = parse_args(sys.argv[1:])
+    history = []
+    ui_log = []
+
+    if one_shot:
+        try:
+            res = run_agent(
+                one_shot,
+                history,
+                model=model,
+                use_tools=use_tools,
+                use_spinner=sys.stdout.isatty() and not raw,
+            )
+            print(res["reply"])
+        except Exception as e:
+            print(f"{C.RED}[error] {e}{C.RESET}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    print_banner(model, use_tools)
+    while True:
+        try:
+            user_input = input(f"{C.WHITE}{C.BOLD}you >{C.RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{C.GRAY}bye.{C.RESET}")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit"):
+            print(f"{C.GRAY}bye.{C.RESET}")
+            break
+        if user_input == "/clear":
+            history.clear()
+            ui_log.clear()
+            print(f"  {C.GRAY}(memory cleared){C.RESET}\n")
+            continue
+        if user_input == "/soul":
+            print(f"\n{C.WHITE}--- {SOUL_FILE.name} ---{C.RESET}")
+            print(f"{C.GRAY}{load_soul()}{C.RESET}")
+            print(f"{C.WHITE}-----------------{C.RESET}\n")
+            continue
+        if user_input == "/tools":
+            use_tools = not use_tools
+            print(f"  {C.GRAY}(tools: {'on' if use_tools else 'off'}){C.RESET}\n")
+            continue
+        if user_input.startswith("/model"):
+            parts = user_input.split(None, 1)
+            if len(parts) == 2 and parts[1].strip():
+                model = parts[1].strip()
+                print(f"  {C.GRAY}(model switched to {model}){C.RESET}\n")
+            else:
+                avail = list_models()
+                print(f"  {C.GRAY}current: {model} | installed: {', '.join(avail) or 'none detected'}{C.RESET}\n")
+            continue
+        if user_input == "/save":
+            if not ui_log:
+                print(f"  {C.GRAY}(nothing to save yet){C.RESET}\n")
+                continue
+            p = save_chat(ui_log, history, model)
+            print(f"  {C.GRAY}(saved to {p}){C.RESET}\n")
+            continue
+
+        t0 = time.monotonic()
+        try:
+            res = run_agent(
+                user_input,
+                history,
+                model=model,
+                use_tools=use_tools,
+                use_spinner=not raw,
+            )
+            dt = time.monotonic() - t0
+            tok = res["tokens"]
+            ui_log.append({"role": "user", "text": user_input})
+            ui_log.append({
+                "role": "assistant",
+                "model": model,
+                "text": res["reply"],
+                "tools": res["tools"],
+                "elapsed": dt,
+            })
+            print(f"\n{C.WHITE}{C.BOLD}agent{C.RESET} {C.GRAY}({dt:.1f}s · {tok['used']}/{tok['max']} tok){C.RESET}")
+            print(res["reply"])
+            print(f"{C.GRAY}{'-' * 40}{C.RESET}\n")
+        except Exception as e:
+            print(f"\n{C.RED}[error] {e}{C.RESET}\n")
+
+
+if __name__ == "__main__":
+    main()

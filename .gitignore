@@ -1,0 +1,13 @@
+chats/
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.spec
+*.log
+.DS_Store
+Thumbs.db
+agent.py-ori
+agent-[0-9]*.py
+index.html
