@@ -25,11 +25,13 @@ IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 
-DEFAULT_SOUL = """You are Gipsy, a concise, direct, slightly witty assistant.
+SHELL_TOOL_NAME = "run_shell" if IS_WINDOWS else "run_bash"
+
+DEFAULT_SOUL = f"""You are Gipsy, a concise, direct, slightly witty assistant.
 
 - Answer directly in text by default without calling tools.
 - If the user asks what a command is, how something works, or asks about another device, just reply with the answer—do NOT run tools on this PC.
-- Only use `run_shell`, `read_file`, or `write_file` when explicitly asked to check, read, or change something on THIS PC.
+- Only use `{SHELL_TOOL_NAME}`, `read_file`, or `write_file` when explicitly asked to check, read, or change something on THIS PC.
 - Never invent tool outputs; if you run a tool, report only what it returned.
 - Ask before running destructive commands (`rm -rf`, formatting, killing critical processes).
 - Keep replies short and readable.
@@ -93,6 +95,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/"
 OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
 OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
 OLLAMA_PULL_URL = f"{OLLAMA_HOST}/api/pull"
+OLLAMA_PS_URL = f"{OLLAMA_HOST}/api/ps"
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3")
 NUM_CTX = int(os.environ.get("AGENT_CTX", "16384"))
 WEB_HOST = "127.0.0.1"
@@ -120,23 +123,25 @@ def os_label() -> str:
 
 def build_tools_schema() -> list:
     if IS_WINDOWS:
+        tool_name = "run_shell"
         shell_desc = (
             "Run a PowerShell command on THIS Windows PC and return stdout/stderr. "
             "Only use when explicitly asked to inspect or act on this local machine."
         )
         cmd_desc = "The PowerShell command to run"
     else:
+        tool_name = "run_bash"
         shell_desc = (
-            f"Run a bash shell command on THIS {os_label()} computer and return stdout/stderr. "
+            f"Run a bash command on THIS {os_label()} computer and return stdout/stderr. "
             "Only use when explicitly asked to inspect or act on this local machine."
         )
-        cmd_desc = "The shell command to run"
+        cmd_desc = "The bash command to run"
 
     return [
         {
             "type": "function",
             "function": {
-                "name": "run_shell",
+                "name": tool_name,
                 "description": shell_desc,
                 "parameters": {
                     "type": "object",
@@ -400,11 +405,26 @@ def trim_history(history: list):
             history.pop(0)
 
 
+def is_model_loaded(model: str) -> bool:
+    try:
+        with urllib.request.urlopen(OLLAMA_PS_URL, timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        loaded = [m.get("name", "") for m in data.get("models", [])]
+        target = model.split(":")[0]
+        return any(
+            n == model or n == f"{model}:latest" or (":" not in model and n.split(":")[0] == target)
+            for n in loaded
+        )
+    except Exception:
+        return True
+
+
 def stream_ollama(
     messages: list,
     model: str,
     tools_enabled: bool = True,
     on_thinking=None,
+    on_phase=None,
     cancel_check=None,
 ) -> dict:
     payload = {
@@ -431,6 +451,14 @@ def stream_ollama(
     tool_calls = []
     prompt_tokens = 0
     eval_tokens = 0
+    current_phase = None
+
+    def set_phase(p: str):
+        nonlocal current_phase
+        if p != current_phase:
+            current_phase = p
+            if on_phase:
+                on_phase(p)
 
     with OLLAMA_LOCK:
         try:
@@ -448,6 +476,7 @@ def stream_ollama(
 
                     t_delta = m.get("thinking") or ""
                     if t_delta:
+                        set_phase("thinking")
                         full_thinking.append(t_delta)
                         if on_thinking:
                             on_thinking(t_delta)
@@ -455,8 +484,16 @@ def stream_ollama(
                     c_delta = m.get("content") or ""
                     if c_delta:
                         full_content.append(c_delta)
+                        joined = "".join(full_content).lstrip()
+                        if (len(joined) < 8 and "<think>".startswith(joined)) or (
+                            joined.startswith("<think>") and "</think>" not in joined
+                        ):
+                            set_phase("thinking")
+                        else:
+                            set_phase("working")
 
                     if m.get("tool_calls"):
+                        set_phase("working")
                         tool_calls.extend(m["tool_calls"])
 
                     if chunk.get("done"):
@@ -537,11 +574,16 @@ def run_agent_stream(
                 if emit:
                     emit({"type": "thinking_delta", "text": delta})
 
+            def on_phase(p):
+                if emit:
+                    emit({"type": "phase", "phase": p})
+
             msg = stream_ollama(
                 messages,
                 model=model,
                 tools_enabled=tools_enabled,
                 on_thinking=on_think,
+                on_phase=on_phase,
                 cancel_check=cancel_check,
             )
 
@@ -860,10 +902,28 @@ WEB_HTML = r"""<!doctype html>
   }
   .chat-item:hover { background: var(--surface); color: var(--text); }
   .chat-item.active { background: var(--surface-2); color: var(--white); }
-  .chat-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .chat-title-wrap { flex: 1; min-width: 0; overflow: hidden; }
+  .chat-title-track { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-title-dup { display: none; }
+  .chat-item.has-overflow:hover .chat-title-wrap {
+    -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 8px, #000 calc(100% - 14px), transparent 100%);
+    mask-image: linear-gradient(90deg, transparent 0, #000 8px, #000 calc(100% - 14px), transparent 100%);
+  }
+  .chat-item.has-overflow:hover .chat-title-track {
+    display: inline-flex; width: max-content; overflow: visible; text-overflow: clip;
+    animation: titleMarquee var(--scroll-dur, 5s) linear infinite;
+  }
+  .chat-item.has-overflow:hover .chat-title-main,
+  .chat-item.has-overflow:hover .chat-title-dup {
+    display: inline-block; padding-right: 34px;
+  }
+  @keyframes titleMarquee {
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
+  }
   .del-btn {
     opacity: 0; border: none; background: transparent; color: var(--muted);
-    padding: 4px; border-radius: 5px; display: grid; place-items: center;
+    padding: 4px; border-radius: 5px; display: grid; place-items: center; flex-shrink: 0;
   }
   .chat-item:hover .del-btn { opacity: 0.7; }
   .del-btn:hover { opacity: 1 !important; color: var(--white); background: rgba(255,255,255,0.1); }
@@ -1124,7 +1184,7 @@ WEB_HTML = r"""<!doctype html>
   }
   .msg-row.assistant:hover .msg-actions { opacity: 1; }
 
-  /* Wave Loader */
+  /* Wave Loader + Circular Model Load Spinner */
   .css-loader { display: inline-flex; align-items: center; gap: 11px; padding: 4px 0 4px 22px; }
   .bars { display: inline-flex; align-items: flex-end; gap: 3px; height: 18px; }
   .bars span { width: 4px; height: 6px; border-radius: 2px; animation: modelWave 1.05s ease-in-out infinite; }
@@ -1134,7 +1194,31 @@ WEB_HTML = r"""<!doctype html>
   .bars span:nth-child(4) { background: var(--m-4); animation-delay: 0.36s; }
   .bars span:nth-child(5) { background: var(--m-5); animation-delay: 0.48s; }
   @keyframes modelWave { 0%, 100% { height: 5px; opacity: 0.45; } 50% { height: 18px; opacity: 1; } }
-  .loader-sec { font-size: 13px; font-family: var(--font-mono); color: var(--muted); }
+  .ring-spin {
+    display: none; width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.14);
+    border-top-color: var(--m-2); border-right-color: var(--m-3);
+    animation: spinRing 0.75s linear infinite; flex-shrink: 0;
+  }
+  @keyframes spinRing { to { transform: rotate(360deg); } }
+  .css-loader.is-loading .bars { display: none; }
+  .css-loader.is-loading .ring-spin { display: inline-block; }
+  .loader-sec {
+    font-size: 13px; font-family: var(--font-mono); color: var(--muted);
+    background: linear-gradient(110deg, var(--muted) 35%, var(--white) 48%, var(--m-1) 54%, var(--muted) 65%);
+    background-size: 220% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: textShimmer 1.9s linear infinite;
+  }
+  @keyframes textShimmer {
+    0%   { background-position: 150% 0; }
+    100% { background-position: -50% 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .loader-sec { background: none; -webkit-text-fill-color: currentColor; animation: none; }
+  }
 
   /* Composer */
   .composer-wrap { position: relative; z-index: 2; padding: 10px 20px 14px; flex-shrink: 0; }
@@ -1578,7 +1662,9 @@ async function loadModels(retryOnBoot = true) {
 
 function toggleSidebar() {
   document.getElementById("sidebar").classList.toggle("collapsed");
+  setTimeout(refreshTitleOverflow, 220);
 }
+window.addEventListener("resize", refreshTitleOverflow);
 
 function usePrompt(txt) {
   const inp = document.getElementById("input");
@@ -1788,18 +1874,48 @@ function buildToolCard(t, isRunning = false, modelName = currentModel) {
   return det;
 }
 
+function refreshTitleOverflow() {
+  for (const div of document.querySelectorAll("#chat-list .chat-item")) {
+    const wrap = div.querySelector(".chat-title-wrap");
+    const track = div.querySelector(".chat-title-track");
+    if (!wrap || !track) continue;
+    div.classList.remove("has-overflow");
+    if (wrap.clientWidth > 20 && track.scrollWidth > wrap.clientWidth + 2) {
+      div.classList.add("has-overflow");
+      const dur = Math.max(4.5, (track.scrollWidth + 34) / 34).toFixed(2);
+      div.style.setProperty("--scroll-dur", `${dur}s`);
+    }
+  }
+}
+
 async function loadChatList() {
   const res = await fetch("/api/chats");
   const chats = await res.json();
   const list = document.getElementById("chat-list");
   list.innerHTML = "";
   for (const c of chats) {
+    const label = c.title || c.id;
     const div = document.createElement("div");
     div.className = "chat-item" + (c.id === currentChatId ? " active" : "");
-    const title = document.createElement("span");
-    title.className = "chat-title";
-    title.textContent = c.title || c.id;
-    title.onclick = () => openChat(c.id);
+    div.onclick = () => openChat(c.id);
+
+    const wrap = document.createElement("div");
+    wrap.className = "chat-title-wrap";
+    const track = document.createElement("div");
+    track.className = "chat-title-track";
+
+    const mainSpan = document.createElement("span");
+    mainSpan.className = "chat-title-main";
+    mainSpan.textContent = label;
+
+    const dupSpan = document.createElement("span");
+    dupSpan.className = "chat-title-dup";
+    dupSpan.setAttribute("aria-hidden", "true");
+    dupSpan.textContent = label;
+
+    track.appendChild(mainSpan);
+    track.appendChild(dupSpan);
+    wrap.appendChild(track);
 
     const del = document.createElement("button");
     del.className = "del-btn";
@@ -1811,10 +1927,11 @@ async function loadChatList() {
       if (currentChatId === c.id) newChat();
       else loadChatList();
     };
-    div.appendChild(title);
+    div.appendChild(wrap);
     div.appendChild(del);
     list.appendChild(div);
   }
+  refreshTitleOverflow();
 }
 
 const WELCOME_QUESTIONS = [
@@ -1965,12 +2082,48 @@ function newChat() {
   document.getElementById("input").focus();
 }
 
+let audioCtx = null;
+function unlockAudio() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    if (!audioCtx) audioCtx = new AC();
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+  } catch (_) {}
+}
+
+function playDoneChime() {
+  try {
+    if (!document.hidden && document.hasFocus()) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    if (!audioCtx) audioCtx = new AC();
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+    const now = audioCtx.currentTime;
+    [587.33, 880].forEach((freq, idx) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      const t0 = now + idx * 0.09;
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, t0);
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.linearRampToValueAtTime(0.06, t0 + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.24);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.25);
+    });
+  } catch (_) {}
+}
+
 async function sendMsg() {
   if (busy) return;
   const input = document.getElementById("input");
   const text = input.value.trim();
   if (!text) return;
 
+  unlockAudio();
   input.value = "";
   autoResize(input);
   busy = true;
@@ -1992,6 +2145,7 @@ async function sendMsg() {
     </div>
     <div class="steps-wrap"></div>
     <div class="css-loader">
+      <span class="ring-spin"></span>
       <div class="bars"><span></span><span></span><span></span><span></span><span></span></div>
       <span class="loader-sec">Thinking... 0.0s</span>
     </div>
@@ -2006,6 +2160,38 @@ async function sendMsg() {
 
   const tStart = performance.now();
   let loaderPhase = "Thinking";
+  let workingHoldUntil = 0;
+  let pendingPhaseTimer = null;
+  function applyLoaderPhase(phase) {
+    if (phase === "loading") {
+      loaderEl.classList.add("is-loading");
+      loaderPhase = "Loading model";
+    } else if (phase === "working") {
+      loaderEl.classList.remove("is-loading");
+      loaderPhase = "Working";
+    } else {
+      loaderEl.classList.remove("is-loading");
+      loaderPhase = "Thinking";
+    }
+    const s = ((performance.now() - tStart) / 1000).toFixed(1);
+    loaderSec.textContent = `${loaderPhase}... ${s}s`;
+  }
+  function setLoaderPhase(phase, minHoldMs = 0) {
+    clearTimeout(pendingPhaseTimer);
+    pendingPhaseTimer = null;
+    if (phase === "working" && minHoldMs > 0) {
+      workingHoldUntil = Math.max(workingHoldUntil, performance.now() + minHoldMs);
+    }
+    if (phase === "thinking" && performance.now() < workingHoldUntil) {
+      applyLoaderPhase("working");
+      pendingPhaseTimer = setTimeout(() => {
+        pendingPhaseTimer = null;
+        if (loaderEl.isConnected) applyLoaderPhase("thinking");
+      }, Math.max(0, workingHoldUntil - performance.now()));
+      return;
+    }
+    applyLoaderPhase(phase);
+  }
   const secTimer = setInterval(() => {
     const s = ((performance.now() - tStart) / 1000).toFixed(1);
     loaderSec.textContent = `${loaderPhase}... ${s}s`;
@@ -2042,7 +2228,9 @@ async function sendMsg() {
         if (!ln.trim()) continue;
         const ev = JSON.parse(ln);
 
-        if (ev.type === "title") {
+        if (ev.type === "phase") {
+          setLoaderPhase(ev.phase);
+        } else if (ev.type === "title") {
           currentChatId = ev.chat_id;
           loadChatList();
         } else if (ev.type === "thinking_delta") {
@@ -2056,7 +2244,7 @@ async function sendMsg() {
           thinkBox.querySelector(".think-label").textContent = `Thinking (${tb.textContent.length} chars)`;
           scrollBottom();
         } else if (ev.type === "tool_start") {
-          loaderPhase = `Running ${ev.name}`;
+          setLoaderPhase("working", 400);
           const card = buildToolCard(ev, true, activeModel);
           toolCards[ev.id] = card;
           stepsWrap.appendChild(card);
@@ -2071,12 +2259,13 @@ async function sendMsg() {
             }
             card.querySelector(".tool-out").textContent = ev.result || "(no output)";
           }
-          loaderPhase = "Thinking";
+          setLoaderPhase("working", 250);
           scrollBottom();
         } else if (ev.type === "tokens" && ev.tokens) {
           updateCtxBadge(ev.tokens.used, ev.tokens.max);
         } else if (ev.type === "done") {
           clearInterval(secTimer);
+          clearTimeout(pendingPhaseTimer);
           loaderEl.remove();
           currentChatId = ev.chat_id;
           if (ev.tokens) updateCtxBadge(ev.tokens.used, ev.tokens.max);
@@ -2098,11 +2287,13 @@ async function sendMsg() {
           row.appendChild(acts);
           scrollBottom();
           loadChatList();
+          playDoneChime();
         }
       }
     }
   } catch (err) {
     clearInterval(secTimer);
+    clearTimeout(pendingPhaseTimer);
     loaderEl.remove();
     const prose = document.createElement("div");
     prose.className = "prose";
@@ -2118,6 +2309,7 @@ async function sendMsg() {
     row.appendChild(prose);
   } finally {
     clearInterval(secTimer);
+    clearTimeout(pendingPhaseTimer);
     busy = false;
     currentAbort = null;
     setSendBtnState(false);
@@ -2474,11 +2666,13 @@ class WebHandler(BaseHTTPRequestHandler):
                     cancelled.set()
 
             t0 = time.monotonic()
+            emit({"type": "phase", "phase": "thinking" if is_model_loaded(model) else "loading"})
             if is_new_chat:
                 chat["title"] = generate_chat_title(msg, model, cancel_check=is_cancelled)
                 chat["ui_messages"].append({"role": "user", "text": msg})
                 save_chat(chat)
                 emit({"type": "title", "chat_id": cid, "title": chat["title"]})
+                emit({"type": "phase", "phase": "thinking"})
             else:
                 chat["ui_messages"].append({"role": "user", "text": msg})
 
