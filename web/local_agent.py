@@ -12,6 +12,7 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -70,6 +71,8 @@ def init_stdio():
 init_stdio()
 
 SOUL_FILE = DATA_DIR / "soul.md"
+SOULS_FILE = DATA_DIR / "souls.json"
+MAX_SOUL_SLOTS = 4
 CHATS_DIR = DATA_DIR / "chats"
 UPLOADS_DIR = DATA_DIR / "uploads"
 CHIPS_FILE = DATA_DIR / "chips.json"
@@ -82,7 +85,15 @@ DEFAULT_CHIPS = [
 MAX_STEPS = 8
 MIN_TOOL_STEPS = 2
 MAX_TOOL_STEPS_LIMIT = 40
-DEFAULT_SETTINGS = {"default_model": "", "sound": "chime", "max_tool_steps": MAX_STEPS}
+DEFAULT_TTS_MODEL = "lfm3-audio:2b"
+DEFAULT_SETTINGS = {
+    "default_model": "",
+    "sound": "chime",
+    "max_tool_steps": MAX_STEPS,
+    "tts_model": DEFAULT_TTS_MODEL,
+    "tts_voice": "",
+    "tts_auto": False,
+}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 VALID_PACKS = ("web", "files", "system")
 
@@ -108,6 +119,7 @@ OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
 OLLAMA_PULL_URL = f"{OLLAMA_HOST}/api/pull"
 OLLAMA_DELETE_URL = f"{OLLAMA_HOST}/api/delete"
 OLLAMA_PS_URL = f"{OLLAMA_HOST}/api/ps"
+OLLAMA_SPEECH_URL = f"{OLLAMA_HOST}/v1/audio/speech"
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3")
 NUM_CTX = int(os.environ.get("AGENT_CTX", "16384"))
 WEB_HOST = "127.0.0.1"
@@ -659,10 +671,230 @@ def execute_tool(name: str, args: dict, cancel_check=None) -> str:
 
 
 # --- OLLAMA HELPERS ---
+def _default_original_soul() -> str:
+    if SOUL_FILE.exists():
+        txt = SOUL_FILE.read_text(encoding="utf-8")
+        if txt.strip():
+            return txt
+    return DEFAULT_SOUL
+
+
+def load_souls() -> dict:
+    if SOULS_FILE.exists():
+        try:
+            raw = json.loads(SOULS_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and isinstance(raw.get("slots"), list):
+                original = str(raw.get("original") or DEFAULT_SOUL)
+                slots = []
+                for idx, item in enumerate(raw["slots"][:MAX_SOUL_SLOTS]):
+                    if not isinstance(item, dict):
+                        continue
+                    sid = str(item.get("id") or f"soul-{idx + 1}").strip()[:40]
+                    name = (str(item.get("name") or f"Soul {len(slots) + 1}").strip() or f"Soul {len(slots) + 1}")[:24]
+                    slots.append({"id": sid, "name": name, "content": str(item.get("content") or "")})
+                if not slots:
+                    slots = [{"id": "original", "name": "Original", "content": original}]
+                active_id = str(raw.get("active_id") or slots[0]["id"])
+                if not any(s["id"] == active_id for s in slots):
+                    active_id = slots[0]["id"]
+                return {"active_id": active_id, "original": original, "slots": slots}
+        except Exception:
+            pass
+    orig = _default_original_soul()
+    return {
+        "active_id": "original",
+        "original": orig,
+        "slots": [{"id": "original", "name": "Original", "content": orig}],
+    }
+
+
+def save_souls(data: dict) -> dict:
+    cur = load_souls()
+    original = cur.get("original") or DEFAULT_SOUL
+    if isinstance(data, dict) and isinstance(data.get("slots"), list):
+        slots = []
+        seen = set()
+        for idx, item in enumerate(data["slots"][:MAX_SOUL_SLOTS]):
+            if not isinstance(item, dict):
+                continue
+            sid = re.sub(r"[^a-zA-Z0-9_-]", "", str(item.get("id") or f"soul-{idx + 1}"))[:40] or f"soul-{idx + 1}"
+            if sid in seen:
+                sid = f"{sid}-{len(slots) + 1}"
+            seen.add(sid)
+            name = (str(item.get("name") or f"Soul {len(slots) + 1}").strip() or f"Soul {len(slots) + 1}")[:24]
+            slots.append({"id": sid, "name": name, "content": str(item.get("content") or "")})
+        if not slots:
+            slots = [{"id": "original", "name": "Original", "content": original}]
+        active_id = str(data.get("active_id") or slots[0]["id"])
+        if not any(s["id"] == active_id for s in slots):
+            active_id = slots[0]["id"]
+        res = {"active_id": active_id, "original": original, "slots": slots}
+    elif isinstance(data, dict) and "content" in data:
+        slots = cur["slots"]
+        active_id = cur["active_id"]
+        content = str(data.get("content") or "")
+        for s in slots:
+            if s["id"] == active_id:
+                s["content"] = content
+                break
+        res = {"active_id": active_id, "original": original, "slots": slots}
+    else:
+        res = cur
+    active = next((s for s in res["slots"] if s["id"] == res["active_id"]), res["slots"][0])
+    SOUL_FILE.write_text(active["content"], encoding="utf-8")
+    SOULS_FILE.write_text(json.dumps(res, indent=2, ensure_ascii=False), encoding="utf-8")
+    return res
+
+
 def load_soul() -> str:
     if SOUL_FILE.exists():
         return SOUL_FILE.read_text(encoding="utf-8").strip()
     return DEFAULT_SOUL.strip()
+
+
+class MissingSpeechModelError(RuntimeError):
+    def __init__(self, model: str, message: str):
+        super().__init__(message)
+        self.model = model
+
+
+def clean_tts_text(raw: str) -> str:
+    s = str(raw or "")
+    s = re.sub(r"<think>.*?</think>", " ", s, flags=re.S)
+    s = re.sub(r"<tool_call>.*?</tool_call>", " ", s, flags=re.S)
+    s = re.sub(r"```[\s\S]*?```", " Code block omitted. ", s)
+    s = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    s = re.sub(r"https?://\S+", " link ", s)
+    s = re.sub(r"`([^`\n]+)`", r"\1", s)
+    s = re.sub(r"(?m)^\s*#{1,6}\s*", "", s)
+    s = re.sub(r"(?m)^\s*[-*+]\s+", "", s)
+    s = re.sub(r"(?m)^\s*>\s*", "", s)
+    s = s.replace("**", "").replace("__", "").replace("~~", "")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def split_tts_chunks(text: str, limit: int = 3500) -> list:
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            chunks.append(rest)
+            break
+        cut = -1
+        for sep in ("\n\n", ". ", "! ", "? ", "\n", " "):
+            pos = rest.rfind(sep, 0, limit)
+            if pos >= limit // 3:
+                cut = pos + len(sep)
+                break
+        if cut <= 0:
+            cut = limit
+        chunks.append(rest[:cut].strip())
+        rest = rest[cut:].strip()
+    return [c for c in chunks if c]
+
+
+def build_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    data_size = len(pcm_bytes)
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
+    return header + pcm_bytes
+
+
+def _raise_ollama_audio_http_error(e: urllib.error.HTTPError, eff_model: str, label: str):
+    err_body = e.read().decode("utf-8", errors="replace")
+    msg = err_body
+    try:
+        parsed = json.loads(err_body)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            msg = str(parsed["error"].get("message") or msg)
+    except Exception:
+        pass
+    if e.code == 404 or "not found" in msg.lower():
+        raise MissingSpeechModelError(eff_model, f'Speech model "{eff_model}" is not installed in Ollama yet.') from e
+    raise RuntimeError(f"Ollama {label} HTTP {e.code}: {msg}") from e
+
+
+def iter_ollama_speech_pcm(raw_text: str, model: str = DEFAULT_TTS_MODEL, voice: str = "", allow_empty: bool = False):
+    """Yield 24 kHz 16-bit LE mono PCM chunks streamed directly from Ollama /v1/audio/speech."""
+    cleaned = clean_tts_text(raw_text)
+    if not cleaned:
+        if allow_empty:
+            return
+        raise ValueError("Nothing readable to speak.")
+    eff_model = (model or DEFAULT_TTS_MODEL).strip()
+    chunks = split_tts_chunks(cleaned, limit=3500)
+
+    for piece in chunks:
+        payload = {"model": eff_model, "input": piece, "response_format": "pcm"}
+        if voice:
+            payload["voice"] = voice
+        req = urllib.request.Request(
+            OLLAMA_SPEECH_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=180)
+        except urllib.error.HTTPError as e:
+            _raise_ollama_audio_http_error(e, eff_model, "TTS")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and try again.") from e
+
+        header_checked = False
+        carry = b""
+        read_fn = getattr(resp, "read1", None) or resp.read
+        with resp:
+            while True:
+                raw_blk = read_fn(8192)
+                if not raw_blk:
+                    break
+                data = carry + raw_blk
+                carry = b""
+                if not header_checked:
+                    if data[:4] == b"RIFF":
+                        dpos = data.find(b"data", 0, 64)
+                        if dpos == -1 and len(data) < 64:
+                            carry = data
+                            continue
+                        if dpos != -1 and dpos + 8 <= len(data):
+                            data = data[dpos + 8:]
+                    header_checked = True
+                if len(data) % 2:
+                    carry = data[-1:]
+                    data = data[:-1]
+                if data:
+                    yield data
+
+
+def synthesize_ollama_speech(raw_text: str, model: str = DEFAULT_TTS_MODEL, voice: str = "") -> bytes:
+    eff_model = (model or DEFAULT_TTS_MODEL).strip()
+    pcm_all = bytearray()
+    for chunk in iter_ollama_speech_pcm(raw_text, model=eff_model, voice=voice, allow_empty=False):
+        pcm_all.extend(chunk)
+    if not pcm_all:
+        raise RuntimeError(f'Speech model "{eff_model}" returned empty audio.')
+    return build_wav_bytes(bytes(pcm_all))
 
 
 def find_ollama_executable() -> str:
@@ -1119,8 +1351,7 @@ def run_agent_stream(
     tools = build_tools_schema(packs)
     has_tools = bool(tools)
 
-    att_header = _build_attachment_header(chat_id, attached_files or [])
-    prompt_text = att_header + user_text
+    prompt_text = _build_attachment_header(chat_id, attached_files or []) + user_text
     history.append({"role": "user", "content": prompt_text})
     trim_history(history)
 
@@ -1133,7 +1364,8 @@ def run_agent_stream(
             "and edit MediaWiki (.wiki), Markdown (.md), or text (.txt) files with edit_doc(file, action, ...)."
         )
 
-    step_limit = normalize_tool_steps(load_settings().get("max_tool_steps", MAX_STEPS))
+    settings = load_settings()
+    step_limit = normalize_tool_steps(settings.get("max_tool_steps", MAX_STEPS))
     all_thinking = []
     all_tools = []
     all_outputs = []
@@ -1378,9 +1610,14 @@ def load_settings() -> dict:
             if isinstance(raw, dict):
                 dm = str(raw.get("default_model", "")).strip()[:120]
                 snd = str(raw.get("sound", "chime")).strip().lower()
+                tm = str(raw.get("tts_model", DEFAULT_TTS_MODEL) or DEFAULT_TTS_MODEL).strip()[:120]
+                tv = str(raw.get("tts_voice", "") or "").strip()[:60]
                 out["default_model"] = dm
                 out["sound"] = snd if snd in VALID_SOUNDS else "chime"
                 out["max_tool_steps"] = normalize_tool_steps(raw.get("max_tool_steps", MAX_STEPS))
+                out["tts_model"] = tm or DEFAULT_TTS_MODEL
+                out["tts_voice"] = tv
+                out["tts_auto"] = bool(raw.get("tts_auto", False))
         except Exception:
             pass
     return out
@@ -1396,6 +1633,13 @@ def save_settings(data: dict) -> dict:
             cur["sound"] = snd if snd in VALID_SOUNDS else "chime"
         if "max_tool_steps" in data:
             cur["max_tool_steps"] = normalize_tool_steps(data.get("max_tool_steps"), cur.get("max_tool_steps", MAX_STEPS))
+        if "tts_model" in data:
+            tm = str(data.get("tts_model") or "").strip()[:120]
+            cur["tts_model"] = tm or DEFAULT_TTS_MODEL
+        if "tts_voice" in data:
+            cur["tts_voice"] = str(data.get("tts_voice") or "").strip()[:60]
+        if "tts_auto" in data:
+            cur["tts_auto"] = bool(data.get("tts_auto"))
     SETTINGS_FILE.write_text(json.dumps(cur, indent=2, ensure_ascii=False), encoding="utf-8")
     return cur
 
@@ -1920,21 +2164,36 @@ WEB_HTML = r"""<!doctype html>
     padding: 6px 12px; background: var(--surface); border-bottom: 1px solid var(--border);
     font-family: var(--font-mono); font-size: 11px; color: var(--muted);
   }
-  .copy-btn {
+  .copy-btn, .speak-btn {
     background: transparent; border: 1px solid var(--border); color: var(--muted);
     padding: 2px 8px; border-radius: 5px; font-size: 11px; flex-shrink: 0;
+    display: inline-flex; align-items: center; justify-content: center;
   }
-  .copy-btn:hover { color: var(--white); border-color: rgba(255,255,255,0.55); }
+  .speak-btn { padding: 3px 6px; min-width: 27px; min-height: 22px; }
+  .copy-btn:hover, .speak-btn:hover { color: var(--white); border-color: rgba(255,255,255,0.55); }
+  .speak-btn.speaking {
+    color: var(--m-1); border-color: var(--m-3); background: var(--m-glow);
+    animation: pulseSpeak 1.3s ease-in-out infinite;
+  }
+  @keyframes pulseSpeak {
+    0%, 100% { box-shadow: 0 0 0 0 var(--m-glow); }
+    50%      { box-shadow: 0 0 0 4px var(--m-glow); }
+  }
+  .tts-spin {
+    width: 11px; height: 11px; border-radius: 50%;
+    border: 1.5px solid rgba(255,255,255,0.2); border-top-color: var(--m-2);
+    animation: spinRing 0.7s linear infinite; display: inline-block;
+  }
   .code-block pre {
     margin: 0; padding: 12px 14px; overflow-x: auto;
     font-family: var(--font-mono); font-size: 13px; line-height: 1.5; color: var(--text);
   }
 
   .msg-actions {
-    padding-left: 22px; display: flex; align-items: center; gap: 10px;
-    opacity: 0; transition: opacity 0.15s; font-size: 11px; color: var(--muted);
+    padding-left: 22px; display: flex; align-items: center; gap: 7px;
+    opacity: 0.55; transition: opacity 0.15s; font-size: 11px; color: var(--muted);
   }
-  .msg-row.assistant:hover .msg-actions { opacity: 1; }
+  .msg-row.assistant:hover .msg-actions, .msg-actions.tts-active { opacity: 1; }
   .stream-cursor {
     display: inline-block; width: 6px; height: 1.05em; vertical-align: text-bottom;
     margin-left: 3px; border-radius: 2px;
@@ -2201,10 +2460,33 @@ WEB_HTML = r"""<!doctype html>
   #pull-box { max-width: 440px; }
   #models-box { max-width: 560px; }
   #files-box { max-width: 600px; }
+  .soul-tabs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .soul-tab {
+    padding: 5px 10px; border-radius: 7px; font-size: 12px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+  }
+  .soul-tab:hover { color: var(--white); border-color: rgba(255, 255, 255, 0.35); }
+  .soul-tab.active {
+    background: var(--m-glow); border-color: var(--m-3); color: var(--m-1); font-weight: 500;
+  }
+  .soul-tab-add { border-style: dashed; }
+  .soul-meta-row { display: flex; align-items: center; gap: 8px; }
+  #soul-name {
+    flex: 1; min-width: 0; background: var(--bg); color: var(--white);
+    border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px;
+    font: inherit; font-size: 13px; transition: border-color 0.15s, box-shadow 0.15s;
+  }
   #soul-text {
-    width: 100%; height: 280px; background: var(--bg); color: var(--text);
+    width: 100%; height: 240px; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 8px; padding: 12px;
     font-family: var(--font-mono); font-size: 13px; line-height: 1.5; resize: vertical;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  #soul-text:focus, #soul-name:focus {
+    outline: none;
+    border-color: rgba(255, 255, 255, 0.55);
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
   }
   #chips-rows, #models-rows, #files-rows { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }
   .model-mgr-row {
@@ -2224,11 +2506,11 @@ WEB_HTML = r"""<!doctype html>
   .btn-danger-arm { border-color: rgba(255, 77, 77, 0.7) !important; color: #ff8080 !important; background: rgba(255, 77, 77, 0.12) !important; }
   .models-status-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 18px; font-size: 12px; color: var(--muted); }
   .chip-edit-row { display: grid; grid-template-columns: 160px 1fr auto; gap: 8px; align-items: center; }
-  .chip-edit-row input, #pull-input, .setting-ctrl select {
+  .chip-edit-row input, #pull-input, .setting-ctrl select, .setting-ctrl input[type="text"] {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 7px; padding: 7px 10px; font: inherit; font-size: 13px; min-width: 0;
   }
-  .chip-edit-row input:focus, #pull-input:focus, .setting-ctrl select:focus {
+  .chip-edit-row input:focus, #pull-input:focus, .setting-ctrl select:focus, .setting-ctrl input[type="text"]:focus {
     outline: none; border-color: rgba(255,255,255,0.45);
   }
   .setting-row {
@@ -2239,7 +2521,7 @@ WEB_HTML = r"""<!doctype html>
   .setting-meta b { font-size: 13px; color: var(--white); font-weight: 500; }
   .setting-meta span { font-size: 11px; color: var(--muted); }
   .setting-ctrl { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
-  .setting-ctrl select { flex: 1; width: 100%; max-width: 215px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .setting-ctrl select, .setting-ctrl input[type="text"] { flex: 1; width: 100%; max-width: 215px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .setting-range-wrap { gap: 10px; }
   .setting-ctrl input[type="range"] {
     flex: 1; min-width: 0; height: 4px; cursor: pointer;
@@ -2410,13 +2692,19 @@ WEB_HTML = r"""<!doctype html>
   <div id="soul-modal">
     <div id="soul-box">
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>Edit soul.md (applies live)</b>
+        <b>Souls (up to 4 presets, applies live)</b>
         <span style="color:var(--muted);font-size:12px;">__SOUL_PATH__</span>
       </div>
-      <textarea id="soul-text"></textarea>
+      <div id="soul-tabs" class="soul-tabs"></div>
+      <div class="soul-meta-row">
+        <input id="soul-name" type="text" maxlength="24" spellcheck="false" placeholder="Soul name..." oninput="updateActiveSoulName(this.value)" />
+        <button type="button" onclick="restoreOriginalSoul()" title="Restore default original soul">Restore original</button>
+        <button type="button" onclick="deleteCurrentSoul()" title="Delete selected soul">Delete</button>
+      </div>
+      <textarea id="soul-text" spellcheck="false" placeholder="Write instructions for this soul..."></textarea>
       <div class="modal-row">
-        <button onclick="closeSoul()">Cancel</button>
-        <button class="btn-white" onclick="saveSoul()">Save soul</button>
+        <button type="button" onclick="closeSoul()">Cancel</button>
+        <button type="button" class="btn-white" onclick="saveSoul()">Save &amp; use</button>
       </div>
     </div>
   </div>
@@ -2480,6 +2768,24 @@ WEB_HTML = r"""<!doctype html>
         <div class="setting-ctrl setting-range-wrap">
           <input type="range" id="set-max-steps" min="2" max="40" step="1" value="8" oninput="updateStepsLabel(this.value)" />
           <span class="setting-val" id="set-max-steps-val">8</span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-meta">
+          <b>Speech model</b>
+          <span>Local Ollama TTS model</span>
+        </div>
+        <div class="setting-ctrl">
+          <select id="set-tts-model"></select>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="setting-meta">
+          <b>Speech voice</b>
+          <span>Optional voice name (default if empty)</span>
+        </div>
+        <div class="setting-ctrl">
+          <input type="text" id="set-tts-voice" spellcheck="false" placeholder="default (or Zoey, Freya...)" />
         </div>
       </div>
       <div class="modal-split">
@@ -2588,6 +2894,7 @@ const SVG_STOP     = `<svg width="14" height="14" viewBox="0 0 24 24" fill="curr
 const SVG_TRIANGLE = `<svg class="tri-svg" width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M5.5 3.5l6 4.5-6 4.5z"/></svg>`;
 const SVG_CLOSE    = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6l-12 12"/></svg>`;
 const SVG_CHECK    = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>`;
+const SVG_SPEAKER  = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>`;
 
 const MODEL_PALETTES = {
   "lfm":     ["#ede9fe", "#c4b5fd", "#a78bfa", "#8b5cf6", "#7c3aed"],
@@ -2694,7 +3001,7 @@ async function streamPullRequest(modelName, onProgress) {
   }
 }
 
-async function pullModel(modelName) {
+async function pullModel(modelName, switchChatModel = true) {
   if (pullingModel) return;
   pullingModel = true;
   const banner = document.getElementById("setup-banner");
@@ -2726,8 +3033,10 @@ async function pullModel(modelName) {
   }
 
   pullingModel = false;
-  currentModel = modelName;
-  modelChosenByUser = true;
+  if (switchChatModel) {
+    currentModel = modelName;
+    modelChosenByUser = true;
+  }
   await loadModels(false);
 }
 
@@ -2757,6 +3066,14 @@ function syncPlusMenuState() {
   }
   for (const item of items) {
     item.classList.toggle("on", !!activePacks[item.dataset.packId]);
+  }
+  const voiceItem = menu.querySelector(".plus-item[data-tts-auto]");
+  if (voiceItem) {
+    const ttsOn = typeof appSettings !== "undefined" && !!appSettings.tts_auto;
+    const ttsModel = (typeof appSettings !== "undefined" && appSettings.tts_model) || "lfm3-audio:2b";
+    voiceItem.classList.toggle("on", ttsOn);
+    const sub = voiceItem.querySelector(".plus-item-sub");
+    if (sub) sub.textContent = `Speak via ${ttsModel}`;
   }
 }
 
@@ -2870,6 +3187,34 @@ function renderPlusMenu() {
     item.onclick = (e) => { e.stopPropagation(); togglePack(p.id); };
     menu.appendChild(item);
   }
+
+  const sepVoice = document.createElement("div");
+  sepVoice.className = "plus-sep";
+  menu.appendChild(sepVoice);
+
+  const secVoice = document.createElement("div");
+  secVoice.className = "plus-sec";
+  secVoice.textContent = "Voice (0 tokens to chat)";
+  menu.appendChild(secVoice);
+
+  const ttsAutoOn = typeof appSettings !== "undefined" && !!appSettings.tts_auto;
+  const ttsModelName = (typeof appSettings !== "undefined" && appSettings.tts_model) || "lfm3-audio:2b";
+  const voiceItem = document.createElement("button");
+  voiceItem.type = "button";
+  voiceItem.dataset.ttsAuto = "1";
+  voiceItem.className = "plus-item" + (ttsAutoOn ? " on" : "");
+  voiceItem.innerHTML = `
+    <span class="plus-item-left">
+      <span class="plus-item-meta">
+        <span class="plus-item-title">Auto-read replies</span>
+        <span class="plus-item-sub"></span>
+      </span>
+    </span>
+    <span class="plus-toggle"></span>
+  `;
+  voiceItem.querySelector(".plus-item-sub").textContent = `Speak via ${ttsModelName}`;
+  voiceItem.onclick = (e) => { e.stopPropagation(); toggleTtsAuto(); };
+  menu.appendChild(voiceItem);
 }
 
 function fmtFileSize(bytes) {
@@ -2885,7 +3230,8 @@ function renderComposerBar() {
   if (!bar) return;
 
   const enabledIds = getEnabledPacksList();
-  const hasAny = enabledIds.length > 0 || pendingFiles.length > 0 || !!uploadNotice;
+  const ttsAuto = typeof appSettings !== "undefined" && !!appSettings.tts_auto;
+  const hasAny = enabledIds.length > 0 || ttsAuto || pendingFiles.length > 0 || !!uploadNotice;
 
   if (!hasAny) {
     if (wrap) {
@@ -2941,6 +3287,31 @@ function renderComposerBar() {
     } else {
       existing.delete(key);
     }
+    desired.push(chip);
+  }
+
+  if (ttsAuto) {
+    const key = "tts:auto";
+    let chip = existing.get(key);
+    const ttsModel = (appSettings && appSettings.tts_model) || "lfm3-audio:2b";
+    if (!chip) {
+      chip = document.createElement("span");
+      chip.className = "tool-chip chip-enter";
+      chip.dataset.chipKey = key;
+      const txt = document.createElement("span");
+      txt.className = "voice-chip-lbl";
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "chip-x";
+      x.title = "Turn off auto-read";
+      x.innerHTML = SVG_CLOSE;
+      x.onclick = () => toggleTtsAuto();
+      chip.appendChild(txt);
+      chip.appendChild(x);
+    } else {
+      existing.delete(key);
+    }
+    chip.querySelector(".voice-chip-lbl").textContent = `Voice · ${ttsModel}`;
     desired.push(chip);
   }
 
@@ -3830,6 +4201,643 @@ function copyText(btn, rawText) {
   setTimeout(() => btn.textContent = "Copy", 1400);
 }
 
+let activeTtsAudio = null;
+let activeTtsBtn = null;
+let activeLiveSpeech = null;
+
+class SpeechSentenceBuffer {
+  constructor() {
+    this.raw = "";
+    this.cursor = 0;
+    this.inCodeFence = false;
+    this.chunksSent = 0;
+  }
+  reset() {
+    this.raw = "";
+    this.cursor = 0;
+    this.inCodeFence = false;
+    this.chunksSent = 0;
+  }
+  pushDelta(delta) {
+    if (!delta) return [];
+    this.raw += delta;
+    return this.flush(false);
+  }
+  finish(finalText = "") {
+    if (finalText && this.chunksSent === 0 && !this.raw) {
+      this.raw = finalText;
+    }
+    return this.flush(true);
+  }
+  flush(final = false) {
+    const out = [];
+    while (this.cursor < this.raw.length) {
+      if (this.inCodeFence) {
+        const closeIdx = this.raw.indexOf("```", this.cursor);
+        if (closeIdx < 0) {
+          if (final) {
+            this.cursor = this.raw.length;
+            this.inCodeFence = false;
+          }
+          break;
+        }
+        this.cursor = closeIdx + 3;
+        this.inCodeFence = false;
+        continue;
+      }
+      const fenceIdx = this.raw.indexOf("```", this.cursor);
+      const limit = fenceIdx >= 0 ? fenceIdx : this.raw.length;
+      const segment = this.raw.slice(this.cursor, limit);
+
+      let cutRel = -1;
+      const re = /([.!?…](?=\s)|\n+|[。！？])/g;
+      const m = re.exec(segment);
+      if (m) {
+        cutRel = m.index + m[0].length;
+        if (m[1] === "." && /^\s*\d+\.$/.test(segment.slice(0, m.index + 1))) {
+          const m2 = re.exec(segment);
+          cutRel = m2 ? m2.index + m2[0].length : -1;
+        }
+      } else if (fenceIdx >= 0) {
+        cutRel = segment.length;
+      } else if (final) {
+        cutRel = segment.length;
+      } else if (this.chunksSent === 0 && segment.length >= 110) {
+        const clauseRe = /(?:,\s|;\s|:\s)/g;
+        let cm;
+        while ((cm = clauseRe.exec(segment)) !== null) {
+          if (cm.index >= 45) {
+            cutRel = cm.index + cm[0].length;
+            break;
+          }
+        }
+      }
+
+      if (cutRel >= 0) {
+        const piece = segment.slice(0, cutRel).trim();
+        this.cursor += cutRel;
+        if (piece && /[A-Za-z0-9\u00C0-\uFFFF]/.test(piece)) {
+          out.push(piece);
+          this.chunksSent += 1;
+        }
+        if (fenceIdx >= 0 && this.cursor === fenceIdx) {
+          this.cursor += 3;
+          this.inCodeFence = true;
+        }
+        continue;
+      }
+      break;
+    }
+    return out;
+  }
+}
+
+function ttsCacheKey(model, voice) {
+  return `${String(model || "").trim()}|${String(voice || "").trim()}`;
+}
+
+function buildWavHeader(dataBytes, sampleRate = 24000, channels = 1, bitsPerSample = 16) {
+  const hdr = new ArrayBuffer(44);
+  const v = new DataView(hdr);
+  const writeTag = (off, s) => {
+    for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+  };
+  const byteRate = sampleRate * channels * (bitsPerSample >> 3);
+  const blockAlign = channels * (bitsPerSample >> 3);
+  writeTag(0, "RIFF");
+  v.setUint32(4, 36 + dataBytes, true);
+  writeTag(8, "WAVE");
+  writeTag(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, channels, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, byteRate, true);
+  v.setUint16(32, blockAlign, true);
+  v.setUint16(34, bitsPerSample, true);
+  writeTag(36, "data");
+  v.setUint32(40, dataBytes, true);
+  return new Uint8Array(hdr);
+}
+
+function normalizePcmChunks(pcmChunks) {
+  const aligned = [];
+  let totalBytes = 0;
+  for (const raw of (pcmChunks || [])) {
+    if (!raw || raw.length < 2) continue;
+    const evenLen = raw.length & ~1;
+    const chunk = evenLen === raw.length ? raw : raw.subarray(0, evenLen);
+    aligned.push(chunk);
+    totalBytes += evenLen;
+  }
+  return { aligned, totalBytes };
+}
+
+function encodePcmChunksToWavBytes(pcmChunks, sampleRate = 24000) {
+  const { aligned, totalBytes } = normalizePcmChunks(pcmChunks);
+  const out = new Uint8Array(44 + totalBytes);
+  out.set(buildWavHeader(totalBytes, sampleRate), 0);
+  let off = 44;
+  for (const c of aligned) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
+function encodePcmChunksToWavBlob(pcmChunks, sampleRate = 24000) {
+  const { aligned, totalBytes } = normalizePcmChunks(pcmChunks);
+  if (!totalBytes) return null;
+  return new Blob([buildWavHeader(totalBytes, sampleRate), ...aligned], { type: "audio/wav" });
+}
+
+function cacheWavOnSpeakBtn(btn, blob, cacheKey) {
+  if (!btn || !blob || !blob.size) return;
+  if (btn._ttsUrl && btn._ttsKey === cacheKey) return;
+  if (btn._ttsUrl) {
+    try { URL.revokeObjectURL(btn._ttsUrl); } catch (_) {}
+  }
+  btn._ttsUrl = URL.createObjectURL(blob);
+  btn._ttsKey = cacheKey;
+}
+
+function resetSpeakBtn(btn) {
+  if (!btn) return;
+  btn.classList.remove("speaking", "loading");
+  btn.title = "Read aloud";
+  btn.innerHTML = SVG_SPEAKER;
+  const row = btn.closest(".msg-actions");
+  if (row) row.classList.remove("tts-active");
+}
+
+function stopTtsPlayback() {
+  if (activeLiveSpeech) {
+    const ls = activeLiveSpeech;
+    activeLiveSpeech = null;
+    ls.stop();
+  }
+  if (activeTtsAudio) {
+    try { activeTtsAudio.pause(); activeTtsAudio.currentTime = 0; } catch (_) {}
+    activeTtsAudio = null;
+  }
+  if (activeTtsBtn) {
+    resetSpeakBtn(activeTtsBtn);
+    activeTtsBtn = null;
+  }
+}
+
+const TTS_SAMPLE_RATE = 24000;
+const TTS_INITIAL_PREBUF_BYTES = 48000; // 1.00s cushion at 24kHz 16-bit mono
+const TTS_REBUF_BYTES = 32768;          // 0.68s recovery cushion after any underrun
+const TTS_COALESCE_BYTES = 24576;       // 0.51s coalesced AudioBuffer blocks
+const TTS_LOW_RUNWAY_BYTES = 8192;
+const TTS_FADE_SAMPLES = 144;           // 6ms linear edge fade at non-contiguous starts / EOF
+
+function pcmInt16ToSoftFloats(u8, sampleCount, applyFadeIn, applyFadeOut) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, sampleCount * 2);
+  const floats = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    let x = dv.getInt16(i * 2, true) / 32768.0;
+    const ax = x < 0 ? -x : x;
+    if (ax > 0.85) {
+      const shaped = 0.85 + 0.09 * Math.tanh((ax - 0.85) / 0.15);
+      x = x < 0 ? -shaped : shaped;
+    }
+    floats[i] = x;
+  }
+  const maxRamp = Math.floor(sampleCount / 2);
+  if (applyFadeIn && maxRamp > 0) {
+    const n = Math.min(TTS_FADE_SAMPLES, maxRamp);
+    for (let i = 0; i < n; i++) floats[i] *= i / n;
+  }
+  if (applyFadeOut && maxRamp > 0) {
+    const n = Math.min(TTS_FADE_SAMPLES, maxRamp);
+    for (let i = 0; i < n; i++) floats[sampleCount - 1 - i] *= i / n;
+  }
+  return floats;
+}
+
+function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
+  stopTtsPlayback();
+  const effModel = (model || appSettings.tts_model || "lfm3-audio:2b").trim();
+  const effVoice = (voice || appSettings.tts_voice || "").trim();
+  const cacheKey = ttsCacheKey(effModel, effVoice);
+
+  let liveHeaderBtn = null;
+  if (!existingBtn && headEl) {
+    liveHeaderBtn = document.createElement("button");
+    liveHeaderBtn.type = "button";
+    liveHeaderBtn.className = "speak-btn live-spk";
+    liveHeaderBtn.title = `Speaking live (${effModel}) — click to stop`;
+    liveHeaderBtn.setAttribute("aria-label", "Stop live speech");
+    liveHeaderBtn.innerHTML = '<span class="tts-spin"></span>';
+    liveHeaderBtn.onclick = () => stopTtsPlayback();
+    headEl.appendChild(liveHeaderBtn);
+  }
+
+  const startBtn = existingBtn || liveHeaderBtn;
+  const session = {
+    model: effModel,
+    voice: effVoice,
+    cacheKey,
+    queue: [],
+    batchesRequested: 0,
+    inputEnded: false,
+    aborted: false,
+    workerRunning: false,
+    hasAudio: false,
+    abortCtrl: null,
+    nextTime: 0,
+    sources: new Set(),
+    pendingAudio: [],
+    pendingBytes: 0,
+    pcmChunks: [],
+    wavBlob: null,
+    wavCommitted: false,
+    btn: startBtn,
+    finalBtn: existingBtn || null,
+    liveHeaderBtn,
+    _commitWavCache() {
+      if (session.aborted) return;
+      if (session.finalBtn && session.wavBlob && !session.wavCommitted) {
+        cacheWavOnSpeakBtn(session.finalBtn, session.wavBlob, session.cacheKey);
+        session.wavCommitted = true;
+        session.wavBlob = null;
+      }
+    },
+    _buildCacheIfComplete() {
+      if (
+        !session.aborted &&
+        session.inputEnded &&
+        !session.workerRunning &&
+        session.queue.length === 0 &&
+        !session.wavBlob &&
+        !session.wavCommitted &&
+        session.pcmChunks.length > 0
+      ) {
+        session.wavBlob = encodePcmChunksToWavBlob(session.pcmChunks, TTS_SAMPLE_RATE);
+        session.pcmChunks = [];
+        session._commitWavCache();
+      }
+    },
+    _doneCheck() {
+      if (session.aborted) return;
+      session._buildCacheIfComplete();
+      if (session.inputEnded && !session.workerRunning && session.queue.length === 0 && session.sources.size === 0) {
+        if (activeLiveSpeech === session) activeLiveSpeech = null;
+        if (session.liveHeaderBtn && session.liveHeaderBtn.isConnected) {
+          session.liveHeaderBtn.remove();
+          session.liveHeaderBtn = null;
+        }
+        if (activeTtsBtn === session.btn) {
+          resetSpeakBtn(activeTtsBtn);
+          activeTtsBtn = null;
+        } else if (session.btn) {
+          resetSpeakBtn(session.btn);
+        }
+      }
+    },
+    _syncBtnState() {
+      if (session.aborted || !session.btn) return;
+      if (session.hasAudio) {
+        session.btn.classList.remove("loading");
+        session.btn.classList.add("speaking");
+        session.btn.innerHTML = SVG_SPEAKER;
+        session.btn.title = "Stop speaking";
+      } else {
+        session.btn.classList.add("loading");
+        session.btn.classList.remove("speaking");
+        session.btn.innerHTML = '<span class="tts-spin"></span>';
+        session.btn.title = `Synthesizing voice (${session.model})...`;
+      }
+      const acts = session.btn.closest(".msg-actions");
+      if (acts) acts.classList.add("tts-active");
+    },
+    attachFinalButton(btn) {
+      if (!btn) return;
+      session.finalBtn = btn;
+      session._commitWavCache();
+      if (session.liveHeaderBtn && session.liveHeaderBtn.isConnected) {
+        session.liveHeaderBtn.remove();
+        session.liveHeaderBtn = null;
+      }
+      if (session.aborted) return;
+      const alive = !session.inputEnded || session.workerRunning || session.queue.length > 0 || session.sources.size > 0;
+      if (!alive) {
+        if (activeLiveSpeech === session) activeLiveSpeech = null;
+        if (activeTtsBtn === session.btn) activeTtsBtn = null;
+        resetSpeakBtn(btn);
+        return;
+      }
+      session.btn = btn;
+      activeTtsBtn = btn;
+      session._syncBtnState();
+    },
+    enqueue(text) {
+      if (session.aborted || !text) return;
+      session.queue.push(text);
+      session._syncBtnState();
+      if (!session.workerRunning) session._drain();
+    },
+    finish(remainingChunks) {
+      if (session.aborted) return;
+      if (Array.isArray(remainingChunks)) {
+        for (const c of remainingChunks) {
+          if (c) session.queue.push(c);
+        }
+      }
+      session.inputEnded = true;
+      session._syncBtnState();
+      if (!session.workerRunning) {
+        if (session.queue.length > 0) session._drain();
+        else session._doneCheck();
+      }
+    },
+    stop() {
+      session.aborted = true;
+      session.queue.length = 0;
+      session.pendingAudio.length = 0;
+      session.pendingBytes = 0;
+      session.pcmChunks.length = 0;
+      session.wavBlob = null;
+      if (session.abortCtrl) {
+        try { session.abortCtrl.abort(); } catch (_) {}
+        session.abortCtrl = null;
+      }
+      for (const src of Array.from(session.sources)) {
+        try { src.stop(); } catch (_) {}
+      }
+      session.sources.clear();
+      if (session.liveHeaderBtn && session.liveHeaderBtn.isConnected) {
+        session.liveHeaderBtn.remove();
+        session.liveHeaderBtn = null;
+      }
+      if (activeTtsBtn === session.btn) {
+        resetSpeakBtn(activeTtsBtn);
+        activeTtsBtn = null;
+      } else if (session.btn) {
+        resetSpeakBtn(session.btn);
+      }
+    },
+    _takeBatch() {
+      if (!session.queue.length) return "";
+      const maxChars = session.batchesRequested === 0 ? 220 : 1000;
+      let piece = session.queue.shift();
+      while (session.queue.length > 0 && (piece.length + 1 + session.queue[0].length) <= maxChars) {
+        piece += " " + session.queue.shift();
+      }
+      session.batchesRequested += 1;
+      return piece;
+    },
+    async _drain() {
+      if (session.workerRunning || session.aborted) return;
+      session.workerRunning = true;
+      try {
+        while (!session.aborted && session.queue.length > 0) {
+          const piece = session._takeBatch();
+          if (!piece) continue;
+          session.abortCtrl = new AbortController();
+          const res = await fetch("/api/tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: piece, model: session.model, voice: session.voice, stream_pcm: true }),
+            signal: session.abortCtrl.signal,
+          });
+          if (session.aborted) break;
+          if (res.status === 204) continue;
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            const msg = errData.error || `Speech failed (HTTP ${res.status})`;
+            showSpeechBanner(msg, errData.missing_model || "");
+            session.stop();
+            return;
+          }
+          if (!res.body || !res.body.getReader) {
+            const buf = await res.arrayBuffer();
+            if (session.aborted) break;
+            const raw = new Uint8Array(buf);
+            const evenLen = raw.length & ~1;
+            if (evenLen >= 2) session._pushPcmRecord(evenLen === raw.length ? raw : raw.subarray(0, evenLen));
+            session._maybeFlushAudio(true);
+            continue;
+          }
+          const reader = res.body.getReader();
+          let carry = null;
+          while (!session.aborted) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (!value || !value.length) continue;
+            let bytes = value;
+            if (carry) {
+              const merged = new Uint8Array(carry.length + bytes.length);
+              merged.set(carry, 0);
+              merged.set(bytes, carry.length);
+              bytes = merged;
+              carry = null;
+            }
+            if (bytes.length % 2 === 1) {
+              carry = bytes.slice(bytes.length - 1);
+              bytes = bytes.subarray(0, bytes.length - 1);
+            }
+            if (bytes.length >= 2) session._pushPcmRecord(bytes);
+          }
+          session._maybeFlushAudio(true);
+        }
+      } catch (err) {
+        if (!session.aborted && (!err || err.name !== "AbortError")) {
+          showSpeechBanner(String(err));
+          session.stop();
+          return;
+        }
+      } finally {
+        if (!session.aborted && session.inputEnded && session.queue.length === 0 && session.pendingBytes >= 2) {
+          session._flushPendingAudio(true);
+        }
+        session.workerRunning = false;
+        session.abortCtrl = null;
+        session._doneCheck();
+      }
+    },
+    _pushPcmRecord(u8) {
+      if (session.aborted || !u8 || u8.length < 2) return;
+      const copy = new Uint8Array(u8);
+      session.pcmChunks.push(copy);
+      session.pendingAudio.push(copy);
+      session.pendingBytes += copy.length;
+      session._maybeFlushAudio(false);
+    },
+    _maybeFlushAudio(batchEnded = false) {
+      if (session.aborted || session.pendingBytes < 2) return;
+      const ctx = audioCtx;
+      const runway = (ctx && session.nextTime > ctx.currentTime) ? (session.nextTime - ctx.currentTime) : 0;
+      if (!session.hasAudio) {
+        if (session.pendingBytes < TTS_INITIAL_PREBUF_BYTES && !(batchEnded && session.queue.length === 0)) return;
+      } else if (runway <= 0.015) {
+        if (session.pendingBytes < TTS_REBUF_BYTES && !(batchEnded && session.queue.length === 0)) return;
+      } else {
+        const lowRunway = runway < 0.25 && session.pendingBytes >= TTS_LOW_RUNWAY_BYTES;
+        const streamDone = batchEnded && session.inputEnded && session.queue.length === 0;
+        if (session.pendingBytes < TTS_COALESCE_BYTES && !lowRunway && !streamDone) return;
+      }
+      const isFinalStream = Boolean(batchEnded && session.inputEnded && session.queue.length === 0);
+      session._flushPendingAudio(isFinalStream);
+    },
+    _flushPendingAudio(isFinal = false) {
+      if (session.aborted || session.pendingBytes < 2) return;
+      unlockAudio();
+      const ctx = audioCtx;
+      if (!ctx) return;
+      const { aligned, totalBytes } = normalizePcmChunks(session.pendingAudio);
+      session.pendingAudio = [];
+      session.pendingBytes = 0;
+      const sampleCount = Math.floor(totalBytes / 2);
+      if (sampleCount <= 0) return;
+
+      const joined = new Uint8Array(sampleCount * 2);
+      let off = 0;
+      for (const c of aligned) {
+        const take = Math.min(c.length, joined.length - off);
+        if (take > 0) {
+          joined.set(take === c.length ? c : c.subarray(0, take), off);
+          off += take;
+        }
+      }
+
+      const contiguous = session.hasAudio && session.nextTime > (ctx.currentTime + 0.015);
+      const startAt = contiguous ? session.nextTime : (ctx.currentTime + 0.035);
+      const floats = pcmInt16ToSoftFloats(joined, sampleCount, !contiguous, isFinal);
+
+      const audioBuf = ctx.createBuffer(1, sampleCount, TTS_SAMPLE_RATE);
+      audioBuf.copyToChannel(floats, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(ctx.destination);
+      session.nextTime = startAt + audioBuf.duration;
+      session.sources.add(src);
+      src.onended = () => {
+        session.sources.delete(src);
+        session._doneCheck();
+      };
+      if (!session.hasAudio) {
+        session.hasAudio = true;
+        session._syncBtnState();
+      }
+      src.start(startAt);
+    },
+  };
+
+  activeLiveSpeech = session;
+  if (startBtn) activeTtsBtn = startBtn;
+  if (existingBtn) session._syncBtnState();
+  return session;
+}
+
+function showSpeechBanner(message, missingModel = "") {
+  const banner = document.getElementById("setup-banner");
+  const textEl = document.getElementById("setup-text");
+  const actEl = document.getElementById("setup-actions");
+  const bar = document.getElementById("pull-bar");
+  if (!banner || !textEl || !actEl || pullingModel) return;
+  if (bar) bar.classList.remove("show");
+  actEl.innerHTML = "";
+  banner.classList.add("show");
+  textEl.textContent = message;
+  if (missingModel) {
+    const pullBtn = document.createElement("button");
+    pullBtn.type = "button";
+    pullBtn.className = "btn-white";
+    pullBtn.textContent = `Pull ${missingModel}`;
+    pullBtn.onclick = () => pullModel(missingModel, false);
+    actEl.appendChild(pullBtn);
+  }
+  const dismissBtn = document.createElement("button");
+  dismissBtn.type = "button";
+  dismissBtn.textContent = "Dismiss";
+  dismissBtn.onclick = () => updateSetupBanner();
+  actEl.appendChild(dismissBtn);
+}
+
+function playAudioUrlForBtn(btn, url) {
+  const audio = new Audio(url);
+  activeTtsAudio = audio;
+  btn.classList.remove("loading");
+  btn.classList.add("speaking");
+  btn.innerHTML = SVG_SPEAKER;
+  btn.title = "Stop speaking";
+  const acts = btn.closest(".msg-actions");
+  if (acts) acts.classList.add("tts-active");
+  audio.addEventListener("ended", () => {
+    if (activeTtsBtn === btn) stopTtsPlayback();
+  });
+  audio.addEventListener("error", () => {
+    if (activeTtsBtn === btn) stopTtsPlayback();
+  });
+  audio.play().catch(() => {
+    if (activeTtsBtn === btn) stopTtsPlayback();
+  });
+}
+
+function speakReply(btn, rawText) {
+  if (!btn) return;
+  if (activeTtsBtn === btn) {
+    stopTtsPlayback();
+    return;
+  }
+  stopTtsPlayback();
+  const model = (appSettings.tts_model || "lfm3-audio:2b").trim();
+  const voice = (appSettings.tts_voice || "").trim();
+  const cacheKey = ttsCacheKey(model, voice);
+
+  if (btn._ttsUrl && btn._ttsKey === cacheKey) {
+    activeTtsBtn = btn;
+    playAudioUrlForBtn(btn, btn._ttsUrl);
+    return;
+  }
+
+  const textStr = String(rawText || "").trim();
+  if (!textStr) return;
+  const buf = new SpeechSentenceBuffer();
+  const pieces = buf.finish(textStr);
+  if (!pieces.length) return;
+
+  const session = createLiveSpeechSession(model, voice, null, btn);
+  session.finish(pieces);
+}
+
+async function toggleTtsAuto() {
+  appSettings.tts_auto = !appSettings.tts_auto;
+  if (!appSettings.tts_auto) stopTtsPlayback();
+  syncPlusMenuState();
+  renderComposerBar();
+  try {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tts_auto: !!appSettings.tts_auto }),
+    });
+  } catch (_) {}
+}
+
+function buildMsgActions(rawText) {
+  const acts = document.createElement("div");
+  acts.className = "msg-actions";
+  const spk = document.createElement("button");
+  spk.type = "button";
+  spk.className = "speak-btn";
+  spk.title = "Read aloud";
+  spk.setAttribute("aria-label", "Read aloud");
+  spk.innerHTML = SVG_SPEAKER;
+  spk.onclick = () => speakReply(spk, rawText || "");
+  const cpy = document.createElement("button");
+  cpy.type = "button";
+  cpy.className = "copy-btn";
+  cpy.textContent = "Copy reply";
+  cpy.onclick = () => copyText(cpy, rawText || "");
+  acts.appendChild(spk);
+  acts.appendChild(cpy);
+  return acts;
+}
+
 function buildThinkingBox(initialText = "", modelName = currentModel) {
   const pal = getModelPalette(modelName);
   const det = document.createElement("details");
@@ -4118,14 +5126,7 @@ function renderMessage(m) {
     row.appendChild(buildOutputsRow(m.outputs));
   }
 
-  const acts = document.createElement("div");
-  acts.className = "msg-actions";
-  const cpy = document.createElement("button");
-  cpy.className = "copy-btn";
-  cpy.textContent = "Copy reply";
-  cpy.onclick = () => copyText(cpy, m.text);
-  acts.appendChild(cpy);
-  row.appendChild(acts);
+  row.appendChild(buildMsgActions(m.text));
 
   col.appendChild(row);
   scrollBottom();
@@ -4135,6 +5136,7 @@ function renderMessage(m) {
 async function openChat(id) {
   if (busy && currentAbort) currentAbort.abort();
   if (activeStreamFlush) activeStreamFlush();
+  stopTtsPlayback();
   userScrolledAway = false;
   activeStreamRow = null;
   closePlusMenu();
@@ -4157,6 +5159,7 @@ async function openChat(id) {
 function newChat() {
   if (busy && currentAbort) currentAbort.abort();
   if (activeStreamFlush) activeStreamFlush();
+  stopTtsPlayback();
   userScrolledAway = false;
   activeStreamRow = null;
   closePlusMenu();
@@ -4181,7 +5184,14 @@ function unlockAudio() {
   } catch (_) {}
 }
 
-let appSettings = { default_model: "", sound: "chime", max_tool_steps: 8 };
+let appSettings = {
+  default_model: "",
+  sound: "chime",
+  max_tool_steps: 8,
+  tts_model: "lfm3-audio:2b",
+  tts_voice: "",
+  tts_auto: false,
+};
 
 function playDoneChime(force = false, soundName = appSettings.sound) {
   try {
@@ -4242,7 +5252,11 @@ async function sendMsg() {
   currentAbort = new AbortController();
   setSendBtnState(true);
 
-  renderMessage({ role: "user", text: text || "(attached files)", attachments: attachedNames });
+  renderMessage({
+    role: "user",
+    text: text || "(attached files)",
+    attachments: attachedNames,
+  });
 
   const activeModel = currentModel;
   const pal = getModelPalette(activeModel);
@@ -4313,6 +5327,31 @@ async function sendMsg() {
   let thinkBox = null;
   const toolCards = {};
   const turnOutputs = [];
+  const autoSpeakActive = Boolean(appSettings.tts_auto);
+  const speechModel = appSettings.tts_model || "lfm3-audio:2b";
+  const speechBuf = autoSpeakActive ? new SpeechSentenceBuffer() : null;
+  let liveSpeech = null;
+  let speechDoneFlushed = false;
+  function flushSpeechChunks(pieces) {
+    if (!autoSpeakActive || !pieces || !pieces.length) return;
+    if (!liveSpeech) {
+      liveSpeech = createLiveSpeechSession(speechModel, appSettings.tts_voice || "", row.querySelector(".asst-head"));
+    }
+    if (liveSpeech && !liveSpeech.aborted) {
+      for (const p of pieces) liveSpeech.enqueue(p);
+    }
+  }
+  function finalizeLiveSpeech(replyText) {
+    if (!autoSpeakActive || !speechBuf || speechDoneFlushed) return;
+    speechDoneFlushed = true;
+    const cleanReply = String(replyText || "");
+    if (!cleanReply || cleanReply.startsWith("**Error:**")) return;
+    const tail = speechBuf.finish(cleanReply);
+    if (!liveSpeech && tail.length) {
+      liveSpeech = createLiveSpeechSession(speechModel, appSettings.tts_voice || "", row.querySelector(".asst-head"));
+    }
+    if (liveSpeech && !liveSpeech.aborted) liveSpeech.finish(tail);
+  }
 
   let streamTarget = "";
   let streamShown = 0;
@@ -4342,6 +5381,7 @@ async function sendMsg() {
     streamTimer = null;
     streamTarget = "";
     streamShown = 0;
+    if (speechBuf) speechBuf.reset();
     if (liveProse && liveProse.isConnected) liveProse.remove();
     liveProse = null;
     if (loaderEl.isConnected) loaderEl.style.display = "";
@@ -4366,16 +5406,19 @@ async function sendMsg() {
       row.appendChild(buildOutputsRow(streamOutputs));
     }
 
-    const acts = document.createElement("div");
-    acts.className = "msg-actions";
-    const cpy = document.createElement("button");
-    cpy.className = "copy-btn";
-    cpy.textContent = "Copy reply";
-    cpy.onclick = () => copyText(cpy, finalText);
-    acts.appendChild(cpy);
+    const acts = buildMsgActions(finalText);
     row.appendChild(acts);
     loadChatList();
     playDoneChime();
+    const spk = acts.querySelector(".speak-btn");
+    if (autoSpeakActive && !finalText.startsWith("**Error:**")) {
+      finalizeLiveSpeech(finalText);
+      if (spk && liveSpeech) {
+        liveSpeech.attachFinalButton(spk);
+      }
+    } else if (liveSpeech && liveSpeech.liveHeaderBtn && liveSpeech.liveHeaderBtn.isConnected) {
+      liveSpeech.stop();
+    }
   }
 
   function flushImmediate() {
@@ -4436,6 +5479,11 @@ async function sendMsg() {
       signal: currentAbort.signal,
     });
 
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.error || `HTTP ${res.status}`);
+    }
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -4488,6 +5536,7 @@ async function sendMsg() {
         } else if (ev.type === "reply_delta" && ev.text) {
           streamTarget += ev.text;
           ensureRevealLoop();
+          if (speechBuf) flushSpeechChunks(speechBuf.pushDelta(ev.text));
         } else if (ev.type === "file_ready" && ev.name && ev.url) {
           const item = { name: ev.name, url: ev.url, size: ev.size };
           const idx = turnOutputs.findIndex(o => o.name === ev.name);
@@ -4509,6 +5558,7 @@ async function sendMsg() {
           streamShown = Math.min(streamShown, streamTarget.length);
           streamOutputs = (Array.isArray(ev.outputs) && ev.outputs.length) ? ev.outputs : turnOutputs.slice();
           streamServerDone = true;
+          finalizeLiveSpeech(streamFinalReply);
           if (!streamTarget.length || streamShown >= streamTarget.length) {
             finishReply();
           } else {
@@ -4518,6 +5568,7 @@ async function sendMsg() {
       }
     }
   } catch (err) {
+    stopTtsPlayback();
     clearInterval(secTimer);
     clearInterval(streamTimer);
     streamTimer = null;
@@ -4546,19 +5597,135 @@ async function sendMsg() {
   }
 }
 
+let soulState = { active_id: "original", original: "", slots: [] };
+
+function getActiveSoulSlot() {
+  return soulState.slots.find(s => s.id === soulState.active_id) || soulState.slots[0] || null;
+}
+
+function syncCurrentSoulInputs() {
+  const cur = getActiveSoulSlot();
+  if (!cur) return;
+  const nm = document.getElementById("soul-name");
+  const tx = document.getElementById("soul-text");
+  if (nm) cur.name = (nm.value.trim() || "Soul").slice(0, 24);
+  if (tx) cur.content = tx.value;
+}
+
+function renderSoulModal() {
+  const tabs = document.getElementById("soul-tabs");
+  const cur = getActiveSoulSlot();
+  if (tabs) {
+    tabs.innerHTML = "";
+    for (const slot of soulState.slots) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.dataset.soulId = slot.id;
+      btn.className = "soul-tab" + (cur && slot.id === cur.id ? " active" : "");
+      btn.textContent = slot.name || "Soul";
+      btn.onclick = () => selectSoulSlot(slot.id);
+      tabs.appendChild(btn);
+    }
+    if (soulState.slots.length < 4) {
+      const addBtn = document.createElement("button");
+      addBtn.type = "button";
+      addBtn.className = "soul-tab soul-tab-add";
+      addBtn.textContent = "+ New soul";
+      addBtn.onclick = addSoulSlot;
+      tabs.appendChild(addBtn);
+    }
+  }
+  const nm = document.getElementById("soul-name");
+  const tx = document.getElementById("soul-text");
+  if (nm && cur) nm.value = cur.name || "";
+  if (tx && cur) tx.value = cur.content || "";
+}
+
+function selectSoulSlot(id) {
+  syncCurrentSoulInputs();
+  soulState.active_id = id;
+  renderSoulModal();
+}
+
+function updateActiveSoulName(val) {
+  const cur = getActiveSoulSlot();
+  if (!cur) return;
+  cur.name = (val.trim() || "Soul").slice(0, 24);
+  const btn = document.querySelector(`#soul-tabs .soul-tab[data-soul-id="${cur.id}"]`);
+  if (btn) btn.textContent = cur.name;
+}
+
+function addSoulSlot() {
+  syncCurrentSoulInputs();
+  if (soulState.slots.length >= 4) return;
+  const num = soulState.slots.length + 1;
+  const id = "soul-" + Date.now().toString(36);
+  soulState.slots.push({ id, name: `Soul ${num}`, content: "" });
+  soulState.active_id = id;
+  renderSoulModal();
+  const tx = document.getElementById("soul-text");
+  if (tx) tx.focus();
+}
+
+function deleteCurrentSoul() {
+  const cur = getActiveSoulSlot();
+  if (!cur) return;
+  soulState.slots = soulState.slots.filter(s => s.id !== cur.id);
+  if (!soulState.slots.length) {
+    soulState.slots.push({ id: "original", name: "Original", content: soulState.original || "" });
+  }
+  soulState.active_id = soulState.slots[0].id;
+  renderSoulModal();
+}
+
+function restoreOriginalSoul() {
+  syncCurrentSoulInputs();
+  const origText = soulState.original || "";
+  const existingOrig = soulState.slots.find(s => s.id === "original");
+  if (existingOrig) {
+    existingOrig.name = "Original";
+    existingOrig.content = origText;
+    soulState.active_id = "original";
+  } else if (soulState.slots.length < 4) {
+    soulState.slots.unshift({ id: "original", name: "Original", content: origText });
+    soulState.active_id = "original";
+  } else {
+    const cur = getActiveSoulSlot();
+    if (cur) {
+      cur.name = "Original";
+      cur.content = origText;
+    }
+  }
+  renderSoulModal();
+}
+
 async function openSoul() {
   const res = await fetch("/api/soul");
   const data = await res.json();
-  document.getElementById("soul-text").value = data.content || "";
+  if (data && Array.isArray(data.slots) && data.slots.length) {
+    soulState = {
+      active_id: data.active_id || data.slots[0].id,
+      original: data.original || data.content || "",
+      slots: data.slots.slice(0, 4).map(s => ({ id: s.id, name: s.name, content: s.content || "" })),
+    };
+  } else {
+    const txt = (data && data.content) || "";
+    soulState = {
+      active_id: "original",
+      original: txt,
+      slots: [{ id: "original", name: "Original", content: txt }],
+    };
+  }
+  renderSoulModal();
   document.getElementById("soul-modal").style.display = "flex";
 }
 function closeSoul() { document.getElementById("soul-modal").style.display = "none"; }
 async function saveSoul() {
-  const content = document.getElementById("soul-text").value;
+  syncCurrentSoulInputs();
   await fetch("/api/soul", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ active_id: soulState.active_id, slots: soulState.slots }),
   });
   closeSoul();
 }
@@ -4679,6 +5846,11 @@ async function loadSettings() {
       appSettings.default_model = data.default_model || "";
       appSettings.sound = data.sound || "chime";
       appSettings.max_tool_steps = Number(data.max_tool_steps) || 8;
+      appSettings.tts_model = data.tts_model || "lfm3-audio:2b";
+      appSettings.tts_voice = data.tts_voice || "";
+      appSettings.tts_auto = !!data.tts_auto;
+      syncPlusMenuState();
+      renderComposerBar();
     }
   } catch (_) {}
 }
@@ -4712,6 +5884,23 @@ function openSettings() {
   const stepsEl = document.getElementById("set-max-steps");
   if (stepsEl) stepsEl.value = String(steps);
   updateStepsLabel(steps);
+
+  const selTts = document.getElementById("set-tts-model");
+  if (selTts) {
+    selTts.innerHTML = "";
+    const curTts = appSettings.tts_model || "lfm3-audio:2b";
+    const ttsOpts = Array.from(new Set(["lfm3-audio:2b", "phonon", curTts, ...availableModels].filter(Boolean)));
+    for (const m of ttsOpts) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m;
+      selTts.appendChild(opt);
+    }
+    selTts.value = curTts;
+  }
+  const voiceEl = document.getElementById("set-tts-voice");
+  if (voiceEl) voiceEl.value = appSettings.tts_voice || "";
+
   document.getElementById("settings-modal").style.display = "flex";
 }
 
@@ -4730,16 +5919,29 @@ async function saveSettings() {
   const sound = document.getElementById("set-sound").value;
   const stepsEl = document.getElementById("set-max-steps");
   const max_tool_steps = stepsEl ? (Number(stepsEl.value) || 8) : 8;
+  const ttsEl = document.getElementById("set-tts-model");
+  const tts_model = ttsEl ? (ttsEl.value || "lfm3-audio:2b") : "lfm3-audio:2b";
+  const voiceEl = document.getElementById("set-tts-voice");
+  const tts_voice = voiceEl ? voiceEl.value.trim() : "";
   const res = await fetch("/api/settings", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ default_model, sound, max_tool_steps }),
+    body: JSON.stringify({
+      default_model,
+      sound,
+      max_tool_steps,
+      tts_model,
+      tts_voice,
+      tts_auto: !!appSettings.tts_auto,
+    }),
   });
   const data = await res.json();
   if (data && data.settings) appSettings = data.settings;
   if (default_model && !currentChatId) {
     selectModel(default_model);
   }
+  renderPlusMenu();
+  renderComposerBar();
   closeSettings();
 }
 
@@ -4901,6 +6103,25 @@ window.addEventListener("drop", (e) => {
 });
 window.addEventListener("blur", hideDropOverlay);
 
+const MODAL_CLOSERS = [
+  ["soul-modal", closeSoul],
+  ["chips-modal", closeChipsModal],
+  ["settings-modal", closeSettings],
+  ["pull-modal", closePullModal],
+  ["models-modal", closeModelsModal],
+  ["files-modal", closeFilesModal],
+];
+for (const [id, closeFn] of MODAL_CLOSERS) {
+  const el = document.getElementById(id);
+  if (!el) continue;
+  let startedOutside = false;
+  el.addEventListener("mousedown", (e) => { startedOutside = (e.target === el); });
+  el.addEventListener("click", (e) => {
+    if (startedOutside && e.target === el) closeFn();
+    startedOutside = false;
+  });
+}
+
 document.addEventListener("click", (e) => {
   const menu = document.getElementById("plus-menu");
   const btn = document.getElementById("plus-btn");
@@ -4911,8 +6132,10 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     closePlusMenu();
-    const fm = document.getElementById("files-modal");
-    if (fm && fm.style.display === "flex") closeFilesModal();
+    for (const [id, closeFn] of MODAL_CLOSERS) {
+      const m = document.getElementById(id);
+      if (m && m.style.display === "flex") closeFn();
+    }
   }
 });
 
@@ -4999,6 +6222,20 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_no_content(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _send_audio_error(self, err: Exception):
+        if isinstance(err, MissingSpeechModelError):
+            self.send_json(404, {"error": str(err), "missing_model": err.model})
+        elif isinstance(err, ValueError):
+            self.send_json(400, {"error": str(err)})
+        else:
+            self.send_json(502, {"error": str(err)})
 
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -5096,7 +6333,8 @@ class WebHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/soul":
-            self.send_json(200, {"content": load_soul()})
+            souls = load_souls()
+            self.send_json(200, {"content": load_soul(), **souls})
             return
 
         if path == "/api/chips":
@@ -5215,8 +6453,58 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/soul":
             data = self.read_json()
-            SOUL_FILE.write_text(data.get("content", ""), encoding="utf-8")
-            self.send_json(200, {"ok": True})
+            saved = save_souls(data)
+            self.send_json(200, {"ok": True, **saved})
+            return
+
+        if path == "/api/tts":
+            data = self.read_json()
+            raw_text = str(data.get("text") or "").strip()
+            stream_pcm = bool(data.get("stream_pcm"))
+            if not raw_text:
+                if stream_pcm:
+                    self._send_no_content()
+                else:
+                    self.send_json(400, {"error": "Missing text to speak"})
+                return
+            st = load_settings()
+            tts_model = str(data.get("model") or st.get("tts_model") or DEFAULT_TTS_MODEL).strip()
+            tts_voice = str(data.get("voice") if "voice" in data else st.get("tts_voice", "")).strip()
+            if stream_pcm:
+                try:
+                    pcm_iter = iter_ollama_speech_pcm(raw_text, model=tts_model, voice=tts_voice, allow_empty=True)
+                    first_chunk = next(pcm_iter, None)
+                except Exception as e:
+                    self._send_audio_error(e)
+                    return
+                if not first_chunk:
+                    self._send_no_content()
+                    return
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/pcm;rate=24000;channels=1;bits=16")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    self.wfile.write(first_chunk)
+                    self.wfile.flush()
+                    for chunk in pcm_iter:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                except Exception:
+                    pass
+                return
+            try:
+                wav_bytes = synthesize_ollama_speech(raw_text, model=tts_model, voice=tts_voice)
+            except Exception as e:
+                self._send_audio_error(e)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(wav_bytes)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(wav_bytes)
             return
 
         if path == "/api/chips":
@@ -5277,7 +6565,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 for x in (data.get("attached_files") if isinstance(data.get("attached_files"), list) else [])
                 if str(x).strip()
             ]
-            msg = raw_msg or ("Inspect and summarize the attached file(s)." if attached_files else "")
+            if not raw_msg and not attached_files:
+                self.send_json(400, {"error": "Empty message"})
+                return
+            msg = raw_msg or "Inspect and summarize the attached file(s)."
             model = (data.get("model") or DEFAULT_MODEL).strip()
             active_packs = parse_active_packs(data)
             tools_enabled = bool(active_packs or attached_files)
