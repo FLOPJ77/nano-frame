@@ -26,11 +26,40 @@ CHATS_DIR = Path(os.environ.get("AGENT_CHATS", str(BASE_DIR / "chats"))).expandu
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
 OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3")
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3:1.7b")
 NUM_CTX = int(os.environ.get("AGENT_CTX", "16384"))
 MAX_HISTORY = 16
 MAX_HISTORY_CHARS = 28000
 MAX_STEPS = 8
+
+PRESET_MODELS = ["lfm3:1.7b", "granite4.2:3b", "qwen3.5:4b", "gemma4:e2b"]
+KNOWN_MODEL_PARAMS = {
+    "lfm3": "1.7B",
+    "lfm3:1.7b": "1.7B",
+    "granite4.2:3b": "3B",
+    "qwen3.5:4b": "4B",
+    "gemma4:e2b": "2B eff",
+    "qwen3.5:2b": "2B",
+    "gemma4:e4b": "4B eff",
+}
+
+
+def infer_model_param(model_name: str, parameter_size: str = "") -> str:
+    ps = (parameter_size or "").strip()
+    if ps:
+        return ps.upper()
+    low = (model_name or "").strip().lower()
+    if low in KNOWN_MODEL_PARAMS:
+        return KNOWN_MODEL_PARAMS[low]
+    if ":" in low:
+        tag = low.split(":", 1)[1]
+        em = re.search(r"(?:^|-)e(\d+(?:\.\d+)?b)(?:$|-)", tag, re.I)
+        if em:
+            return f"{em.group(1).upper()} eff"
+        sm = re.search(r"(?:^|-)(\d+(?:\.\d+)?[bm])(?:$|-)", tag, re.I)
+        if sm:
+            return sm.group(1).upper()
+    return KNOWN_MODEL_PARAMS.get(low.split(":", 1)[0], "")
 
 USE_COLOR = sys.stdout.isatty()
 
@@ -241,6 +270,7 @@ def call_ollama(messages: list, model: str, use_tools: bool = True) -> dict:
         "model": model,
         "messages": messages,
         "stream": False,
+        "keep_alive": "15m",
         "options": {
             "temperature": 0.1,
             "top_k": 50,
@@ -280,13 +310,45 @@ def call_ollama(messages: list, model: str, use_tools: bool = True) -> dict:
     }
 
 
-def list_models() -> list:
+def _model_family_rank(name: str) -> int:
+    low = (name or "").lower()
+    if low.startswith("lfm3") and "audio" not in low:
+        return 0
+    if low.startswith("granite4.2") or low.startswith("granite"):
+        return 1
+    if low.startswith("qwen3.5") or low.startswith("qwen"):
+        return 2
+    if low.startswith("gemma4") or low.startswith("gemma"):
+        return 3
+    if low.startswith("lfm"):
+        return 4
+    return 5
+
+
+def list_models_detailed() -> list:
+    items = []
     try:
         with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=3) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        for m in data.get("models", []):
+            raw_name = str(m.get("name") or "").strip()
+            name = raw_name[:-7] if raw_name.endswith(":latest") else raw_name
+            if not name:
+                continue
+            det = m.get("details") if isinstance(m.get("details"), dict) else {}
+            ps = str(det.get("parameter_size") or "").strip()
+            items.append({
+                "name": name,
+                "param": infer_model_param(name, ps),
+            })
+        items.sort(key=lambda d: (_model_family_rank(d["name"]), d["name"].lower()))
     except Exception:
-        return []
+        pass
+    return items
+
+
+def list_models() -> list:
+    return [d["name"] for d in list_models_detailed()]
 
 
 def print_tool_call(name: str, args: dict):
@@ -363,7 +425,9 @@ def save_chat(ui_log: list, history: list, model: str) -> Path:
 
 def print_banner(model: str, use_tools: bool):
     t_state = "on" if use_tools else "off"
-    line1 = f"  * {model} cli   |   soul: {SOUL_FILE.name} (live)   |   tools: {t_state}"
+    p_lbl = infer_model_param(model)
+    m_disp = f"{model} ({p_lbl})" if p_lbl else model
+    line1 = f"  * {m_disp} cli   |   soul: {SOUL_FILE.name} (live)   |   tools: {t_state}"
     line2 = "  cmds: /model [name]  /tools  /soul  /save  /clear  exit"
     width = max(len(line1), len(line2)) + 2
     border = "-" * width
@@ -377,12 +441,12 @@ def print_help():
     print(
         "Usage: ai [OPTIONS] [PROMPT...]\n\n"
         "Examples:\n"
-        "  ai                                   Start interactive terminal chat\n"
-        '  ai "how do I compress a folder"      Quick one-shot answer\n'
-        '  ai -n "command to list open ports"   Pure text mode (skip tools)\n'
-        '  ai -m gemma4 "check disk space"      Use a specific Ollama model\n\n'
+        "  ai                                       Start interactive terminal chat\n"
+        '  ai "how do I compress a folder"          Quick one-shot answer\n'
+        '  ai -n "command to list open ports"       Pure text mode (skip tools)\n'
+        '  ai -m gemma4:e2b "check disk space"      Use a specific Ollama model\n\n'
         "Options:\n"
-        "  -m, --model NAME   Model name (default: AGENT_MODEL or lfm3)\n"
+        "  -m, --model NAME   Model name (default: AGENT_MODEL or lfm3:1.7b)\n"
         "  -n, --no-tools     Disable local bash/file tools\n"
         "  -r, --raw          Disable spinner animation\n"
         "  -h, --help         Show this help message"
@@ -418,8 +482,20 @@ def parse_args(argv: list) -> tuple:
     return model, use_tools, raw, " ".join(argv[i:]).strip()
 
 
+def resolve_startup_model(model: str) -> str:
+    if model != "lfm3:1.7b":
+        return model
+    installed = list_models()
+    if not installed or "lfm3:1.7b" in installed:
+        return model
+    if "lfm3" in installed or "lfm3:latest" in installed:
+        return "lfm3"
+    return model
+
+
 def main():
     model, use_tools, raw, one_shot = parse_args(sys.argv[1:])
+    model = resolve_startup_model(model)
     history = []
     ui_log = []
 
@@ -469,10 +545,20 @@ def main():
             parts = user_input.split(None, 1)
             if len(parts) == 2 and parts[1].strip():
                 model = parts[1].strip()
-                print(f"  {C.GRAY}(model switched to {model}){C.RESET}\n")
+                p_lbl = infer_model_param(model)
+                suffix = f" ({p_lbl})" if p_lbl else ""
+                print(f"  {C.GRAY}(model switched to {model}{suffix}){C.RESET}\n")
             else:
-                avail = list_models()
-                print(f"  {C.GRAY}current: {model} | installed: {', '.join(avail) or 'none detected'}{C.RESET}\n")
+                avail = list_models_detailed()
+                cur_p = infer_model_param(model)
+                cur_s = f"{model} ({cur_p})" if cur_p else model
+                inst_str = ", ".join(
+                    f"{d['name']} ({d['param']})" if d.get("param") else d["name"]
+                    for d in avail
+                )
+                presets_str = ", ".join(f"{p} ({infer_model_param(p)})" for p in PRESET_MODELS)
+                print(f"  {C.GRAY}current: {cur_s} | installed: {inst_str or 'none detected'}{C.RESET}")
+                print(f"  {C.GRAY}recommended light: {presets_str}{C.RESET}\n")
             continue
         if user_input == "/save":
             if not ui_log:

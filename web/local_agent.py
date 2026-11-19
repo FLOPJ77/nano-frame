@@ -55,7 +55,12 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def init_stdio():
-    """Prevent crashes in windowed/noconsole packaged builds where stdout/stderr are None."""
+    """Prevent crashes in windowed/noconsole packaged builds where std handles are None."""
+    if sys.stdin is None:
+        try:
+            sys.stdin = open(os.devnull, "r", encoding="utf-8")
+        except OSError:
+            pass
     if sys.stdout is not None and sys.stderr is not None:
         return
     try:
@@ -115,19 +120,37 @@ seed_soul_if_missing()
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
+OLLAMA_GENERATE_URL = f"{OLLAMA_HOST}/api/generate"
 OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
 OLLAMA_PULL_URL = f"{OLLAMA_HOST}/api/pull"
 OLLAMA_DELETE_URL = f"{OLLAMA_HOST}/api/delete"
 OLLAMA_PS_URL = f"{OLLAMA_HOST}/api/ps"
 OLLAMA_SPEECH_URL = f"{OLLAMA_HOST}/v1/audio/speech"
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3")
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3:1.7b")
 NUM_CTX = int(os.environ.get("AGENT_CTX", "16384"))
 WEB_HOST = "127.0.0.1"
 WEB_PORT = int(os.environ.get("AGENT_PORT", "8765"))
 MAX_HISTORY = 16
 MAX_HISTORY_CHARS = 28000
 
-PRESET_MODELS = ["lfm3", "granite4.2", "gemma4", "qwen3.5"]
+PRESET_MODELS = [
+    "lfm3:1.7b",
+    "granite4.2:3b",
+    "qwen3.5:4b",
+    "gemma4:e2b",
+]
+KNOWN_MODEL_PARAMS = {
+    "lfm3": "1.7B",
+    "lfm3:1.7b": "1.7B",
+    "granite4.2:3b": "3B",
+    "gemma4:e2b": "2B eff",
+    "gemma4:e4b": "4B eff",
+    "qwen3.5:0.8b": "0.8B",
+    "qwen3.5:2b": "2B",
+    "qwen3.5:4b": "4B",
+    "lfm3-audio:2b": "2B",
+    "phonon": "31M",
+}
 OLLAMA_LOCK = threading.Lock()
 SERVER_REF = {"server": None}
 
@@ -316,30 +339,59 @@ def edit_doc_impl(args: dict, chat_id: str = "") -> tuple:
 # --- KEYLESS WEB SEARCH & FETCH HELPERS ---
 class _HtmlTextExtractor(html.parser.HTMLParser):
     SKIP_TAGS = {"script", "style", "noscript", "svg", "head"}
+    META_KEYS = ("og:title", "twitter:title", "description", "og:description")
 
     def __init__(self):
         super().__init__()
         self._skip = 0
+        self._in_title = False
+        self._title_chunks = []
+        self._meta = {}
         self.chunks = []
 
     def handle_starttag(self, tag, attrs):
-        if tag.lower() in self.SKIP_TAGS:
+        tl = tag.lower()
+        if tl == "title":
+            self._in_title = True
+        elif tl == "meta":
+            ad = {k.lower(): (v or "").strip() for k, v in attrs}
+            key = (ad.get("property") or ad.get("name") or "").lower()
+            val = ad.get("content") or ""
+            if key in self.META_KEYS and val and key not in self._meta:
+                self._meta[key] = val
+        if tl in self.SKIP_TAGS:
             self._skip += 1
-        elif tag.lower() in ("p", "br", "li", "div", "h1", "h2", "h3", "h4", "tr"):
+        elif tl in ("p", "br", "li", "div", "h1", "h2", "h3", "h4", "tr"):
             self.chunks.append("\n")
 
     def handle_endtag(self, tag):
-        if tag.lower() in self.SKIP_TAGS and self._skip > 0:
+        tl = tag.lower()
+        if tl == "title":
+            self._in_title = False
+        if tl in self.SKIP_TAGS and self._skip > 0:
             self._skip -= 1
 
     def handle_data(self, data):
-        if not self._skip:
+        if self._in_title:
+            self._title_chunks.append(data)
+        elif not self._skip:
             self.chunks.append(data)
 
     def get_text(self) -> str:
+        hdr = []
+        title = re.sub(r"\s+", " ", html_lib.unescape("".join(self._title_chunks))).strip()
+        og_title = re.sub(r"\s+", " ", html_lib.unescape(self._meta.get("og:title") or self._meta.get("twitter:title") or "")).strip()
+        desc = re.sub(r"\s+", " ", html_lib.unescape(self._meta.get("og:description") or self._meta.get("description") or "")).strip()
+        best_title = og_title or title
+        if best_title:
+            hdr.append(f"Title: {best_title}")
+        if desc:
+            hdr.append(f"Description: {desc}")
+
         raw = html_lib.unescape("".join(self.chunks))
         lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in raw.splitlines()]
-        return "\n".join(ln for ln in lines if ln)
+        body_lines = [ln for ln in lines if ln]
+        return "\n".join(hdr + body_lines)
 
 
 class _DdgParser(html.parser.HTMLParser):
@@ -379,15 +431,79 @@ class _DdgParser(html.parser.HTMLParser):
             self._cur["snippet"] += data
 
 
+_WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
+_YOUTUBE_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")
+
+
+def clean_tool_url(raw_url: str) -> str:
+    """Extract a clean URL from Markdown links, enclosing parentheses, quotes, or brackets."""
+    u = str(raw_url or "").replace("\u200b", "").replace("\ufeff", "").strip()
+    if not u:
+        return ""
+    md = re.search(r"\[[^\]]*\]\(([^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)", u)
+    if md:
+        u = md.group(1).strip()
+    else:
+        url_in_text = re.search(r"https?://[^\s<>\"'`]+", u)
+        if url_in_text:
+            u = url_in_text.group(0)
+    for _ in range(3):
+        prev = u
+        u = u.strip()
+        if len(u) >= 2 and u[0] + u[-1] in ("<>", '""', "''", "``", "()", "[]"):
+            u = u[1:-1].strip()
+        u = u.lstrip("<(\"'`[").rstrip(">\"'`,.;!?")
+        while u.endswith(")") and u.count(")") > u.count("("):
+            u = u[:-1]
+        while u.endswith("]") and u.count("]") > u.count("["):
+            u = u[:-1]
+        if u == prev:
+            break
+    if u and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", u):
+        if re.match(r"^(?:www\.|youtube\.com/|youtu\.be/|m\.youtube\.com/|music\.youtube\.com/|[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/|$))", u, re.I):
+            u = "https://" + u
+    return u
+
+
+def _is_youtube_host(netloc: str) -> bool:
+    host = (netloc or "").split("@")[-1].split(":")[0].lower()
+    return host in _YOUTUBE_HOSTS
+
+
+def _fetch_youtube_oembed(url: str) -> str:
+    oembed_url = "https://www.youtube.com/oembed?" + urllib.parse.urlencode({"url": url, "format": "json"})
+    req = urllib.request.Request(oembed_url, headers={"User-Agent": _WEB_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            raw = resp.read(64 * 1024).decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return ""
+        parts = []
+        if data.get("title"):
+            parts.append(f"YouTube Video: {str(data['title']).strip()}")
+        if data.get("author_name"):
+            parts.append(f"Channel: {str(data['author_name']).strip()}")
+        if parts:
+            parts.append(f"URL: {url}")
+            return "\n".join(parts)
+    except Exception:
+        pass
+    return ""
+
+
 def web_search_impl(query: str) -> str:
     q = (query or "").strip()
+    m_wrapped = re.fullmatch(r"\(\s*(https?://[^\s()]+)\s*\)", q)
+    if m_wrapped:
+        q = m_wrapped.group(1)
     if not q:
         return "Empty search query."
     url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": q})
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+            "User-Agent": _WEB_UA,
             "Accept-Language": "en-US,en;q=0.9",
         },
     )
@@ -407,22 +523,37 @@ def web_search_impl(query: str) -> str:
 
 
 def fetch_url_impl(url: str) -> str:
-    u = (url or "").strip()
+    u = clean_tool_url(url)
     parsed = urllib.parse.urlparse(u)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return "Invalid URL: must start with http:// or https://"
+
+    yt_info = _fetch_youtube_oembed(u) if _is_youtube_host(parsed.netloc) else ""
+
     req = urllib.request.Request(
         u,
-        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"},
+        headers={"User-Agent": _WEB_UA, "Accept-Language": "en-US,en;q=0.9"},
     )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        body = resp.read(512 * 1024).decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            body = resp.read(512 * 1024).decode("utf-8", errors="replace")
+    except Exception:
+        if yt_info:
+            return yt_info[:4000]
+        raise
+
     if "html" in ctype or "<html" in body[:500].lower():
         ext = _HtmlTextExtractor()
         ext.feed(body)
-        return ext.get_text()[:4000]
-    return body.strip()[:4000]
+        page_text = ext.get_text()
+    else:
+        page_text = body.strip()
+
+    if yt_info:
+        combined = f"{yt_info}\n\n{page_text}".strip() if page_text else yt_info
+        return combined[:4000]
+    return page_text[:4000]
 
 
 def parse_active_packs(data: dict) -> list:
@@ -453,10 +584,10 @@ def build_tools_schema(active_packs: list = None) -> list:
                 "type": "function",
                 "function": {
                     "name": "fetch_url",
-                    "description": "Fetch readable text from a webpage URL.",
+                    "description": "Fetch readable text or title/metadata from a webpage or YouTube URL (pass only the plain URL without parentheses or quotes).",
                     "parameters": {
                         "type": "object",
-                        "properties": {"url": {"type": "string", "description": "http/https URL"}},
+                        "properties": {"url": {"type": "string", "description": "Plain http/https URL without parentheses"}},
                         "required": ["url"],
                     },
                 },
@@ -518,8 +649,9 @@ def build_tools_schema(active_packs: list = None) -> list:
         if IS_WINDOWS:
             tool_name = "run_shell"
             shell_desc = (
-                "Run a PowerShell command on THIS Windows PC and return stdout/stderr. "
-                "Only use when explicitly asked to inspect or act on this local machine."
+                "Run a non-interactive PowerShell command silently in the background on THIS Windows PC and return stdout/stderr. "
+                "Quote paths or URLs containing spaces, '&', or parentheses like (x86) in single quotes. "
+                "Only use when explicitly asked to inspect or act on this local machine; use fetch_url/web_search for URLs."
             )
             cmd_desc = "The PowerShell command to run"
         else:
@@ -575,14 +707,33 @@ def build_tools_schema(active_packs: list = None) -> list:
     return tools
 
 
+def _windows_subprocess_kwargs(new_group: bool = False) -> dict:
+    """Return Windows subprocess kwargs that suppress console windows cleanly."""
+    if not IS_WINDOWS:
+        return {}
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    if new_group:
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    kw = {"creationflags": flags}
+    si_cls = getattr(subprocess, "STARTUPINFO", None)
+    if si_cls is not None:
+        si = si_cls()
+        si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+        si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kw["startupinfo"] = si
+    return kw
+
+
 def terminate_process_tree(proc: subprocess.Popen):
     if IS_WINDOWS:
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
+                **_windows_subprocess_kwargs(new_group=False),
             )
         except Exception:
             try:
@@ -600,7 +751,7 @@ def build_shell_argv(cmd: str) -> list:
     if IS_WINDOWS:
         ps = shutil.which("powershell") or shutil.which("pwsh")
         if ps:
-            return [ps, "-NoProfile", "-NonInteractive", "-Command", cmd]
+            return [ps, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd]
         return ["cmd", "/c", cmd]
     return ["bash", "-c", cmd]
 
@@ -619,13 +770,14 @@ def execute_tool_with_meta(name: str, args: dict, chat_id: str = "", cancel_chec
         if name in ("run_shell", "run_bash"):
             cmd = args.get("command", "")
             popen_kwargs = {
+                "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.STDOUT,
                 "text": True,
                 "cwd": str(Path.home()),
             }
             if IS_WINDOWS:
-                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                popen_kwargs.update(_windows_subprocess_kwargs(new_group=True))
             else:
                 popen_kwargs["start_new_session"] = True
 
@@ -897,6 +1049,68 @@ def synthesize_ollama_speech(raw_text: str, model: str = DEFAULT_TTS_MODEL, voic
     return build_wav_bytes(bytes(pcm_all))
 
 
+def warm_ollama_model(model: str = DEFAULT_TTS_MODEL) -> dict:
+    eff_model = (model or DEFAULT_TTS_MODEL).strip()
+    running, installed, _ = probe_ollama_detailed()
+    if not running:
+        raise RuntimeError(f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and try again.")
+
+    base = eff_model.split(":", 1)[0]
+    has_tag = ":" in eff_model
+    model_ok = any(
+        m == eff_model or m == f"{eff_model}:latest" or (not has_tag and m.split(":", 1)[0] == base)
+        for m in installed
+    )
+    if not model_ok:
+        raise MissingSpeechModelError(eff_model, f'Speech model "{eff_model}" is not installed in Ollama yet.')
+
+    if is_model_loaded(eff_model):
+        return {"ok": True, "model": eff_model, "already_loaded": True}
+
+    req = urllib.request.Request(
+        OLLAMA_GENERATE_URL,
+        data=json.dumps({"model": eff_model, "prompt": "", "keep_alive": "15m"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            resp.read()
+        return {"ok": True, "model": eff_model, "loaded": True}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        if "not found" in err_body.lower():
+            raise MissingSpeechModelError(eff_model, f'Speech model "{eff_model}" is not installed in Ollama yet.') from e
+        if e.code in (400, 404, 405, 501):
+            for _ in iter_ollama_speech_pcm(".", model=eff_model, allow_empty=True):
+                pass
+            return {"ok": True, "model": eff_model, "loaded": True, "via": "speech"}
+        raise RuntimeError(f"Ollama TTS warm HTTP {e.code}: {err_body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and try again.") from e
+
+
+def unload_ollama_model(model: str = DEFAULT_TTS_MODEL) -> dict:
+    eff_model = (model or DEFAULT_TTS_MODEL).strip()
+    if not eff_model:
+        return {"ok": True, "unloaded": False}
+    try:
+        if not is_model_loaded(eff_model):
+            return {"ok": True, "model": eff_model, "already_unloaded": True}
+    except Exception:
+        pass
+    req = urllib.request.Request(
+        OLLAMA_GENERATE_URL,
+        data=json.dumps({"model": eff_model, "prompt": "", "keep_alive": 0}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resp.read()
+        return {"ok": True, "model": eff_model, "unloaded": True}
+    except Exception:
+        return {"ok": True, "model": eff_model, "unloaded": False}
+
+
 def find_ollama_executable() -> str:
     exe = shutil.which("ollama")
     if exe:
@@ -961,22 +1175,27 @@ def try_start_ollama() -> bool:
     exe = find_ollama_executable()
     if not exe:
         return False
+    ol_env = os.environ.copy()
+    ol_env.setdefault("OLLAMA_NUM_PARALLEL", "2")
+    ol_env.setdefault("OLLAMA_MAX_LOADED_MODELS", "2")
     try:
         if IS_MAC and Path("/Applications/Ollama.app").exists():
-            subprocess.Popen(["open", "-a", "Ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["open", "-a", "Ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ol_env)
         elif IS_WINDOWS:
-            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
             subprocess.Popen(
                 [exe, "serve"],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=flags,
+                env=ol_env,
+                **_windows_subprocess_kwargs(new_group=False),
             )
         else:
             subprocess.Popen(
                 [exe, "serve"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=ol_env,
                 start_new_session=True,
             )
     except Exception:
@@ -990,22 +1209,99 @@ def try_start_ollama() -> bool:
     return False
 
 
+def infer_model_param_label(model_name: str, details_map: dict = None) -> str:
+    n = (model_name or "").strip()
+    if not n:
+        return ""
+    if details_map:
+        det = details_map.get(n) or details_map.get(normalize_model_name(n))
+        if isinstance(det, dict):
+            ps = str(det.get("parameter_size") or "").strip()
+            if ps:
+                return ps.upper()
+    low = n.lower()
+    if low in KNOWN_MODEL_PARAMS:
+        return KNOWN_MODEL_PARAMS[low]
+    if ":" in low:
+        tag = low.split(":", 1)[1]
+        em = re.search(r"(?:^|-)e(\d+(?:\.\d+)?b)(?:$|-)", tag, re.I)
+        if em:
+            return f"{em.group(1).upper()} eff"
+        sm = re.search(r"(?:^|-)(\d+(?:\.\d+)?[bm])(?:$|-)", tag, re.I)
+        if sm:
+            return sm.group(1).upper()
+    base = low.split(":", 1)[0]
+    if base in KNOWN_MODEL_PARAMS:
+        return KNOWN_MODEL_PARAMS[base]
+    return ""
+
+
+def _parse_param_b(label: str) -> float:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*([bm])", label or "", re.I)
+    if not m:
+        return 999.0
+    val = float(m.group(1))
+    return val / 1000.0 if m.group(2).lower() == "m" else val
+
+
+def _model_family_rank(name: str) -> int:
+    low = (name or "").lower()
+    if low.startswith("lfm3") and "audio" not in low:
+        return 0
+    if low.startswith("granite4.2") or low.startswith("granite"):
+        return 1
+    if low.startswith("qwen3.5") or low.startswith("qwen"):
+        return 2
+    if low.startswith("gemma4") or low.startswith("gemma"):
+        return 3
+    if low.startswith("lfm"):
+        return 4
+    return 5
+
+
 def get_models_info() -> dict:
     running, installed, installed_details = probe_ollama_detailed()
     settings = load_settings()
     saved_default = settings.get("default_model", "").strip()
 
+    details_by_name = {}
+    for d in installed_details:
+        if isinstance(d, dict):
+            if d.get("name"):
+                details_by_name[d["name"]] = d
+            if d.get("raw_name"):
+                details_by_name[d["raw_name"]] = d
+
     merged = list(installed)
     for p in PRESET_MODELS:
-        if not any(m == p or m.startswith(p + ":") for m in merged):
-            merged.append(p)
-    if saved_default and not any(m == saved_default or m.startswith(saved_default + ":") for m in merged):
+        if any(m == p or m == f"{p}:latest" or (p == "lfm3:1.7b" and m == "lfm3") for m in merged):
+            continue
+        merged.append(p)
+    if saved_default and not any(m == saved_default or m == f"{saved_default}:latest" for m in merged):
         merged.insert(0, saved_default)
+
+    model_params = {}
+    for m in merged + [saved_default, DEFAULT_TTS_MODEL, "phonon", "phonon:en"]:
+        if m and m not in model_params:
+            lbl = infer_model_param_label(m, details_by_name)
+            if lbl:
+                model_params[m] = lbl
+
+    installed_set = set(installed)
+    merged.sort(key=lambda m: (
+        _model_family_rank(m),
+        _parse_param_b(model_params.get(m, "")),
+        0 if m in installed_set else 1,
+        m.lower(),
+    ))
 
     active_default = saved_default or DEFAULT_MODEL
     if not saved_default and "AGENT_MODEL" not in os.environ and installed:
-        if not any(m == DEFAULT_MODEL or m.startswith(DEFAULT_MODEL + ":") for m in installed):
-            active_default = installed[0]
+        if not any(m == DEFAULT_MODEL or m == f"{DEFAULT_MODEL}:latest" or (DEFAULT_MODEL == "lfm3:1.7b" and m == "lfm3") for m in installed):
+            ordered_installed = sorted(installed, key=lambda m: (_model_family_rank(m), _parse_param_b(model_params.get(m, "")), m.lower()))
+            active_default = ordered_installed[0]
+        elif DEFAULT_MODEL not in installed and "lfm3" in installed and DEFAULT_MODEL == "lfm3:1.7b":
+            active_default = "lfm3"
 
     return {
         "ollama_running": running,
@@ -1013,6 +1309,7 @@ def get_models_info() -> dict:
         "installed": installed,
         "installed_details": installed_details,
         "models": merged,
+        "model_params": model_params,
         "default_model": active_default,
         "os": os_label(),
         "data_dir": str(DATA_DIR),
@@ -1170,6 +1467,7 @@ def stream_ollama(
         "model": model,
         "messages": messages,
         "stream": True,
+        "keep_alive": "15m",
         "options": {
             "temperature": 0.1,
             "top_k": 50,
@@ -1357,11 +1655,19 @@ def run_agent_stream(
 
     sys_prompt = load_soul()
     if "web" in packs:
-        sys_prompt += "\n- Web tools enabled: use web_search or fetch_url when external or recent information is needed."
+        sys_prompt += (
+            "\n- Web tools enabled: use web_search or fetch_url when external or recent information or a webpage/YouTube link is given "
+            "(pass plain URLs without parentheses or quotes). Do not use shell commands for web lookups."
+        )
     if "files" in packs:
         sys_prompt += (
             "\n- Document tools enabled: pass the exact attached filename to read_doc(file, range) first, "
             "and edit MediaWiki (.wiki), Markdown (.md), or text (.txt) files with edit_doc(file, action, ...)."
+        )
+    if "system" in packs and IS_WINDOWS:
+        sys_prompt += (
+            "\n- Windows shell runs non-interactive PowerShell: always wrap paths or URLs containing spaces, '&', or parentheses like (x86) in single quotes, "
+            "and do not keep retrying failed shell commands."
         )
 
     settings = load_settings()
@@ -1370,6 +1676,7 @@ def run_agent_stream(
     all_tools = []
     all_outputs = []
     seen_outputs = set()
+    seen_call_counts = {}
     tool_counter = 0
     last_tokens = {"used": 0, "prompt": 0, "output": 0, "max": NUM_CTX}
 
@@ -1448,13 +1755,21 @@ def run_agent_stream(
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {}
+                if not isinstance(args, dict):
+                    args = {}
 
                 tool_counter += 1
                 tid = tool_counter
                 if emit:
                     emit({"type": "tool_start", "id": tid, "name": name, "args": args})
 
-                result, file_meta = execute_tool_with_meta(name, args, chat_id=chat_id, cancel_check=cancel_check)
+                sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+                seen_call_counts[sig] = seen_call_counts.get(sig, 0) + 1
+                if seen_call_counts[sig] > 2:
+                    result = "Repeated identical tool call skipped; summarize the prior result or explain the issue without retrying the same command."
+                    file_meta = None
+                else:
+                    result, file_meta = execute_tool_with_meta(name, args, chat_id=chat_id, cancel_check=cancel_check)
 
                 tool_record = {"id": tid, "name": name, "args": args, "result": result}
                 all_tools.append(tool_record)
@@ -1839,6 +2154,14 @@ WEB_HTML = r"""<!doctype html>
   *::-webkit-scrollbar-thumb:active { background: #71717a; border: 2px solid transparent; background-clip: padding-box; }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 15px; }
   body { display: flex; overflow: hidden; }
+  #main-pane {
+    opacity: 0;
+    transform: translateY(8px) scale(0.994);
+    transition:
+      opacity 0.42s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.46s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  body.app-ready #main-pane { opacity: 1; transform: translateY(0) scale(1); }
   svg { display: block; flex-shrink: 0; }
 
   .m-mark {
@@ -1857,13 +2180,12 @@ WEB_HTML = r"""<!doctype html>
     width: 260px; background: var(--sidebar); border-right: 1px solid var(--border);
     display: flex; flex-direction: column; flex-shrink: 0; transition: width 0.2s ease, opacity 0.2s ease;
   }
-  aside.collapsed { width: 0; border-right: none; overflow: hidden; opacity: 0; }
+  aside.collapsed { width: 0; border-right: none; overflow: hidden; opacity: 0; pointer-events: none; visibility: hidden; }
   .side-head {
     height: 52px; padding: 0 14px; border-bottom: 1px solid var(--border);
     display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
   }
   .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 14px; color: var(--white); }
-  .brand-slot { width: 18px; height: 18px; display: grid; place-items: center; flex-shrink: 0; }
   .side-actions { padding: 10px 10px 6px; display: flex; gap: 6px; }
 
   button {
@@ -1954,7 +2276,7 @@ WEB_HTML = r"""<!doctype html>
   }
   .caret-svg { color: var(--muted); transition: transform 0.15s; }
   .model-menu {
-    position: absolute; top: calc(100% + 6px); left: 0; min-width: 235px;
+    position: absolute; top: calc(100% + 6px); left: 0; min-width: 280px;
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
     padding: 5px; display: flex; flex-direction: column; gap: 2px;
     box-shadow: 0 10px 30px rgba(0,0,0,0.55); z-index: 30;
@@ -1974,14 +2296,25 @@ WEB_HTML = r"""<!doctype html>
       visibility 0s;
   }
   .model-opt {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    display: flex; align-items: center; gap: 10px;
     padding: 7px 10px; border-radius: 7px; border: none; background: transparent;
     color: var(--text); font-size: 13px; text-align: left; width: 100%;
   }
   .model-opt:hover { background: var(--surface-2); }
-  .model-opt-left { display: flex; align-items: center; gap: 8px; }
+  .model-opt-left { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+  .opt-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .opt-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-  .opt-right { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+  .opt-param {
+    font-family: var(--font-mono); font-size: 11px; line-height: 1;
+    color: var(--muted); flex-shrink: 0;
+    width: 52px; text-align: right; white-space: nowrap;
+  }
+  .opt-status {
+    display: inline-flex; align-items: center; justify-content: flex-end;
+    width: 28px; flex-shrink: 0;
+    color: var(--muted); font-size: 11px; line-height: 1; white-space: nowrap;
+  }
+  .model-pill .opt-param { width: auto; text-align: left; opacity: 0.78; padding-left: 1px; }
   .model-sep { height: 1px; background: var(--border); margin: 4px 6px; }
   .model-add { color: var(--muted); }
   .model-add:hover { color: var(--white); }
@@ -2026,14 +2359,17 @@ WEB_HTML = r"""<!doctype html>
   #welcome {
     position: absolute; left: 20px; right: 20px; bottom: calc(100% + 10px);
     max-width: 680px; margin: 0 auto; text-align: center;
-    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
     opacity: 1; transform: translateY(0);
     transition: opacity 0.22s ease, transform 0.28s cubic-bezier(0.22, 1, 0.36, 1), visibility 0.28s;
   }
   main:not(.is-empty) #welcome {
     opacity: 0; transform: translateY(-14px); visibility: hidden; pointer-events: none;
   }
-  #welcome .m-mark { width: 30px; height: 30px; gap: 2px; }
+  #welcome-mascot {
+    width: clamp(72px, 11vh, 104px); height: clamp(72px, 11vh, 104px);
+    position: relative; flex-shrink: 0;
+  }
   .q-rotator { min-height: 36px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
   #rotating-q {
     margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -0.4px; color: var(--white);
@@ -2236,7 +2572,9 @@ WEB_HTML = r"""<!doctype html>
   }
   @media (prefers-reduced-motion: reduce) {
     .loader-sec { background: none; -webkit-text-fill-color: currentColor; animation: none; }
-    #composer-bar-wrap, #plus-menu, .model-menu, #plus-btn svg, .plus-toggle, .plus-toggle::after, .chip-enter,
+    #main-pane { opacity: 1 !important; transform: none !important; transition: none !important; }
+    #composer-bar-wrap, #plus-menu, .model-menu, #plus-btn svg, .plus-toggle, .plus-toggle::after,
+    .chip-enter, .chip-leave, #soul-box, #chips-box, #settings-box, #pull-box, #models-box, #files-box,
     #drop-overlay, .drop-box, #drop-overlay.show .drop-box, #drop-overlay.show .drop-arrow {
       transition: none !important; animation: none !important;
     }
@@ -2259,12 +2597,16 @@ WEB_HTML = r"""<!doctype html>
     display: grid; grid-template-rows: 0fr;
     opacity: 0; transform: translateY(4px);
     transition:
-      grid-template-rows 0.22s cubic-bezier(0.22, 1, 0.36, 1),
-      opacity 0.18s ease,
-      transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+      grid-template-rows 0.2s cubic-bezier(0.22, 1, 0.36, 1) 0.05s,
+      opacity 0.16s ease 0.04s,
+      transform 0.2s cubic-bezier(0.22, 1, 0.36, 1) 0.04s;
   }
   #composer-bar-wrap.show {
     grid-template-rows: 1fr; opacity: 1; transform: translateY(0);
+    transition:
+      grid-template-rows 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+      opacity 0.18s ease,
+      transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   }
   .composer-bar-inner { overflow: hidden; min-height: 0; }
   #composer-bar {
@@ -2338,16 +2680,21 @@ WEB_HTML = r"""<!doctype html>
     display: inline-flex; align-items: center; gap: 6px;
     padding: 4px 8px; border-radius: 6px; font-size: 11.5px;
     border: 1px solid var(--border); background: var(--surface-2);
-    color: var(--text); max-width: 240px;
-    transition: opacity 0.16s ease, transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
-                background 0.15s ease, border-color 0.15s ease;
+    color: var(--text); max-width: 240px; white-space: nowrap; overflow: hidden;
+    transition: background 0.15s ease, border-color 0.15s ease;
   }
   @keyframes chipIn {
-    from { opacity: 0; transform: translateY(3px) scale(0.94); }
-    to   { opacity: 1; transform: translateY(0) scale(1); }
+    from { opacity: 0; transform: translateY(3px) scale(0.94); max-width: 0; padding-left: 0; padding-right: 0; margin-right: -6px; border-width: 0; }
+    50%  { max-width: 240px; padding-left: 8px; padding-right: 8px; margin-right: 0; border-width: 1px; }
+    to   { opacity: 1; transform: translateY(0) scale(1); max-width: 240px; }
+  }
+  @keyframes chipOut {
+    from { opacity: 1; transform: translateY(0) scale(1); max-width: 240px; padding-left: 8px; padding-right: 8px; border-width: 1px; }
+    60%  { opacity: 0; transform: translateY(3px) scale(0.92); }
+    to   { opacity: 0; transform: translateY(3px) scale(0.90); max-width: 0; padding-left: 0; padding-right: 0; margin-right: -6px; border-width: 0; }
   }
   .chip-enter { animation: chipIn 0.2s cubic-bezier(0.22, 1, 0.36, 1); }
-  .chip-leave { opacity: 0 !important; transform: translateY(-2px) scale(0.92) !important; pointer-events: none; }
+  .chip-leave { animation: chipOut 0.14s cubic-bezier(0.4, 0, 1, 1) forwards; pointer-events: none; }
   .tool-chip { border-color: var(--m-3); background: var(--m-glow); color: var(--m-1); }
   .att-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .att-chip-size { font-size: 10px; color: var(--muted); flex-shrink: 0; }
@@ -2455,6 +2802,11 @@ WEB_HTML = r"""<!doctype html>
   #soul-box, #chips-box, #settings-box, #pull-box, #models-box, #files-box {
     width: 100%; max-width: 640px; background: var(--surface); border: 1px solid var(--border);
     border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 14px;
+    animation: modalIn 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  @keyframes modalIn {
+    from { opacity: 0; transform: translateY(6px) scale(0.985); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
   }
   #settings-box { max-width: 480px; }
   #pull-box { max-width: 440px; }
@@ -2513,6 +2865,15 @@ WEB_HTML = r"""<!doctype html>
   .chip-edit-row input:focus, #pull-input:focus, .setting-ctrl select:focus, .setting-ctrl input[type="text"]:focus {
     outline: none; border-color: rgba(255,255,255,0.45);
   }
+  .pull-presets { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pull-preset-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 8px; border-radius: 6px; font-size: 11.5px;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+  }
+  .pull-preset-btn:hover { border-color: var(--m-3); background: var(--m-glow); color: var(--white); }
+  .pull-preset-btn span { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
   .setting-row {
     display: grid; grid-template-columns: minmax(0, 1fr) 215px;
     align-items: center; gap: 14px;
@@ -2537,48 +2898,6 @@ WEB_HTML = r"""<!doctype html>
   .btn-white { background: var(--white); color: #111; border: none; font-weight: 600; }
   .btn-white:hover { background: #e4e4e7; }
 
-  /* Startup Splash Overlay */
-  #splash-overlay {
-    position: fixed; inset: 0; z-index: 100; background: #050506;
-    display: grid; place-items: center;
-    transition: background 0.8s ease, opacity 0.45s ease;
-  }
-  #splash-overlay.fading { background: transparent; pointer-events: none; }
-  .splash-stage { position: relative; width: 84px; height: 84px; display: grid; place-items: center; }
-  .splash-glide {
-    width: 45px; height: 45px; display: grid; place-items: center;
-    transform-origin: center center;
-  }
-  #splash-overlay #brand-mark {
-    width: 100%; height: 100%; gap: 5px;
-    transform-origin: center center;
-    animation: spinLinesMark 2.2s ease-in-out forwards;
-  }
-  #splash-overlay #brand-mark span {
-    border-radius: 2.5px;
-    transform-origin: left center;
-    animation: extendLine 1.75s cubic-bezier(0.22, 1, 0.36, 1) both;
-  }
-  #splash-overlay #brand-mark span:nth-child(1) { animation-delay: 0.08s; }
-  #splash-overlay #brand-mark span:nth-child(2) { animation-delay: 0.16s; }
-  #splash-overlay #brand-mark span:nth-child(3) { animation-delay: 0.24s; }
-  #splash-overlay #brand-mark span:nth-child(4) { animation-delay: 0.32s; }
-  #splash-overlay #brand-mark span:nth-child(5) { animation-delay: 0.40s; }
-  @keyframes spinLinesMark {
-    0%   { opacity: 0; transform: rotate(-90deg) scale(1.08); }
-    18%  { opacity: 1; transform: rotate(-90deg) scale(1.08); animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1); }
-    82%  { opacity: 1; transform: rotate(0deg)   scale(1.02); animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1); }
-    100% { opacity: 1; transform: rotate(0deg)   scale(1.00); }
-  }
-  @keyframes extendLine {
-    0%   { transform: scaleX(0.35); }
-    62%  { transform: scaleX(1.05); }
-    100% { transform: scaleX(1.00); }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    #splash-overlay, #splash-overlay * { animation: none !important; transition: none !important; }
-  }
-
   @media (max-width: 720px) {
     aside { position: fixed; top: 0; bottom: 0; left: 0; z-index: 25; }
     .ctx-badge { display: none; }
@@ -2592,18 +2911,10 @@ WEB_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
-  <div id="splash-overlay" aria-hidden="true">
-    <div class="splash-stage">
-      <div class="splash-glide" id="splash-glide">
-        <div class="m-mark" id="brand-mark"><span></span><span></span><span></span><span></span><span></span></div>
-      </div>
-    </div>
-  </div>
-
-  <aside id="sidebar">
+  <aside id="sidebar" class="collapsed">
     <div class="side-head">
       <div class="brand">
-        <div class="brand-slot" id="brand-slot"></div>
+        <div class="m-mark" id="brand-mark"><span></span><span></span><span></span><span></span><span></span></div>
         <span>local agent</span>
       </div>
     </div>
@@ -2629,6 +2940,7 @@ WEB_HTML = r"""<!doctype html>
           <button type="button" class="model-pill" id="model-btn" onclick="toggleModelMenu(event)">
             <span class="dot-live"></span>
             <span id="model-label">__MODEL__</span>
+            <span id="model-param" class="opt-param" style="display:none;"></span>
             <svg class="caret-svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
           </button>
           <div class="model-menu" id="model-menu"></div>
@@ -2657,7 +2969,7 @@ WEB_HTML = r"""<!doctype html>
 
       <div class="composer-wrap">
         <div id="welcome">
-          <div class="m-mark"><span></span><span></span><span></span><span></span><span></span></div>
+          <div id="welcome-mascot" title="LFM3 mascot (click to poke)"></div>
           <div class="q-rotator" aria-live="polite">
             <h1 id="rotating-q">What are we working on?</h1>
           </div>
@@ -2802,9 +3114,17 @@ WEB_HTML = r"""<!doctype html>
     <div id="pull-box">
       <div style="display:flex;justify-content:space-between;align-items:center;">
         <b>Download Ollama model</b>
-        <span style="color:var(--muted);font-size:12px;">LFM · Granite · Gemma · Qwen</span>
+        <span style="color:var(--muted);font-size:12px;">Pick light 2B–4B or type larger tag</span>
       </div>
-      <input id="pull-input" type="text" placeholder="Model tag, e.g. gemma4, qwen3.5:9b, granite4.2..." onkeydown="if(event.key==='Enter'){event.preventDefault();submitPullModal();}" />
+      <input id="pull-input" type="text" placeholder="e.g. lfm3:1.7b, granite4.2:3b, qwen3.5:4b, gemma4:e2b (or :9b, :12b)" onkeydown="if(event.key==='Enter'){event.preventDefault();submitPullModal();}" />
+      <div class="pull-presets">
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('lfm3:1.7b')">lfm3:1.7b <span>1.7B</span></button>
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('granite4.2:3b')">granite4.2:3b <span>3B</span></button>
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('qwen3.5:4b')">qwen3.5:4b <span>4B</span></button>
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('gemma4:e2b')">gemma4:e2b <span>2B eff</span></button>
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('lfm3-audio:2b')">lfm3-audio:2b <span>2B TTS</span></button>
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('phonon')">phonon <span>31M TTS</span></button>
+      </div>
       <div class="modal-row">
         <button type="button" onclick="closePullModal()">Cancel</button>
         <button type="button" class="btn-white" onclick="submitPullModal()">Download</button>
@@ -2867,6 +3187,7 @@ WEB_HTML = r"""<!doctype html>
     </div>
   </div>
 
+<script src="/lfm3-mascot.js"></script>
 <script>
 const MAX_CTX = __NUM_CTX__;
 let currentChatId = null;
@@ -2875,6 +3196,7 @@ let currentModel = "__MODEL__";
 let availableModels = ["__MODEL__"];
 let installedModels = [];
 let installedModelDetails = [];
+let modelParams = {};
 let ollamaRunning = true;
 let pullingModel = false;
 let toolsEnabled = localStorage.getItem("local_agent_tools") === "1";
@@ -2913,17 +3235,68 @@ function getModelPalette(name) {
   return DEFAULT_PALETTE;
 }
 
+const CLIENT_KNOWN_PARAMS = {
+  "lfm3": "1.7B",
+  "lfm3:1.7b": "1.7B",
+  "granite4.2:3b": "3B",
+  "gemma4:e2b": "2B eff",
+  "gemma4:e4b": "4B eff",
+  "qwen3.5:0.8b": "0.8B",
+  "qwen3.5:2b": "2B",
+  "qwen3.5:4b": "4B",
+  "lfm3-audio:2b": "2B",
+  "phonon": "31M",
+};
+
+function getModelParamLabel(name) {
+  const n = String(name || "").trim();
+  if (!n) return "";
+  if (typeof modelParams !== "undefined" && modelParams && modelParams[n]) return modelParams[n];
+  if (typeof installedModelDetails !== "undefined" && Array.isArray(installedModelDetails)) {
+    const det = installedModelDetails.find(d => d && (d.name === n || d.raw_name === n));
+    if (det && det.parameter_size) return det.parameter_size;
+  }
+  const low = n.toLowerCase();
+  if (CLIENT_KNOWN_PARAMS[low]) return CLIENT_KNOWN_PARAMS[low];
+  const colonIdx = low.indexOf(":");
+  if (colonIdx >= 0) {
+    const tag = low.slice(colonIdx + 1);
+    const edgeM = tag.match(/(?:^|-)e(\d+(?:\.\d+)?b)(?:$|-)/i);
+    if (edgeM) return edgeM[1].toUpperCase() + " eff";
+    const sizeM = tag.match(/(?:^|-)(\d+(?:\.\d+)?[bm])(?:$|-)/i);
+    if (sizeM) return sizeM[1].toUpperCase();
+  }
+  const base = colonIdx >= 0 ? low.slice(0, colonIdx) : low;
+  if (CLIENT_KNOWN_PARAMS[base]) return CLIENT_KNOWN_PARAMS[base];
+  return "";
+}
+
+let welcomeMascot = null;
+
 function applyModelTheme(modelName) {
   const pal = getModelPalette(modelName);
   const root = document.documentElement.style;
   pal.forEach((col, idx) => root.setProperty(`--m-${idx + 1}`, col));
   root.setProperty("--m-glow", pal[2] + "24");
   document.getElementById("model-label").textContent = modelName;
+  const mpEl = document.getElementById("model-param");
+  if (mpEl) {
+    const pLbl = getModelParamLabel(modelName);
+    mpEl.textContent = pLbl;
+    mpEl.style.display = pLbl ? "" : "none";
+  }
   const wm = document.getElementById("welcome-model");
   if (wm) wm.textContent = modelName;
+  if (welcomeMascot && typeof welcomeMascot.setRingColors === "function") {
+    welcomeMascot.setRingColors(pal[3], pal[4]);
+  }
 }
 
 function isModelInstalled(name) {
+  if (!name) return false;
+  if (name.includes(":")) {
+    return installedModels.some(m => m === name || m === name + ":latest" || (name === "lfm3:1.7b" && m === "lfm3"));
+  }
   return installedModels.some(m => m === name || m.startsWith(name + ":"));
 }
 
@@ -3229,6 +3602,19 @@ function renderComposerBar() {
   const bar = document.getElementById("composer-bar");
   if (!bar) return;
 
+  function markChipLeaving(el, key) {
+    if (!el || el.dataset.leaving === "1") return;
+    const k = key || el.dataset.chipKey || "";
+    if (k) el.dataset.leavingKey = k;
+    delete el.dataset.chipKey;
+    el.dataset.leaving = "1";
+    el.classList.remove("chip-enter");
+    el.classList.add("chip-leave");
+    setTimeout(() => {
+      if (el.isConnected && el.dataset.leaving === "1") el.remove();
+    }, 160);
+  }
+
   const enabledIds = getEnabledPacksList();
   const ttsAuto = typeof appSettings !== "undefined" && !!appSettings.tts_auto;
   const hasAny = enabledIds.length > 0 || ttsAuto || pendingFiles.length > 0 || !!uploadNotice;
@@ -3240,26 +3626,14 @@ function renderComposerBar() {
     }
     bar.classList.remove("show");
     for (const el of Array.from(bar.children)) {
-      el.dataset.leaving = "1";
-      el.classList.remove("chip-enter");
-      el.classList.add("chip-leave");
+      markChipLeaving(el, el.dataset.chipKey);
     }
-    setTimeout(() => {
-      if (!wrap || !wrap.classList.contains("show")) {
-        for (const el of Array.from(bar.children)) {
-          if (el.dataset.leaving === "1") el.remove();
-        }
-      }
-    }, 230);
     return;
-  }
-
-  for (const el of Array.from(bar.children)) {
-    if (el.dataset.leaving === "1") el.remove();
   }
 
   const existing = new Map();
   for (const el of Array.from(bar.children)) {
+    if (el.dataset.leaving === "1") continue;
     const k = el.dataset.chipKey;
     if (k) existing.set(k, el);
     else el.remove();
@@ -3311,7 +3685,9 @@ function renderComposerBar() {
     } else {
       existing.delete(key);
     }
-    chip.querySelector(".voice-chip-lbl").textContent = `Voice · ${ttsModel}`;
+    const warmState = (typeof ttsWarmState !== "undefined") ? ttsWarmState : "";
+    const stateSuffix = warmState === "loading" ? " · loading..." : (warmState === "ready" ? " · ready" : "");
+    chip.querySelector(".voice-chip-lbl").textContent = `Voice · ${ttsModel}${stateSuffix}`;
     desired.push(chip);
   }
 
@@ -3367,12 +3743,22 @@ function renderComposerBar() {
     desired.push(errChip);
   }
 
-  for (const [, stale] of existing) {
-    stale.remove();
+  const desiredKeys = new Set(desired.map(d => d.dataset.chipKey).filter(Boolean));
+  for (const el of Array.from(bar.children)) {
+    if (el.dataset.leaving === "1" && desiredKeys.has(el.dataset.leavingKey || "")) {
+      el.remove();
+    }
+  }
+
+  for (const [oldKey, stale] of existing) {
+    markChipLeaving(stale, oldKey);
   }
 
   let cursor = bar.firstChild;
   for (const el of desired) {
+    while (cursor && cursor.dataset && cursor.dataset.leaving === "1") {
+      cursor = cursor.nextSibling;
+    }
     if (cursor === el) {
       cursor = cursor.nextSibling;
     } else {
@@ -3650,6 +4036,7 @@ function renderModelMenu() {
   for (const m of availableModels) {
     const pal = getModelPalette(m);
     const installed = isModelInstalled(m);
+    const paramLabel = getModelParamLabel(m);
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "model-opt";
@@ -3658,9 +4045,12 @@ function renderModelMenu() {
         <span class="opt-dot" style="background:${pal[2]};opacity:${installed ? 0.95 : 0.35};"></span>
         <span class="opt-name"></span>
       </span>
-      <span class="opt-right">${m === currentModel ? SVG_CHECK : (!installed && ollamaRunning ? "pull" : "")}</span>
+      <span class="opt-param"></span>
+      <span class="opt-status">${m === currentModel ? SVG_CHECK : (!installed && ollamaRunning ? "pull" : "")}</span>
     `;
     btn.querySelector(".opt-name").textContent = m;
+    const pEl = btn.querySelector(".opt-param");
+    if (pEl) pEl.textContent = paramLabel || "";
     btn.onclick = () => selectModel(m);
     menu.appendChild(btn);
   }
@@ -3943,6 +4333,13 @@ async function deleteInstalledModel(targetName, displayName) {
   }
 }
 
+function pickPullModel(tag) {
+  const inp = document.getElementById("pull-input");
+  if (!inp) return;
+  inp.value = tag || "";
+  inp.focus();
+}
+
 function openPullModal() {
   const inp = document.getElementById("pull-input");
   inp.value = "";
@@ -3993,6 +4390,7 @@ async function loadModels(retryOnBoot = true) {
     hasBin = Boolean(info.has_ollama_bin);
     installedModels = Array.isArray(info.installed) ? info.installed : [];
     installedModelDetails = Array.isArray(info.installed_details) ? info.installed_details : [];
+    modelParams = (info && info.model_params && typeof info.model_params === "object") ? info.model_params : {};
     if (Array.isArray(info.models) && info.models.length) availableModels = info.models;
     if (!currentChatId && !modelChosenByUser && info.default_model) {
       if ((typeof appSettings !== "undefined" && appSettings.default_model) || !isModelInstalled(currentModel)) {
@@ -4003,6 +4401,9 @@ async function loadModels(retryOnBoot = true) {
   applyModelTheme(currentModel);
   renderModelMenu();
   updateSetupBanner();
+  if (ollamaRunning && typeof appSettings !== "undefined" && appSettings.tts_auto && !_bootTtsWarmed) {
+    warmTtsModel(false);
+  }
   if (document.getElementById("models-modal").style.display === "flex") {
     renderModelsManager();
   }
@@ -4262,14 +4663,18 @@ class SpeechSentenceBuffer {
         cutRel = segment.length;
       } else if (final) {
         cutRel = segment.length;
-      } else if (this.chunksSent === 0 && segment.length >= 110) {
+      } else if (this.chunksSent === 0 && segment.length >= 48) {
         const clauseRe = /(?:,\s|;\s|:\s)/g;
         let cm;
         while ((cm = clauseRe.exec(segment)) !== null) {
-          if (cm.index >= 45) {
+          if (cm.index >= 24) {
             cutRel = cm.index + cm[0].length;
             break;
           }
+        }
+        if (cutRel < 0 && segment.length >= 80) {
+          const sp = segment.lastIndexOf(" ", 80);
+          if (sp >= 42) cutRel = sp + 1;
         }
       }
 
@@ -4387,11 +4792,15 @@ function stopTtsPlayback() {
 }
 
 const TTS_SAMPLE_RATE = 24000;
-const TTS_INITIAL_PREBUF_BYTES = 48000; // 1.00s cushion at 24kHz 16-bit mono
-const TTS_REBUF_BYTES = 32768;          // 0.68s recovery cushion after any underrun
-const TTS_COALESCE_BYTES = 24576;       // 0.51s coalesced AudioBuffer blocks
+const TTS_INITIAL_PREBUF_BYTES = 24000; // 0.50s cushion at 24kHz 16-bit mono
+const TTS_REBUF_BYTES = 36864;          // 0.77s recovery cushion after any underrun
+const TTS_COALESCE_BYTES = 20480;       // 0.43s coalesced AudioBuffer blocks
 const TTS_LOW_RUNWAY_BYTES = 8192;
 const TTS_FADE_SAMPLES = 144;           // 6ms linear edge fade at non-contiguous starts / EOF
+const TTS_FIRST_BATCH_MIN_CHARS = 100;  // Target initial runway before starting live TTS
+const TTS_FIRST_BATCH_WAIT_MS = 280;    // Brief settle for tiny openers to merge clauses
+const TTS_COALESCE_MIN_CHARS = 240;     // Coalesce subsequent short sentences while audio plays
+const TTS_COALESCE_RUNWAY_SEC = 1.5;    // Dispatch next batch once remaining runway dips below 1.5s
 
 function pcmInt16ToSoftFloats(u8, sampleCount, applyFadeIn, applyFadeOut) {
   const dv = new DataView(u8.buffer, u8.byteOffset, sampleCount * 2);
@@ -4447,6 +4856,8 @@ function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
     workerRunning: false,
     hasAudio: false,
     abortCtrl: null,
+    drainTimer: null,
+    firstEnqueueAt: 0,
     nextTime: 0,
     sources: new Set(),
     pendingAudio: [],
@@ -4457,6 +4868,57 @@ function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
     btn: startBtn,
     finalBtn: existingBtn || null,
     liveHeaderBtn,
+    _queuedChars() {
+      let total = 0;
+      for (const q of session.queue) total += q.length;
+      return total;
+    },
+    _audioRunway() {
+      const ctx = audioCtx;
+      return (ctx && session.nextTime > ctx.currentTime) ? (session.nextTime - ctx.currentTime) : 0;
+    },
+    _clearDrainTimer() {
+      if (session.drainTimer) {
+        clearTimeout(session.drainTimer);
+        session.drainTimer = null;
+      }
+    },
+    _scheduleDrain() {
+      if (session.aborted || session.workerRunning || !session.queue.length) return;
+      session._clearDrainTimer();
+      if (session.inputEnded) {
+        session._drain();
+        return;
+      }
+      const qChars = session._queuedChars();
+      if (session.batchesRequested === 0) {
+        if (qChars >= TTS_FIRST_BATCH_MIN_CHARS) {
+          session._drain();
+          return;
+        }
+        const elapsed = session.firstEnqueueAt ? (Date.now() - session.firstEnqueueAt) : 0;
+        const waitMs = Math.max(0, TTS_FIRST_BATCH_WAIT_MS - elapsed);
+        if (waitMs === 0) {
+          session._drain();
+        } else {
+          session.drainTimer = setTimeout(() => {
+            session.drainTimer = null;
+            if (!session.aborted && !session.workerRunning && session.queue.length > 0) session._drain();
+          }, waitMs);
+        }
+        return;
+      }
+      const runway = session._audioRunway();
+      if (runway > TTS_COALESCE_RUNWAY_SEC && qChars < TTS_COALESCE_MIN_CHARS) {
+        const checkMs = Math.min(250, Math.max(80, Math.round((runway - 1.4) * 500)));
+        session.drainTimer = setTimeout(() => {
+          session.drainTimer = null;
+          session._scheduleDrain();
+        }, checkMs);
+        return;
+      }
+      session._drain();
+    },
     _commitWavCache() {
       if (session.aborted) return;
       if (session.finalBtn && session.wavBlob && !session.wavCommitted) {
@@ -4535,9 +4997,10 @@ function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
     },
     enqueue(text) {
       if (session.aborted || !text) return;
+      if (!session.firstEnqueueAt) session.firstEnqueueAt = Date.now();
       session.queue.push(text);
       session._syncBtnState();
-      if (!session.workerRunning) session._drain();
+      session._scheduleDrain();
     },
     finish(remainingChunks) {
       if (session.aborted) return;
@@ -4547,6 +5010,7 @@ function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
         }
       }
       session.inputEnded = true;
+      session._clearDrainTimer();
       session._syncBtnState();
       if (!session.workerRunning) {
         if (session.queue.length > 0) session._drain();
@@ -4555,6 +5019,7 @@ function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
     },
     stop() {
       session.aborted = true;
+      session._clearDrainTimer();
       session.queue.length = 0;
       session.pendingAudio.length = 0;
       session.pendingBytes = 0;
@@ -4581,7 +5046,7 @@ function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
     },
     _takeBatch() {
       if (!session.queue.length) return "";
-      const maxChars = session.batchesRequested === 0 ? 220 : 1000;
+      const maxChars = session.batchesRequested === 0 ? 280 : 1000;
       let piece = session.queue.shift();
       while (session.queue.length > 0 && (piece.length + 1 + session.queue[0].length) <= maxChars) {
         piece += " " + session.queue.shift();
@@ -4591,9 +5056,16 @@ function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
     },
     async _drain() {
       if (session.workerRunning || session.aborted) return;
+      session._clearDrainTimer();
       session.workerRunning = true;
       try {
         while (!session.aborted && session.queue.length > 0) {
+          if (!session.inputEnded && session.batchesRequested > 0) {
+            if (session._audioRunway() > TTS_COALESCE_RUNWAY_SEC && session._queuedChars() < TTS_COALESCE_MIN_CHARS) {
+              if (session.hasAudio && session.pendingBytes >= 2) session._flushPendingAudio(false);
+              break;
+            }
+          }
           const piece = session._takeBatch();
           if (!piece) continue;
           session.abortCtrl = new AbortController();
@@ -4652,10 +5124,16 @@ function createLiveSpeechSession(model, voice, headEl, existingBtn = null) {
       } finally {
         if (!session.aborted && session.inputEnded && session.queue.length === 0 && session.pendingBytes >= 2) {
           session._flushPendingAudio(true);
+        } else if (!session.aborted && session.hasAudio && session.pendingBytes >= 2) {
+          session._flushPendingAudio(false);
         }
         session.workerRunning = false;
         session.abortCtrl = null;
-        session._doneCheck();
+        if (!session.aborted && session.queue.length > 0) {
+          session._scheduleDrain();
+        } else {
+          session._doneCheck();
+        }
       }
     },
     _pushPcmRecord(u8) {
@@ -4804,9 +5282,69 @@ function speakReply(btn, rawText) {
   session.finish(pieces);
 }
 
+let ttsWarmState = "";
+let ttsWarmSeq = 0;
+let _bootTtsWarmed = false;
+
+async function warmTtsModel(showMissingBanner = true) {
+  if (typeof appSettings === "undefined" || !appSettings.tts_auto || !ollamaRunning) return;
+  const seq = ++ttsWarmSeq;
+  _bootTtsWarmed = true;
+  ttsWarmState = "loading";
+  renderComposerBar();
+  const model = (appSettings.tts_model || "lfm3-audio:2b").trim();
+  try {
+    const res = await fetch("/api/tts/warm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (seq !== ttsWarmSeq || !appSettings.tts_auto) return;
+    if (!res.ok) {
+      ttsWarmState = "";
+      renderComposerBar();
+      if (res.status === 404 && data.missing_model && showMissingBanner) {
+        showSpeechBanner(data.error || `Speech model "${data.missing_model}" is not installed in Ollama yet.`, data.missing_model);
+      }
+      return;
+    }
+    ttsWarmState = "ready";
+    renderComposerBar();
+    setTimeout(() => {
+      if (seq === ttsWarmSeq && ttsWarmState === "ready") {
+        ttsWarmState = "";
+        renderComposerBar();
+      }
+    }, 3800);
+  } catch (_) {
+    if (seq === ttsWarmSeq) {
+      ttsWarmState = "";
+      renderComposerBar();
+    }
+  }
+}
+
+async function unloadTtsModel(model) {
+  if (!ollamaRunning) return;
+  const eff = (model || (typeof appSettings !== "undefined" && appSettings.tts_model) || "lfm3-audio:2b").trim();
+  if (!eff) return;
+  try {
+    await fetch("/api/tts/unload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: eff }),
+    });
+  } catch (_) {}
+}
+
 async function toggleTtsAuto() {
   appSettings.tts_auto = !appSettings.tts_auto;
-  if (!appSettings.tts_auto) stopTtsPlayback();
+  if (!appSettings.tts_auto) {
+    ttsWarmSeq++;
+    ttsWarmState = "";
+    stopTtsPlayback();
+  }
   syncPlusMenuState();
   renderComposerBar();
   try {
@@ -4816,6 +5354,11 @@ async function toggleTtsAuto() {
       body: JSON.stringify({ tts_auto: !!appSettings.tts_auto }),
     });
   } catch (_) {}
+  if (appSettings.tts_auto) {
+    warmTtsModel(true);
+  } else {
+    unloadTtsModel();
+  }
 }
 
 function buildMsgActions(rawText) {
@@ -5001,20 +5544,49 @@ function stopQuestionRotation() {
   if (el) el.classList.remove("q-exit", "q-enter");
 }
 
+let welcomeMascotPauseTimer = null;
+
+function initWelcomeMascot() {
+  const box = document.getElementById("welcome-mascot");
+  if (!box || welcomeMascot || typeof BooMascot === "undefined") return;
+  const pal = getModelPalette(currentModel);
+  welcomeMascot = BooMascot.mount(box, {
+    variant: "with-purple",
+    face: "soft",
+    theme: "dark",
+    mood: "auto",
+    mouth: "happy",
+    ringTop: pal[3],
+    ringBottom: pal[4],
+  });
+  const main = document.getElementById("main-pane");
+  if (main && !main.classList.contains("is-empty") && typeof welcomeMascot.setPaused === "function") {
+    welcomeMascot.setPaused(true);
+  }
+}
+
 function setEmptyState(isEmpty) {
   const main = document.getElementById("main-pane");
   if (!main) return;
   const wasEmpty = main.classList.contains("is-empty");
   main.classList.toggle("is-empty", isEmpty);
+  clearTimeout(welcomeMascotPauseTimer);
   if (isEmpty && !wasEmpty) {
     qIndex = 0;
     const el = document.getElementById("rotating-q");
     if (el) el.textContent = WELCOME_QUESTIONS[0];
     startQuestionRotation();
+    if (welcomeMascot && typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
   } else if (isEmpty) {
     if (!qTimer) startQuestionRotation();
+    if (welcomeMascot && typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
   } else {
     stopQuestionRotation();
+    if (welcomeMascot && typeof welcomeMascot.setPaused === "function") {
+      welcomeMascotPauseTimer = setTimeout(() => {
+        if (welcomeMascot) welcomeMascot.setPaused(true);
+      }, 320);
+    }
   }
 }
 
@@ -5875,7 +6447,8 @@ function openSettings() {
   for (const m of list) {
     const opt = document.createElement("option");
     opt.value = m;
-    opt.textContent = m;
+    const p = getModelParamLabel(m);
+    opt.textContent = p ? `${m} · ${p}` : m;
     selModel.appendChild(opt);
   }
   selModel.value = appSettings.default_model || "";
@@ -5889,11 +6462,12 @@ function openSettings() {
   if (selTts) {
     selTts.innerHTML = "";
     const curTts = appSettings.tts_model || "lfm3-audio:2b";
-    const ttsOpts = Array.from(new Set(["lfm3-audio:2b", "phonon", curTts, ...availableModels].filter(Boolean)));
+    const ttsOpts = Array.from(new Set(["lfm3-audio:2b", "phonon", "phonon:en", curTts, ...installedModels].filter(Boolean)));
     for (const m of ttsOpts) {
       const opt = document.createElement("option");
       opt.value = m;
-      opt.textContent = m;
+      const p = getModelParamLabel(m);
+      opt.textContent = p ? `${m} · ${p}` : m;
       selTts.appendChild(opt);
     }
     selTts.value = curTts;
@@ -5915,6 +6489,7 @@ function testSound() {
 }
 
 async function saveSettings() {
+  const prevTts = (appSettings.tts_model || "lfm3-audio:2b").trim();
   const default_model = document.getElementById("set-default-model").value;
   const sound = document.getElementById("set-sound").value;
   const stepsEl = document.getElementById("set-max-steps");
@@ -5943,6 +6518,12 @@ async function saveSettings() {
   renderPlusMenu();
   renderComposerBar();
   closeSettings();
+  if (tts_model.trim() !== prevTts) {
+    unloadTtsModel(prevTts);
+    if (appSettings.tts_auto) {
+      warmTtsModel(true);
+    }
+  }
 }
 
 async function quitServer() {
@@ -5950,76 +6531,6 @@ async function quitServer() {
     await fetch("/api/quit", { method: "POST" });
   } catch (_) {}
   document.body.innerHTML = '<div style="margin:auto;text-align:center;color:#9898a3;font-family:sans-serif;"><h2 style="color:#fff;">Local agent stopped</h2><p>You can close this tab now.</p></div>';
-}
-
-function finishSplashHandoff() {
-  const overlay = document.getElementById("splash-overlay");
-  const mark = document.getElementById("brand-mark");
-  const slot = document.getElementById("brand-slot");
-  if (slot && mark && mark.parentElement !== slot) {
-    slot.appendChild(mark);
-  }
-  if (overlay && overlay.isConnected) overlay.remove();
-}
-
-function waitForSplashIntro() {
-  return new Promise((resolve) => {
-    const mark = document.getElementById("brand-mark");
-    if (!mark) { resolve(); return; }
-    let settled = false;
-    const done = () => { if (!settled) { settled = true; resolve(); } };
-    mark.addEventListener("animationend", (e) => {
-      if (e.target === mark && e.animationName === "spinLinesMark") done();
-    });
-    setTimeout(done, 2500);
-  });
-}
-
-function runSplashOutro() {
-  const overlay = document.getElementById("splash-overlay");
-  const glide = document.getElementById("splash-glide");
-  const mark = document.getElementById("brand-mark");
-  const slot = document.getElementById("brand-slot");
-  if (!overlay || !glide || !mark || !slot) {
-    finishSplashHandoff();
-    return;
-  }
-  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    finishSplashHandoff();
-    return;
-  }
-  requestAnimationFrame(() => {
-    const tr = slot.getBoundingClientRect();
-    const mr = mark.getBoundingClientRect();
-    if (!tr || tr.width <= 0 || !mr || mr.width <= 0) {
-      finishSplashHandoff();
-      return;
-    }
-    const scale = tr.width / mr.width;
-    const dx = (tr.left + tr.width / 2) - (mr.left + mr.width / 2);
-    const dy = (tr.top + tr.height / 2) - (mr.top + mr.height / 2);
-    overlay.classList.add("fading");
-    if (typeof glide.animate === "function") {
-      const anim = glide.animate(
-        [
-          { transform: "translate(0px, 0px) scale(1)" },
-          { transform: `translate(${dx}px, ${dy}px) scale(${scale})` },
-        ],
-        { duration: 900, easing: "cubic-bezier(0.22, 1, 0.36, 1)", fill: "forwards" }
-      );
-      let done = false;
-      const complete = () => {
-        if (done) return;
-        done = true;
-        finishSplashHandoff();
-        try { anim.cancel(); } catch (_) {}
-      };
-      anim.finished.then(complete, complete);
-      setTimeout(complete, 1500);
-    } else {
-      finishSplashHandoff();
-    }
-  });
 }
 
 const inpEl = document.getElementById("input");
@@ -6176,19 +6687,27 @@ document.getElementById("empty-spacer").addEventListener("transitionend", (e) =>
 renderPlusMenu();
 renderComposerBar();
 setSendBtnState(false);
+initWelcomeMascot();
 updateCtxBadge(0, MAX_CTX);
-startQuestionRotation();
-loadChips();
-loadChatList();
-
-const bootReady = loadSettings().then(() => loadModels());
-if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-  finishSplashHandoff();
-} else {
-  const splashMinWait = waitForSplashIntro();
-  const splashMaxWait = new Promise(r => setTimeout(r, 4000));
-  Promise.race([Promise.all([bootReady, splashMinWait]), splashMaxWait]).then(runSplashOutro);
+let _appRevealed = false;
+function revealApp() {
+  if (_appRevealed) return;
+  _appRevealed = true;
+  requestAnimationFrame(() => document.body.classList.add("app-ready"));
 }
+
+startQuestionRotation();
+const _bootMinDelay = new Promise(resolve => setTimeout(resolve, 500));
+const _bootFallback = setTimeout(revealApp, 1500);
+Promise.allSettled([
+  _bootMinDelay,
+  loadChips(),
+  loadChatList(),
+  loadSettings().then(() => loadModels()),
+]).then(() => {
+  clearTimeout(_bootFallback);
+  revealApp();
+});
 </script>
 </body>
 </html>
@@ -6206,6 +6725,19 @@ def render_web_html() -> bytes:
         .replace("__CTX_K__", html_lib.escape(ctx_k))
     )
     return page.encode("utf-8")
+
+
+def load_mascot_js() -> bytes:
+    candidates = []
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        candidates.extend([Path(bundled) / "web" / "lfm3-mascot.js", Path(bundled) / "lfm3-mascot.js"])
+    here = Path(__file__).resolve().parent
+    candidates.extend([here / "lfm3-mascot.js", here.parent / "lfm3-mascot.js"])
+    for p in candidates:
+        if p.is_file():
+            return p.read_bytes()
+    return b""
 
 
 class WebHandler(BaseHTTPRequestHandler):
@@ -6277,6 +6809,19 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/lfm3-mascot.js":
+            body = load_mascot_js()
+            if not body:
+                self.send_json(404, {"error": "Mascot script not found"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(body)
             return
@@ -6455,6 +7000,24 @@ class WebHandler(BaseHTTPRequestHandler):
             data = self.read_json()
             saved = save_souls(data)
             self.send_json(200, {"ok": True, **saved})
+            return
+
+        if path == "/api/tts/warm":
+            data = self.read_json()
+            st = load_settings()
+            tts_model = str(data.get("model") or st.get("tts_model") or DEFAULT_TTS_MODEL).strip()
+            try:
+                info = warm_ollama_model(tts_model)
+                self.send_json(200, info)
+            except Exception as e:
+                self._send_audio_error(e)
+            return
+
+        if path == "/api/tts/unload":
+            data = self.read_json()
+            st = load_settings()
+            tts_model = str(data.get("model") or st.get("tts_model") or DEFAULT_TTS_MODEL).strip()
+            self.send_json(200, unload_ollama_model(tts_model))
             return
 
         if path == "/api/tts":
