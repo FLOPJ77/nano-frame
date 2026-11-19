@@ -2,6 +2,7 @@
 """Cross-platform local Web UI agent backed by Ollama (Windows, macOS, Linux)."""
 
 import errno
+import hashlib
 import html as html_lib
 import html.parser
 import json
@@ -21,12 +22,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 IS_FROZEN = bool(getattr(sys, "frozen", False))
+
+if IS_MAC:
+    _cur_path = os.environ.get("PATH", "")
+    _cur_parts = _cur_path.split(os.pathsep) if _cur_path else []
+    _extra = [p for p in ("/opt/homebrew/bin", "/usr/local/bin") if os.path.isdir(p) and p not in _cur_parts]
+    if _extra:
+        os.environ["PATH"] = os.pathsep.join(_extra + _cur_parts)
 
 SHELL_TOOL_NAME = "run_shell" if IS_WINDOWS else "run_bash"
 
@@ -38,6 +48,15 @@ DEFAULT_SOUL = """You are Gipsy, a concise, direct, slightly witty assistant.
 - Never invent tool outputs; if you run a tool, report only what it returned.
 - Ask before running destructive commands (`rm -rf`, formatting, killing critical processes).
 - Keep replies short and readable.
+"""
+
+DEFAULT_CUBE_SOUL = """You are Cube, a disciplined, systematic long-horizon engineering partner.
+
+- Understand the full objective first and break work into focused, verifiable pieces before modifying files.
+- Keep every file change, shell command, and artifact strictly inside the assigned project folder.
+- Write complete, clean, modular code—avoid stubs or unverified assumptions.
+- Verify behavior by running real checks and tests, and inspect failures carefully before declaring success.
+- Communicate plans, handoffs, and reviews with concise technical precision.
 """
 
 
@@ -77,15 +96,24 @@ init_stdio()
 
 SOUL_FILE = DATA_DIR / "soul.md"
 SOULS_FILE = DATA_DIR / "souls.json"
+CUBE_SOUL_FILE = DATA_DIR / "cube_soul.md"
+CUBE_SOULS_FILE = DATA_DIR / "cube_souls.json"
 MAX_SOUL_SLOTS = 4
 CHATS_DIR = DATA_DIR / "chats"
+PROJECTS_DIR = DATA_DIR / "projects"
 UPLOADS_DIR = DATA_DIR / "uploads"
 CHIPS_FILE = DATA_DIR / "chips.json"
+PROJECT_CHIPS_FILE = DATA_DIR / "project_chips.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_CHIPS = [
     {"label": "Check CPU, RAM & disk", "prompt": "Check my CPU, RAM, GPU, and free disk space on this PC"},
     {"label": "Check Downloads", "prompt": "List the largest files in my Downloads folder"},
     {"label": "Explain a command", "prompt": "How do I compress a folder with tar and gzip?"},
+]
+DEFAULT_PROJECT_CHIPS = [
+    {"label": "Build Python app + tests", "prompt": "Analyze this folder and build a clean modular Python CLI tool with unit tests and README.md, run the tests, and fix any issues."},
+    {"label": "Review & refactor codebase", "prompt": "Inspect the files in this folder, create an implementation plan to clean up bugs and structure, refactor piece by piece, and verify everything works."},
+    {"label": "Create web page / dashboard", "prompt": "Build a clean responsive HTML/CSS/JS app in this folder, test that the JS syntax and assets work properly, and summarize the walkthrough."},
 ]
 MAX_STEPS = 8
 MIN_TOOL_STEPS = 2
@@ -98,24 +126,40 @@ DEFAULT_SETTINGS = {
     "tts_model": DEFAULT_TTS_MODEL,
     "tts_voice": "",
     "tts_auto": False,
+    "project_workers": 1,
+    "project_num_ctx": 16384,
+    "project_orchestrator_model": "",
+    "project_worker_model": "",
+    "project_worker_pool": [],
+    "project_max_review_cycles": 1,
+    "show_prompt_chips": True,
 }
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 VALID_PACKS = ("web", "files", "system")
 
 
-def seed_soul_if_missing():
-    if SOUL_FILE.exists():
+def _seed_soul_if_missing(dst: Path, bundled_name: str, fallback: str):
+    if dst.exists():
         return
     bundled = getattr(sys, "_MEIPASS", None)
     if bundled:
-        cand = Path(bundled) / "soul.md"
+        cand = Path(bundled) / bundled_name
         if cand.exists():
-            SOUL_FILE.write_text(cand.read_text(encoding="utf-8"), encoding="utf-8")
+            dst.write_text(cand.read_text(encoding="utf-8"), encoding="utf-8")
             return
-    SOUL_FILE.write_text(DEFAULT_SOUL, encoding="utf-8")
+    dst.write_text(fallback, encoding="utf-8")
+
+
+def seed_soul_if_missing():
+    _seed_soul_if_missing(SOUL_FILE, "soul.md", DEFAULT_SOUL)
+
+
+def seed_cube_soul_if_missing():
+    _seed_soul_if_missing(CUBE_SOUL_FILE, "cube_soul.md", DEFAULT_CUBE_SOUL)
 
 
 seed_soul_if_missing()
+seed_cube_soul_if_missing()
 
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
@@ -152,11 +196,34 @@ KNOWN_MODEL_PARAMS = {
     "phonon": "31M",
 }
 OLLAMA_LOCK = threading.Lock()
+_OLLAMA_GATE_COND = threading.Condition()
+_OLLAMA_ACTIVE_SLOTS = 0
 SERVER_REF = {"server": None}
 
 
 class CancelledError(Exception):
     pass
+
+
+@contextmanager
+def acquire_ollama_slot(max_slots: int = 1, cancel_check=None):
+    """Gate concurrent Ollama calls cleanly (1 = sequential CPU-safe, >1 = parallel waves)."""
+    global _OLLAMA_ACTIVE_SLOTS
+    cap = max(1, min(4, int(max_slots or 1)))
+    with _OLLAMA_GATE_COND:
+        while _OLLAMA_ACTIVE_SLOTS >= cap:
+            if cancel_check and cancel_check():
+                raise CancelledError()
+            _OLLAMA_GATE_COND.wait(timeout=0.2)
+        if cancel_check and cancel_check():
+            raise CancelledError()
+        _OLLAMA_ACTIVE_SLOTS += 1
+    try:
+        yield
+    finally:
+        with _OLLAMA_GATE_COND:
+            _OLLAMA_ACTIVE_SLOTS = max(0, _OLLAMA_ACTIVE_SLOTS - 1)
+            _OLLAMA_GATE_COND.notify_all()
 
 
 def os_label() -> str:
@@ -207,10 +274,12 @@ def inspect_file_outline(path: Path) -> str:
         return ""
 
 
-def resolve_doc_path(file_arg: str, chat_id: str = "", for_write: bool = False) -> tuple:
+def resolve_doc_path(file_arg: str, chat_id: str = "", for_write: bool = False, workspace_dir: Path = None) -> tuple:
     raw = (file_arg or "").strip()
     if not raw:
         raise ValueError("Missing file name")
+    if workspace_dir is not None:
+        return resolve_confined_path(raw, workspace_dir), False
     if chat_id and valid_chat_id(chat_id):
         safe = safe_upload_name(raw)
         up_dir = UPLOADS_DIR / chat_id
@@ -228,8 +297,9 @@ def resolve_doc_path(file_arg: str, chat_id: str = "", for_write: bool = False) 
     return p, False
 
 
-def read_doc_impl(file_arg: str, range_spec: str = "", chat_id: str = "") -> str:
-    path, _ = resolve_doc_path(file_arg, chat_id=chat_id, for_write=False)
+def read_doc_impl(file_arg: str, range_spec: str = "", chat_id: str = "", workspace_dir: Path = None) -> str:
+    path, _ = resolve_doc_path(file_arg, chat_id=chat_id, for_write=False, workspace_dir=workspace_dir)
+    out_limit = 24000 if workspace_dir is not None else 5500
     if not path.exists():
         return f"File not found: {file_arg}"
     if _is_binary_file(path):
@@ -249,7 +319,7 @@ def read_doc_impl(file_arg: str, range_spec: str = "", chat_id: str = "") -> str
                 hits.append(block)
                 if len(hits) >= 20:
                     break
-        return "\n---\n".join(hits)[:5500] if hits else f"No matches for '{term}' in {path.name}"
+        return "\n---\n".join(hits)[:out_limit] if hits else f"No matches for '{term}' in {path.name}"
 
     if spec.lower().startswith("section:") and ext in (".wiki", ".mediawiki", ".md"):
         sec_q = spec.split(":", 1)[1].strip().lower()
@@ -273,19 +343,20 @@ def read_doc_impl(file_arg: str, range_spec: str = "", chat_id: str = "") -> str
         if start is None:
             return f"Section '{sec_q}' not found in {path.name}"
         numbered = [f"L{k + 1}: {lines[k]}" for k in range(start, end)]
-        return ("\n".join(numbered))[:5500]
+        return ("\n".join(numbered))[:out_limit]
 
-    l1, l2 = 1, min(len(lines), 120)
+    page_lines = 400 if workspace_dir is not None else 120
+    l1, l2 = 1, min(len(lines), page_lines)
     m = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", spec)
     if m:
         l1 = max(1, int(m.group(1)))
-        l2 = min(len(lines), int(m.group(2) or (l1 + 119)))
+        l2 = min(len(lines), int(m.group(2) or (l1 + page_lines - 1)))
     numbered = [f"L{k}: {lines[k - 1]}" for k in range(l1, l2 + 1)]
-    tail = f"\n... ({len(lines)} total lines; pass range=\"{l2 + 1}-{min(len(lines), l2 + 120)}\" for more)" if l2 < len(lines) else ""
-    return (f"{path.name} ({len(lines)} lines):\n" + "\n".join(numbered))[:5500] + tail
+    tail = f"\n... ({len(lines)} total lines; pass range=\"{l2 + 1}-{min(len(lines), l2 + page_lines)}\" for more)" if l2 < len(lines) else ""
+    return (f"{path.name} ({len(lines)} lines):\n" + "\n".join(numbered))[:out_limit] + tail
 
 
-def edit_doc_impl(args: dict, chat_id: str = "") -> tuple:
+def edit_doc_impl(args: dict, chat_id: str = "", workspace_dir: Path = None) -> tuple:
     file_arg = str(args.get("file") or "").strip()
     action = str(args.get("action") or "write").strip().lower()
     content = "" if args.get("content") is None else str(args.get("content"))
@@ -293,11 +364,11 @@ def edit_doc_impl(args: dict, chat_id: str = "") -> tuple:
     line_range = str(args.get("line_range") or "").strip()
     output_file = str(args.get("output_file") or "").strip()
 
-    src_path, src_is_upload = resolve_doc_path(file_arg, chat_id=chat_id, for_write=True)
+    src_path, src_is_upload = resolve_doc_path(file_arg, chat_id=chat_id, for_write=True, workspace_dir=workspace_dir)
     if src_path.exists() and _is_binary_file(src_path):
         return f"'{src_path.name}' is a binary file and cannot be edited as text.", None
     target_arg = output_file or file_arg
-    dst_path, dst_is_upload = resolve_doc_path(target_arg, chat_id=chat_id, for_write=True)
+    dst_path, dst_is_upload = resolve_doc_path(target_arg, chat_id=chat_id, for_write=True, workspace_dir=workspace_dir)
 
     existing = src_path.read_text(encoding="utf-8", errors="replace") if src_path.exists() else ""
     if action == "write":
@@ -562,7 +633,7 @@ def parse_active_packs(data: dict) -> list:
     return ["system"] if bool(data.get("tools_enabled", True)) else []
 
 
-def build_tools_schema(active_packs: list = None) -> list:
+def build_tools_schema(active_packs: list = None, project_mode: bool = False) -> list:
     packs = set(active_packs if active_packs is not None else ["system"])
     tools = []
 
@@ -594,7 +665,23 @@ def build_tools_schema(active_packs: list = None) -> list:
             },
         ])
 
-    if "files" in packs:
+    if project_mode and ("files" in packs or "system" in packs):
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List relative files and directories inside the active project folder.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Optional relative subfolder inside project"},
+                        "pattern": {"type": "string", "description": "Optional filename filter or glob"},
+                    },
+                },
+            },
+        })
+
+    if "files" in packs and not (project_mode and "system" in packs):
         tools.extend([
             {
                 "type": "function",
@@ -662,6 +749,11 @@ def build_tools_schema(active_packs: list = None) -> list:
             )
             cmd_desc = "The bash command to run"
 
+        read_props = {"path": {"type": "string", "description": "Path to the file"}}
+        if project_mode:
+            read_props["start_line"] = {"type": "integer", "description": "Optional 1-based start line"}
+            read_props["end_line"] = {"type": "integer", "description": "Optional 1-based end line"}
+
         tools.extend([
             {
                 "type": "function",
@@ -682,7 +774,7 @@ def build_tools_schema(active_packs: list = None) -> list:
                     "description": "Read the contents of a local file on THIS computer.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"path": {"type": "string", "description": "Path to the file"}},
+                        "properties": read_props,
                         "required": ["path"],
                     },
                 },
@@ -756,25 +848,50 @@ def build_shell_argv(cmd: str) -> list:
     return ["bash", "-c", cmd]
 
 
-def execute_tool_with_meta(name: str, args: dict, chat_id: str = "", cancel_check=None) -> tuple:
+def execute_tool_with_meta(
+    name: str,
+    args: dict,
+    chat_id: str = "",
+    cancel_check=None,
+    workspace_dir: Path = None,
+    project_mode: bool = False,
+    max_output_chars: int = None,
+    shell_timeout: int = 30,
+) -> tuple:
     try:
+        out_cap = int(max_output_chars or (24000 if project_mode else 4000))
+        file_cap = int(max_output_chars or (24000 if project_mode else 6000))
         if name == "web_search":
             return web_search_impl(args.get("query", "")), None
         if name == "fetch_url":
             return fetch_url_impl(args.get("url", "")), None
         if name == "read_doc":
-            return read_doc_impl(args.get("file", ""), args.get("range", ""), chat_id=chat_id), None
+            return read_doc_impl(args.get("file", ""), args.get("range", ""), chat_id=chat_id, workspace_dir=workspace_dir), None
         if name == "edit_doc":
-            return edit_doc_impl(args, chat_id=chat_id)
+            return edit_doc_impl(args, chat_id=chat_id, workspace_dir=workspace_dir)
+
+        if name == "list_files":
+            root = workspace_dir.resolve() if workspace_dir else Path.home().resolve()
+            lines = list_workspace_tree_lines(root, sub_rel=str(args.get("path") or ""), pattern=str(args.get("pattern") or ""))
+            return ("\n".join(lines) if lines else "(empty folder)"), None
 
         if name in ("run_shell", "run_bash"):
             cmd = args.get("command", "")
+            run_cwd = str(workspace_dir.resolve()) if workspace_dir else str(Path.home())
+            env = os.environ.copy()
+            env.setdefault("PYTHONUTF8", "1")
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            if workspace_dir:
+                env["PROJECT_DIR"] = run_cwd
             popen_kwargs = {
                 "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.STDOUT,
                 "text": True,
-                "cwd": str(Path.home()),
+                "encoding": "utf-8",
+                "errors": "replace",
+                "cwd": run_cwd,
+                "env": env,
             }
             if IS_WINDOWS:
                 popen_kwargs.update(_windows_subprocess_kwargs(new_group=True))
@@ -787,28 +904,50 @@ def execute_tool_with_meta(name: str, args: dict, chat_id: str = "", cancel_chec
                 target=lambda: out_buf.append(proc.communicate()[0]), daemon=True
             )
             reader.start()
-            deadline = time.monotonic() + 30
+            t_lim = max(10, int(shell_timeout or 30))
+            deadline = time.monotonic() + t_lim
             while reader.is_alive():
                 if cancel_check and cancel_check():
                     terminate_process_tree(proc)
                     raise CancelledError()
                 if time.monotonic() > deadline:
                     terminate_process_tree(proc)
-                    return "(command timed out after 30s)", None
+                    return f"(command timed out after {t_lim}s)", None
                 reader.join(0.1)
 
             out = (out_buf[0] if out_buf else "").strip()
-            return (out[:4000] if out else f"(exit code {proc.returncode}, no output)"), None
+            if not out:
+                return f"(exit code {proc.returncode}, no output)", None
+            return f"(exit {proc.returncode})\n{out[:out_cap]}" if project_mode else out[:out_cap], None
 
         if name == "read_file":
-            p = Path(args["path"]).expanduser()
-            return p.read_text(encoding="utf-8", errors="replace")[:6000], None
+            p = resolve_confined_path(args["path"], workspace_dir) if workspace_dir else Path(args["path"]).expanduser()
+            if not p.exists():
+                return f"File not found: {args['path']}", None
+            if p.is_dir():
+                lines = list_workspace_tree_lines(workspace_dir or p, sub_rel=str(args["path"])) if workspace_dir else [x.name for x in sorted(p.iterdir())[:100]]
+                return "\n".join(lines) or "(empty directory)", None
+            if _is_binary_file(p):
+                return f"Binary file ({p.stat().st_size} bytes): {p.name}", None
+            text = p.read_text(encoding="utf-8", errors="replace")
+            s_line = args.get("start_line")
+            e_line = args.get("end_line")
+            if s_line is not None or e_line is not None:
+                all_lines = text.splitlines()
+                l1 = max(1, int(s_line or 1))
+                l2 = min(len(all_lines), int(e_line or (l1 + 199)))
+                chunk = "\n".join(f"L{k}: {all_lines[k - 1]}" for k in range(l1, l2 + 1))
+                hdr = f"{p.name} (lines {l1}-{l2} of {len(all_lines)}):\n"
+                return (hdr + chunk)[:file_cap], None
+            return text[:file_cap], None
 
         if name == "write_file":
-            p = Path(args["path"]).expanduser()
+            p = resolve_confined_path(args["path"], workspace_dir) if workspace_dir else Path(args["path"]).expanduser()
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(args["content"], encoding="utf-8")
-            return f"Wrote {len(args['content'])} chars to {p}", None
+            content = str(args.get("content") or "")
+            p.write_text(content, encoding="utf-8")
+            rel_note = str(p.relative_to(workspace_dir.resolve())).replace("\\", "/") if workspace_dir else str(p)
+            return f"Wrote {len(content)} chars to {rel_note}", None
 
         return f"Unknown tool: {name}", None
     except CancelledError:
@@ -823,46 +962,57 @@ def execute_tool(name: str, args: dict, cancel_check=None) -> str:
 
 
 # --- OLLAMA HELPERS ---
-def _default_original_soul() -> str:
-    if SOUL_FILE.exists():
-        txt = SOUL_FILE.read_text(encoding="utf-8")
+def _soul_config(mode: str = "chat") -> tuple[Path, Path, str, str, str, str]:
+    if str(mode or "").strip().lower() == "project":
+        return (CUBE_SOUL_FILE, CUBE_SOULS_FILE, DEFAULT_CUBE_SOUL, "cube", "Cube", "project")
+    return (SOUL_FILE, SOULS_FILE, DEFAULT_SOUL, "original", "Original", "chat")
+
+
+def _default_original_soul(mode: str = "chat") -> str:
+    soul_file, _, default_txt, _, _, _ = _soul_config(mode)
+    if soul_file.exists():
+        txt = soul_file.read_text(encoding="utf-8")
         if txt.strip():
             return txt
-    return DEFAULT_SOUL
+    return default_txt
 
 
-def load_souls() -> dict:
-    if SOULS_FILE.exists():
+def load_souls(mode: str = "chat") -> dict:
+    soul_file, souls_file, default_txt, default_id, default_name, norm_mode = _soul_config(mode)
+    if souls_file.exists():
         try:
-            raw = json.loads(SOULS_FILE.read_text(encoding="utf-8"))
+            raw = json.loads(souls_file.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and isinstance(raw.get("slots"), list):
-                original = str(raw.get("original") or DEFAULT_SOUL)
+                original = str(raw.get("original") or default_txt)
                 slots = []
                 for idx, item in enumerate(raw["slots"][:MAX_SOUL_SLOTS]):
                     if not isinstance(item, dict):
                         continue
                     sid = str(item.get("id") or f"soul-{idx + 1}").strip()[:40]
-                    name = (str(item.get("name") or f"Soul {len(slots) + 1}").strip() or f"Soul {len(slots) + 1}")[:24]
+                    name = (str(item.get("name") or f"{default_name} {len(slots) + 1}").strip() or f"{default_name} {len(slots) + 1}")[:24]
                     slots.append({"id": sid, "name": name, "content": str(item.get("content") or "")})
                 if not slots:
-                    slots = [{"id": "original", "name": "Original", "content": original}]
+                    slots = [{"id": default_id, "name": default_name, "content": original}]
                 active_id = str(raw.get("active_id") or slots[0]["id"])
                 if not any(s["id"] == active_id for s in slots):
                     active_id = slots[0]["id"]
-                return {"active_id": active_id, "original": original, "slots": slots}
+                return {"mode": norm_mode, "file": str(soul_file), "active_id": active_id, "original": original, "slots": slots}
         except Exception:
             pass
-    orig = _default_original_soul()
+    orig = _default_original_soul(norm_mode)
     return {
-        "active_id": "original",
+        "mode": norm_mode,
+        "file": str(soul_file),
+        "active_id": default_id,
         "original": orig,
-        "slots": [{"id": "original", "name": "Original", "content": orig}],
+        "slots": [{"id": default_id, "name": default_name, "content": orig}],
     }
 
 
-def save_souls(data: dict) -> dict:
-    cur = load_souls()
-    original = cur.get("original") or DEFAULT_SOUL
+def save_souls(data: dict, mode: str = "chat") -> dict:
+    soul_file, souls_file, default_txt, default_id, default_name, norm_mode = _soul_config(mode)
+    cur = load_souls(norm_mode)
+    original = cur.get("original") or default_txt
     if isinstance(data, dict) and isinstance(data.get("slots"), list):
         slots = []
         seen = set()
@@ -873,14 +1023,14 @@ def save_souls(data: dict) -> dict:
             if sid in seen:
                 sid = f"{sid}-{len(slots) + 1}"
             seen.add(sid)
-            name = (str(item.get("name") or f"Soul {len(slots) + 1}").strip() or f"Soul {len(slots) + 1}")[:24]
+            name = (str(item.get("name") or f"{default_name} {len(slots) + 1}").strip() or f"{default_name} {len(slots) + 1}")[:24]
             slots.append({"id": sid, "name": name, "content": str(item.get("content") or "")})
         if not slots:
-            slots = [{"id": "original", "name": "Original", "content": original}]
+            slots = [{"id": default_id, "name": default_name, "content": original}]
         active_id = str(data.get("active_id") or slots[0]["id"])
         if not any(s["id"] == active_id for s in slots):
             active_id = slots[0]["id"]
-        res = {"active_id": active_id, "original": original, "slots": slots}
+        res = {"mode": norm_mode, "file": str(soul_file), "active_id": active_id, "original": original, "slots": slots}
     elif isinstance(data, dict) and "content" in data:
         slots = cur["slots"]
         active_id = cur["active_id"]
@@ -889,19 +1039,27 @@ def save_souls(data: dict) -> dict:
             if s["id"] == active_id:
                 s["content"] = content
                 break
-        res = {"active_id": active_id, "original": original, "slots": slots}
+        res = {"mode": norm_mode, "file": str(soul_file), "active_id": active_id, "original": original, "slots": slots}
     else:
         res = cur
     active = next((s for s in res["slots"] if s["id"] == res["active_id"]), res["slots"][0])
-    SOUL_FILE.write_text(active["content"], encoding="utf-8")
-    SOULS_FILE.write_text(json.dumps(res, indent=2, ensure_ascii=False), encoding="utf-8")
+    soul_file.write_text(active["content"], encoding="utf-8")
+    souls_file.write_text(
+        json.dumps({"active_id": res["active_id"], "original": res["original"], "slots": res["slots"]}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     return res
 
 
-def load_soul() -> str:
-    if SOUL_FILE.exists():
-        return SOUL_FILE.read_text(encoding="utf-8").strip()
-    return DEFAULT_SOUL.strip()
+def load_soul(mode: str = "chat") -> str:
+    soul_file, _, default_txt, _, _, _ = _soul_config(mode)
+    if soul_file.exists():
+        return soul_file.read_text(encoding="utf-8").strip()
+    return default_txt.strip()
+
+
+def load_cube_soul() -> str:
+    return load_soul("project")
 
 
 class MissingSpeechModelError(RuntimeError):
@@ -1462,18 +1620,25 @@ def stream_ollama(
     on_phase=None,
     on_content=None,
     cancel_check=None,
+    num_ctx: int = None,
+    num_predict: int = None,
+    max_parallel_slots: int = 1,
 ) -> dict:
+    eff_ctx = int(num_ctx or NUM_CTX)
+    opts = {
+        "temperature": 0.1,
+        "top_k": 50,
+        "repeat_penalty": 1.1,
+        "num_ctx": eff_ctx,
+    }
+    if num_predict is not None:
+        opts["num_predict"] = int(num_predict)
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
         "keep_alive": "15m",
-        "options": {
-            "temperature": 0.1,
-            "top_k": 50,
-            "repeat_penalty": 1.1,
-            "num_ctx": NUM_CTX,
-        },
+        "options": opts,
     }
     eff_tools = tools if tools is not None else (build_tools_schema(["system"]) if tools_enabled else [])
     if eff_tools:
@@ -1505,9 +1670,9 @@ def stream_ollama(
 
     tag_filter = _StreamTagFilter(on_content=emit_clean)
 
-    with OLLAMA_LOCK:
+    with acquire_ollama_slot(max_slots=max_parallel_slots, cancel_check=cancel_check):
         try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            with urllib.request.urlopen(req, timeout=600) as resp:
                 for raw_line in resp:
                     if cancel_check and cancel_check():
                         raise CancelledError()
@@ -1567,7 +1732,7 @@ def stream_ollama(
             "used": used,
             "prompt": prompt_tokens,
             "output": eval_tokens,
-            "max": NUM_CTX,
+            "max": eff_ctx,
         },
     }
 
@@ -1857,7 +2022,7 @@ def generate_chat_title(user_msg: str, model: str, cancel_check=None) -> str:
     try:
         if cancel_check and cancel_check():
             return fallback
-        with OLLAMA_LOCK:
+        with acquire_ollama_slot(max_slots=2, cancel_check=cancel_check):
             try:
                 raw = _call(disable_think=True)
             except urllib.error.HTTPError as e:
@@ -1870,10 +2035,17 @@ def generate_chat_title(user_msg: str, model: str, cancel_check=None) -> str:
         return fallback
 
 
-def load_chips() -> list:
-    if CHIPS_FILE.exists():
+def _chips_config(mode: str = "chat"):
+    if str(mode or "").strip().lower() == "project":
+        return PROJECT_CHIPS_FILE, DEFAULT_PROJECT_CHIPS
+    return CHIPS_FILE, DEFAULT_CHIPS
+
+
+def load_chips(mode: str = "chat") -> list:
+    chips_file, defaults = _chips_config(mode)
+    if chips_file.exists():
         try:
-            raw = json.loads(CHIPS_FILE.read_text(encoding="utf-8"))
+            raw = json.loads(chips_file.read_text(encoding="utf-8"))
             if isinstance(raw, list):
                 cleaned = [
                     {
@@ -1888,10 +2060,11 @@ def load_chips() -> list:
                 return cleaned
         except Exception:
             pass
-    return [dict(c) for c in DEFAULT_CHIPS]
+    return [dict(c) for c in defaults]
 
 
-def save_chips(items: list) -> list:
+def save_chips(items: list, mode: str = "chat") -> list:
+    chips_file, _ = _chips_config(mode)
     cleaned = [
         {
             "label": str(item.get("label", "")).strip()[:40],
@@ -1902,7 +2075,7 @@ def save_chips(items: list) -> list:
         and str(item.get("label", "")).strip()
         and str(item.get("prompt", "")).strip()
     ]
-    CHIPS_FILE.write_text(json.dumps(cleaned, indent=2, ensure_ascii=False), encoding="utf-8")
+    chips_file.write_text(json.dumps(cleaned, indent=2, ensure_ascii=False), encoding="utf-8")
     return cleaned
 
 
@@ -1915,6 +2088,41 @@ def normalize_tool_steps(val, default: int = MAX_STEPS) -> int:
     except (TypeError, ValueError):
         n = default
     return max(MIN_TOOL_STEPS, min(MAX_TOOL_STEPS_LIMIT, n))
+
+
+def normalize_project_workers(val, default: int = 1) -> int:
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(4, n))
+
+
+def normalize_project_ctx(val, default: int = NUM_CTX) -> int:
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        n = default
+    return max(4096, min(262144, n))
+
+
+def normalize_project_cycles(val, default: int = 1) -> int:
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        n = default
+    return max(0, min(100, n))
+
+
+def _normalize_model_list(vals) -> list:
+    if not isinstance(vals, list):
+        return []
+    out = []
+    for x in vals:
+        s = str(x or "").strip()[:120]
+        if s and s not in out:
+            out.append(s)
+    return out[:16]
 
 
 def load_settings() -> dict:
@@ -1933,6 +2141,13 @@ def load_settings() -> dict:
                 out["tts_model"] = tm or DEFAULT_TTS_MODEL
                 out["tts_voice"] = tv
                 out["tts_auto"] = bool(raw.get("tts_auto", False))
+                out["project_workers"] = normalize_project_workers(raw.get("project_workers", 1))
+                out["project_num_ctx"] = normalize_project_ctx(raw.get("project_num_ctx", NUM_CTX))
+                out["project_orchestrator_model"] = str(raw.get("project_orchestrator_model", "") or "").strip()[:120]
+                out["project_worker_model"] = str(raw.get("project_worker_model", "") or "").strip()[:120]
+                out["project_worker_pool"] = _normalize_model_list(raw.get("project_worker_pool"))
+                out["project_max_review_cycles"] = normalize_project_cycles(raw.get("project_max_review_cycles", 1), default=1)
+                out["show_prompt_chips"] = bool(raw.get("show_prompt_chips", True))
         except Exception:
             pass
     return out
@@ -1955,6 +2170,20 @@ def save_settings(data: dict) -> dict:
             cur["tts_voice"] = str(data.get("tts_voice") or "").strip()[:60]
         if "tts_auto" in data:
             cur["tts_auto"] = bool(data.get("tts_auto"))
+        if "project_workers" in data:
+            cur["project_workers"] = normalize_project_workers(data.get("project_workers"), cur.get("project_workers", 1))
+        if "project_num_ctx" in data:
+            cur["project_num_ctx"] = normalize_project_ctx(data.get("project_num_ctx"), cur.get("project_num_ctx", NUM_CTX))
+        if "project_orchestrator_model" in data:
+            cur["project_orchestrator_model"] = str(data.get("project_orchestrator_model") or "").strip()[:120]
+        if "project_worker_model" in data:
+            cur["project_worker_model"] = str(data.get("project_worker_model") or "").strip()[:120]
+        if "project_worker_pool" in data:
+            cur["project_worker_pool"] = _normalize_model_list(data.get("project_worker_pool"))
+        if "project_max_review_cycles" in data:
+            cur["project_max_review_cycles"] = normalize_project_cycles(data.get("project_max_review_cycles"), cur.get("project_max_review_cycles", 1))
+        if "show_prompt_chips" in data:
+            cur["show_prompt_chips"] = bool(data.get("show_prompt_chips"))
     SETTINGS_FILE.write_text(json.dumps(cur, indent=2, ensure_ascii=False), encoding="utf-8")
     return cur
 
@@ -2016,6 +2245,1284 @@ def list_chats() -> list:
         except Exception:
             continue
     return items
+
+
+# --- LONG-HORIZON PROJECT STORAGE, FOLDER PICKER & ORCHESTRATION ---
+_PROJECT_IO_LOCK = threading.Lock()
+_SKIP_WALK_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache", "dist", "build"}
+
+
+def ensure_projects_dir():
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def project_dir(pid: str) -> Path:
+    return PROJECTS_DIR / pid
+
+
+def project_meta_path(pid: str) -> Path:
+    return project_dir(pid) / "project.json"
+
+
+def project_plan_path(pid: str) -> Path:
+    return project_dir(pid) / "implementation_plan.md"
+
+
+def project_walkthrough_path(pid: str) -> Path:
+    return project_dir(pid) / "walkthrough.md"
+
+
+def validate_project_workspace(raw_path: str) -> Path:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        raise ValueError("Please select an existing folder on your PC before starting this project.")
+    p = Path(raw).expanduser().resolve()
+    if not p.exists() or not p.is_dir():
+        raise ValueError(f"Selected folder does not exist or is not a directory: {raw}")
+    return p
+
+
+def resolve_confined_path(raw_path: str, workspace_dir: Path) -> Path:
+    ws_root = workspace_dir.resolve()
+    raw = str(raw_path or ".").strip() or "."
+    p = Path(raw).expanduser()
+    cand = (p if p.is_absolute() else (ws_root / p)).resolve()
+    try:
+        cand.relative_to(ws_root)
+    except ValueError as e:
+        raise PermissionError(f"Blocked: stay strictly inside project folder '{ws_root}'") from e
+    return cand
+
+
+def load_project(pid: str) -> dict:
+    ensure_projects_dir()
+    p = project_meta_path(pid)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {
+        "id": pid,
+        "title": "New project",
+        "workspace_dir": "",
+        "orchestrator_model": DEFAULT_MODEL,
+        "worker_model": DEFAULT_MODEL,
+        "worker_pool": [],
+        "status": "draft",
+        "plan_md": "",
+        "walkthrough_md": "",
+        "tasks": [],
+        "tokens": {"used": 0, "prompt": 0, "output": 0, "max": NUM_CTX},
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ui_messages": [],
+    }
+
+
+def save_project(proj: dict):
+    ensure_projects_dir()
+    with _PROJECT_IO_LOCK:
+        pid = proj["id"]
+        pdir = project_dir(pid)
+        pdir.mkdir(parents=True, exist_ok=True)
+        proj["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        project_meta_path(pid).write_text(
+            json.dumps(proj, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if proj.get("plan_md") is not None:
+            project_plan_path(pid).write_text(str(proj.get("plan_md") or ""), encoding="utf-8")
+        if proj.get("walkthrough_md") is not None:
+            project_walkthrough_path(pid).write_text(str(proj.get("walkthrough_md") or ""), encoding="utf-8")
+
+
+def list_projects() -> list:
+    ensure_projects_dir()
+    items = []
+    for p in sorted(PROJECTS_DIR.iterdir(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
+        if not p.is_dir():
+            continue
+        meta = p / "project.json"
+        if not meta.is_file():
+            continue
+        try:
+            data = json.loads(meta.read_text(encoding="utf-8"))
+            items.append({
+                "id": data.get("id", p.name),
+                "title": data.get("title", p.name),
+                "workspace_dir": data.get("workspace_dir", ""),
+                "orchestrator_model": data.get("orchestrator_model", DEFAULT_MODEL),
+                "status": data.get("status", "complete"),
+                "updated_at": data.get("updated_at", ""),
+            })
+        except Exception:
+            continue
+    return items
+
+
+def delete_project(pid: str):
+    """Remove project metadata and artifacts without deleting user files in workspace_dir."""
+    pdir = project_dir(pid)
+    if pdir.is_dir():
+        shutil.rmtree(pdir, ignore_errors=True)
+
+
+def copy_uploads_to_workspace(pid: str, attached_files: list, workspace_dir: Path):
+    if not attached_files or not valid_chat_id(pid):
+        return
+    src_dir = UPLOADS_DIR / pid
+    if not src_dir.is_dir():
+        return
+    for fname in attached_files:
+        safe = safe_upload_name(fname)
+        src = src_dir / safe
+        if src.is_file():
+            dst = resolve_confined_path(safe, workspace_dir)
+            if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+
+
+def _directory_shortcuts() -> list:
+    home = Path.home().resolve()
+    candidates = [
+        ("Home", home),
+        ("Desktop", home / "Desktop"),
+        ("Documents", home / "Documents"),
+        ("Downloads", home / "Downloads"),
+    ]
+    out = [{"label": lbl, "path": str(p)} for lbl, p in candidates if p.is_dir()]
+    if IS_WINDOWS:
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            drv = Path(f"{letter}:\\")
+            if drv.exists():
+                out.append({"label": f"{letter}:", "path": str(drv)})
+    return out
+
+
+def list_directory_entries(raw_path: str = "") -> dict:
+    raw = (raw_path or "").strip()
+    if IS_WINDOWS and re.fullmatch(r"[A-Za-z]:", raw):
+        raw += "\\"
+    target = Path(raw).expanduser().resolve() if raw else Path.home().resolve()
+    if not target.exists() or not target.is_dir():
+        raise ValueError(f"Directory not found: {raw_path}")
+    dirs = []
+    try:
+        for entry in sorted(target.iterdir(), key=lambda x: x.name.lower()):
+            if (entry.name.startswith(".") and entry.name not in (".config",)) or (IS_WINDOWS and entry.name.startswith("$")):
+                continue
+            try:
+                if entry.is_dir():
+                    dirs.append({"name": entry.name, "path": str(entry)})
+            except OSError:
+                continue
+    except PermissionError as e:
+        raise ValueError(f"Permission denied reading {target}") from e
+    parent = str(target.parent) if target.parent != target else str(target)
+    return {
+        "path": str(target),
+        "parent": parent,
+        "dirs": dirs[:250],
+        "shortcuts": _directory_shortcuts(),
+    }
+
+
+def create_directory_entry(parent_raw: str, name_raw: str) -> dict:
+    parent = validate_project_workspace(parent_raw)
+    name = (name_raw or "").strip()
+    if not name or name in (".", "..") or any(ch in name for ch in ("/", "\\", ":", "\x00")):
+        raise ValueError("Invalid folder name")
+    target = resolve_confined_path(name, parent)
+    target.mkdir(parents=True, exist_ok=False)
+    return {"path": str(target), **list_directory_entries(str(target))}
+
+
+def pick_os_folder(initial_dir: str = "") -> dict:
+    start_dir = Path.home()
+    if initial_dir:
+        try:
+            cand = Path(initial_dir).expanduser().resolve()
+            if cand.is_dir():
+                start_dir = cand
+        except Exception:
+            pass
+
+    if IS_WINDOWS:
+        ps = shutil.which("powershell") or shutil.which("pwsh")
+        if ps:
+            script = (
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                f"$d.SelectedPath = '{str(start_dir).replace(chr(39), chr(39)*2)}'; "
+                "$d.Description = 'Choose project folder'; "
+                "$d.ShowNewFolderButton = $true; "
+                "$f = New-Object System.Windows.Forms.Form; $f.TopMost = $true; "
+                "try { if ($d.ShowDialog($f) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath } } "
+                "finally { $d.Dispose(); $f.Dispose() }"
+            )
+            try:
+                res = subprocess.run(
+                    [ps, "-NoProfile", "-NonInteractive", "-STA", "-Command", script],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+                    **_windows_subprocess_kwargs(new_group=False),
+                )
+                chosen = (res.stdout or "").strip()
+                if chosen and Path(chosen).is_dir():
+                    return {"ok": True, "path": str(Path(chosen).resolve()), "cancelled": False}
+                if res.returncode == 0:
+                    return {"ok": False, "cancelled": True}
+                err_msg = (res.stderr or "").strip() or f"PowerShell exited with code {res.returncode}"
+                return {"ok": False, "cancelled": False, "error": err_msg}
+            except Exception as e:
+                return {"ok": False, "cancelled": False, "error": str(e)}
+
+    if IS_MAC and shutil.which("osascript"):
+        try:
+            esc_mac = str(start_dir).replace("\\", "\\\\").replace('"', '\\"')
+            res = subprocess.run(
+                ["osascript", "-e", "activate", "-e", f'POSIX path of (choose folder with prompt "Choose project folder" default location POSIX file "{esc_mac}")'],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+            )
+            if res.returncode != 0 and not (res.stdout or "").strip() and "-128" not in (res.stderr or ""):
+                res = subprocess.run(
+                    ["osascript", "-e", "activate", "-e", 'POSIX path of (choose folder with prompt "Choose project folder")'],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+                )
+            chosen = (res.stdout or "").strip()
+            if chosen and Path(chosen).is_dir():
+                return {"ok": True, "path": str(Path(chosen).resolve()), "cancelled": False}
+            if res.returncode == 0 or "-128" in (res.stderr or ""):
+                return {"ok": False, "cancelled": True}
+            return {"ok": False, "cancelled": False, "error": (res.stderr or "").strip() or "macOS folder picker failed"}
+        except Exception as e:
+            return {"ok": False, "cancelled": False, "error": str(e)}
+
+    if not IS_WINDOWS and not IS_MAC:
+        zen = shutil.which("zenity")
+        if zen and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            try:
+                res = subprocess.run(
+                    [zen, "--file-selection", "--directory", "--title=Choose project folder", f"--filename={start_dir}/"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+                )
+                chosen = (res.stdout or "").strip()
+                if res.returncode == 0 and chosen and Path(chosen).is_dir():
+                    return {"ok": True, "path": str(Path(chosen).resolve()), "cancelled": False}
+                return {"ok": False, "cancelled": res.returncode in (1, 5)}
+            except Exception:
+                pass
+        kdg = shutil.which("kdialog")
+        if kdg and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            try:
+                res = subprocess.run(
+                    [kdg, "--getexistingdirectory", str(start_dir), "--title", "Choose project folder"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+                )
+                chosen = (res.stdout or "").strip()
+                if res.returncode == 0 and chosen and Path(chosen).is_dir():
+                    return {"ok": True, "path": str(Path(chosen).resolve()), "cancelled": False}
+                return {"ok": False, "cancelled": True}
+            except Exception:
+                pass
+        if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and not IS_FROZEN:
+            try:
+                tk_code = (
+                    "import tkinter as tk; from tkinter import filedialog; "
+                    "r=tk.Tk(); r.withdraw(); r.attributes('-topmost', True); "
+                    f"p=filedialog.askdirectory(initialdir={json.dumps(str(start_dir))}, title='Choose project folder'); "
+                    "print(p or '')"
+                )
+                res = subprocess.run([sys.executable, "-c", tk_code], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+                chosen = (res.stdout or "").strip()
+                if chosen and Path(chosen).is_dir():
+                    return {"ok": True, "path": str(Path(chosen).resolve()), "cancelled": False}
+                if res.returncode == 0:
+                    return {"ok": False, "cancelled": True}
+            except Exception:
+                pass
+
+    return {"ok": False, "cancelled": False, "error": "OS picker dialog unavailable; browse or create a folder below."}
+
+
+def list_workspace_tree_lines(root_dir: Path, sub_rel: str = "", pattern: str = "", limit: int = 180) -> list:
+    base = resolve_confined_path(sub_rel or ".", root_dir) if sub_rel else root_dir.resolve()
+    if not base.exists() or not base.is_dir():
+        return []
+    out = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_WALK_DIRS and not d.startswith("."))
+        cur = Path(dirpath)
+        rel_dir = cur.relative_to(root_dir.resolve())
+        for fn in sorted(filenames):
+            if fn.startswith("."):
+                continue
+            fp = cur / fn
+            rel = str((rel_dir / fn) if str(rel_dir) != "." else Path(fn)).replace("\\", "/")
+            if pattern and not Path(rel).match(pattern) and pattern.lower() not in rel.lower():
+                continue
+            try:
+                sz = fp.stat().st_size
+            except OSError:
+                sz = 0
+            out.append(f"{rel} ({sz} B)")
+            if len(out) >= limit:
+                out.append("... (more files truncated; pass subdir/pattern to narrow)")
+                return out
+    return out
+
+
+def _snapshot_workspace(workspace_dir: Path, limit: int = 80) -> str:
+    lines = list_workspace_tree_lines(workspace_dir, limit=limit)
+    if not lines:
+        return "(folder is currently empty)"
+    return "\n".join(f"- {ln}" for ln in lines)
+
+
+def _build_workspace_preview(workspace_dir: Path, max_files: int = 4, per_file_chars: int = 320, max_total_chars: int = 1200) -> str:
+    root = workspace_dir.resolve()
+    if not root.is_dir():
+        return ""
+    snippets = []
+    used = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_WALK_DIRS and not d.startswith("."))
+        cur = Path(dirpath)
+        for fn in sorted(filenames):
+            if fn.startswith("."):
+                continue
+            fp = cur / fn
+            try:
+                sz = fp.stat().st_size
+                if sz <= 0 or sz > 4096:
+                    continue
+                raw = fp.read_bytes()
+                if b"\x00" in raw[:512]:
+                    continue
+                txt = raw.decode("utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if not txt:
+                continue
+            rel = str(fp.relative_to(root)).replace("\\", "/")
+            block = f"--- {rel} ---\n{txt[:per_file_chars]}"
+            if used + len(block) > max_total_chars:
+                return "\n".join(snippets)
+            snippets.append(block)
+            used += len(block)
+            if len(snippets) >= max_files:
+                return "\n".join(snippets)
+    return "\n".join(snippets)
+
+
+def _snapshot_workspace_mtimes(workspace_dir: Path) -> dict:
+    snap = {}
+    root = workspace_dir.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_WALK_DIRS and not d.startswith(".")]
+        cur = Path(dirpath)
+        for fn in filenames:
+            if fn.startswith("."):
+                continue
+            fp = cur / fn
+            rel = str(fp.relative_to(root)).replace("\\", "/")
+            try:
+                st = fp.stat()
+                snap[rel] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                continue
+    return snap
+
+
+def _snapshot_workspace_digests(workspace_dir: Path) -> dict:
+    snap = {}
+    root = workspace_dir.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_WALK_DIRS and not d.startswith(".")]
+        cur = Path(dirpath)
+        for fn in filenames:
+            if fn.startswith("."):
+                continue
+            fp = cur / fn
+            rel = str(fp.relative_to(root)).replace("\\", "/")
+            try:
+                snap[rel] = hashlib.sha256(fp.read_bytes()).hexdigest()
+            except OSError:
+                continue
+    return snap
+
+
+def _collect_workspace_outputs(project_id: str, workspace_dir: Path, before_snap: dict) -> list:
+    after_snap = _snapshot_workspace_mtimes(workspace_dir)
+    changed = []
+    for rel, meta in after_snap.items():
+        if before_snap.get(rel) != meta:
+            changed.append((rel, meta[1]))
+    changed.sort(key=lambda x: x[0])
+    out = []
+    for rel, sz in changed[:40]:
+        out.append({
+            "name": rel,
+            "path": str((workspace_dir / rel).resolve()),
+            "size": sz,
+            "url": f"/api/projects/{urllib.parse.quote(project_id)}/files?path={urllib.parse.quote(rel)}",
+        })
+    return out
+
+
+def _extract_tagged_section(text: str, tag: str) -> str:
+    m = re.search(rf"\[\[\s*{re.escape(tag)}\s*\]\]\s*(.*?)(?=\[\[\s*[A-Z_]+\s*\]\]|\Z)", text, re.S | re.I)
+    return m.group(1).strip() if m else ""
+
+
+def _extract_json_array(text: str):
+    if not text:
+        return None
+    fenced = re.findall(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text, re.I)
+    candidates = fenced + []
+    lb = text.find("[")
+    rb = text.rfind("]")
+    if lb != -1 and rb > lb:
+        candidates.append(text[lb:rb + 1])
+    for cand in candidates:
+        try:
+            parsed = json.loads(cand)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_worker_model(requested: str, allowed_workers: list, fallback: str) -> str:
+    req = str(requested or "").strip()
+    if req and allowed_workers:
+        low = req.lower()
+        for aw in allowed_workers:
+            if aw.lower() == low:
+                return aw
+        for aw in allowed_workers:
+            if aw.split(":")[0].lower() == low or low in aw.lower():
+                return aw
+    return fallback
+
+
+def _normalize_task_items(raw_list, id_prefix: str, allowed_workers: list, default_worker: str) -> list:
+    tasks = []
+    if isinstance(raw_list, list):
+        for idx, item in enumerate(raw_list, 1):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or item.get("name") or f"Task {idx}").strip()[:140]
+            brief = str(item.get("brief") or item.get("instructions") or item.get("description") or title).strip()
+            try:
+                wave = max(1, int(item.get("wave") or item.get("parallel_group") or idx))
+            except (TypeError, ValueError):
+                wave = idx
+            files_raw = item.get("files") or []
+            if isinstance(files_raw, str):
+                files_list = [x.strip() for x in files_raw.split(",") if x.strip()]
+            elif isinstance(files_raw, list):
+                files_list = [str(x).strip() for x in files_raw if str(x).strip()]
+            else:
+                files_list = []
+            tid = str(item.get("id") or f"{id_prefix}{idx}").strip()[:24]
+            chosen_model = _resolve_worker_model(item.get("model") or item.get("worker"), allowed_workers, default_worker)
+            tasks.append({
+                "id": tid,
+                "title": title,
+                "wave": wave,
+                "model": chosen_model,
+                "files": files_list[:12],
+                "brief": brief,
+                "verify": str(item.get("verify") or "").strip()[:300],
+                "status": "pending",
+                "summary": "",
+            })
+    return tasks
+
+
+def _parse_orchestrator_plan(raw_reply: str, user_text: str, allowed_workers: list, default_worker: str) -> tuple:
+    _, clean = split_thinking_and_reply(raw_reply or "", "")
+    understanding = _extract_tagged_section(clean, "UNDERSTANDING")
+    plan_md = _extract_tagged_section(clean, "IMPLEMENTATION_PLAN")
+    tasks_sec = _extract_tagged_section(clean, "TASKS_JSON")
+
+    if not tasks_sec:
+        tm = re.search(r"^\s*TASKS\s*:\s*(.*)$", clean, re.S | re.M | re.I)
+        tasks_sec = tm.group(1) if tm else clean
+
+    raw_arr = _extract_json_array(tasks_sec)
+    tasks = _normalize_task_items(raw_arr, "T", allowed_workers, default_worker)
+
+    if not plan_md:
+        pm = re.search(r"^\s*PLAN\s*:\s*(.*?)(?=^\s*(?:TASKS|FIX_TASKS|\[\[TASKS_JSON\]\])\s*:|\Z)", clean, re.S | re.M | re.I)
+        if pm:
+            plan_md = pm.group(1).strip()
+
+    if not tasks:
+        bullets = re.findall(r"^\s*(?:\d+[.)]|[-*])\s+(.+)$", plan_md or clean, re.M)
+        tasks = _normalize_task_items(
+            [{"id": f"T{i}", "title": b[:80], "wave": i, "brief": b} for i, b in enumerate(bullets[:6], 1)],
+            "T",
+            allowed_workers,
+            default_worker,
+        )
+
+    if not tasks:
+        tasks = [{
+            "id": "T1",
+            "title": "Complete project goal",
+            "wave": 1,
+            "model": default_worker,
+            "files": [],
+            "brief": user_text,
+            "verify": "Verify deliverables inside the workspace folder run cleanly.",
+            "status": "pending",
+            "summary": "",
+        }]
+
+    if not understanding:
+        understanding = user_text.strip()
+    if not plan_md:
+        stripped = re.sub(r"^\s*TASKS\s*:.*$", "", clean, flags=re.S | re.M | re.I)
+        stripped = re.sub(r"```(?:json)?\s*\[[\s\S]*?\]\s*```", "", stripped, flags=re.I).strip()
+        plan_md = stripped or "\n".join(f"- **{t['id']}**: {t['title']}" for t in tasks)
+    return understanding, plan_md, tasks
+
+
+def _parse_review_decision(raw_reply: str, cycle: int, allowed_workers: list, default_worker: str) -> tuple:
+    _, clean = split_thinking_and_reply(raw_reply or "", "")
+    rev_sec = _extract_tagged_section(clean, "REVIEW_DECISION") or clean
+    status_m = re.search(r"^\s*STATUS\s*:\s*([A-Za-z_ -]+)", rev_sec, re.M | re.I)
+    raw_status = (status_m.group(1).strip().upper() if status_m else "")
+    fix_sec = _extract_tagged_section(clean, "FIX_TASKS_JSON") or clean
+    raw_arr = _extract_json_array(fix_sec)
+    fix_tasks = _normalize_task_items(raw_arr, f"R{cycle}-T", allowed_workers, default_worker)
+
+    explicit_pass = any(k in raw_status for k in ("COMPLETE", "PASS", "DONE", "OK"))
+    is_needs_work = any(k in raw_status for k in ("NEEDS", "FIX", "FAIL", "INCOMPLETE")) or bool(fix_tasks)
+    if not raw_status and not fix_tasks and not explicit_pass:
+        lower = clean.lower()
+        is_needs_work = ("needs_work" in lower or "needs work" in lower)
+
+    status = "NEEDS_WORK" if is_needs_work else "COMPLETE"
+    sum_m = re.search(r"SUMMARY\s*:\s*(.*?)(?=^\s*(?:FIX_TASKS|\[\[FIX_TASKS_JSON\]\])|\Z)", rev_sec, re.S | re.M | re.I)
+    summary = sum_m.group(1).strip() if sum_m else clean.strip()
+    if status == "NEEDS_WORK" and not fix_tasks:
+        fix_tasks = [{
+            "id": f"R{cycle}-T1",
+            "title": "Fix issues found in review",
+            "wave": 1,
+            "model": default_worker,
+            "files": [],
+            "brief": f"Fix all issues identified in Orchestrator Review #{cycle}:\n\n{summary[:900]}",
+            "verify": "Re-verify the fixed functionality inside the project folder.",
+            "status": "pending",
+            "summary": "",
+        }]
+    return status, summary, fix_tasks
+
+
+def _build_walkthrough_md(goal: str, workspace_dir: Path, tasks: list, reviews: list, final_note: str = "") -> str:
+    lines = [
+        "# Project Walkthrough",
+        "",
+        f"**Workspace:** `{workspace_dir}`",
+        "",
+        "## Goal",
+        goal.strip(),
+        "",
+        "## Task Progress",
+    ]
+    for t in tasks:
+        mark = "x" if t.get("status") == "done" else ("!" if t.get("status") == "error" else " ")
+        lines.append(f"- [{mark}] **{t.get('id', '')} · {t.get('title', '')}** *(Wave {t.get('wave', 1)}, {t.get('model', '')})*")
+        if t.get("files"):
+            lines.append(f"  - Targets: `{', '.join(t['files'])}`")
+        if t.get("summary"):
+            brief_sum = re.sub(r"\s+", " ", str(t["summary"])).strip()[:320]
+            lines.append(f"  - Outcome: {brief_sum}")
+    if reviews:
+        lines.extend(["", "## Orchestrator Reviews"])
+        for rv in reviews:
+            st = rv.get("status", "COMPLETE")
+            note = re.sub(r"\s+", " ", str(rv.get("summary", ""))).strip()[:400]
+            lines.append(f"- **Review #{rv.get('cycle', 1)} ({st})**: {note}")
+    if final_note:
+        lines.extend(["", "## Final Verification", final_note.strip()])
+    return "\n".join(lines).strip() + "\n"
+
+
+def _compact_worker_messages(messages: list, workspace_dir: Path, keep_tail: int = 4) -> tuple:
+    """Keep system + task brief + latest tool steps intact while summarizing middle tool outputs for small models."""
+    if len(messages) <= keep_tail + 2:
+        return messages, False
+    head = messages[:2]
+    middle = messages[2:-keep_tail]
+    tail = messages[-keep_tail:]
+    digest_lines = [
+        "[Compacted earlier tool steps to keep context fresh and small]",
+        "Workspace files currently on disk:",
+        _snapshot_workspace(workspace_dir, limit=60),
+        "",
+        "Actions already completed:",
+    ]
+    for m in middle:
+        role = m.get("role", "")
+        if role == "assistant":
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                names = ", ".join(tc.get("function", {}).get("name", "tool") for tc in tcs)
+                digest_lines.append(f"- Called tool(s): {names}")
+            elif m.get("content"):
+                digest_lines.append(f"- Assistant note: {str(m['content']).strip()[:220]}")
+        elif role == "tool":
+            res_snip = re.sub(r"\s+", " ", str(m.get("content", ""))).strip()[:240]
+            if res_snip:
+                digest_lines.append(f"  -> Result: {res_snip}")
+    compacted_note = {"role": "user", "content": "\n".join(digest_lines)}
+    return head + [compacted_note] + tail, True
+
+
+def _run_uncapped_tool_agent(
+    *,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    tools: list,
+    workspace_dir: Path,
+    num_ctx: int,
+    max_parallel_slots: int,
+    on_thinking=None,
+    on_content=None,
+    on_tool_start=None,
+    on_tool_end=None,
+    on_compacted=None,
+    on_tokens=None,
+    cancel_check=None,
+) -> dict:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    has_tools = bool(tools)
+    all_thinking = []
+    all_tools = []
+    seen_call_counts = {}
+    consecutive_skips = 0
+    tool_counter = 0
+    compactions = 0
+    last_tokens = {"used": 0, "prompt": 0, "output": 0, "max": num_ctx}
+    last_prompt_tokens = 0
+
+    while True:
+        if cancel_check and cancel_check():
+            raise CancelledError()
+
+        est_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+        if len(messages) > 6 and (last_prompt_tokens >= int(num_ctx * 0.62) or est_chars // 4 >= int(num_ctx * 0.62)):
+            messages, did_cmp = _compact_worker_messages(messages, workspace_dir, keep_tail=4)
+            if did_cmp:
+                compactions += 1
+                if on_compacted:
+                    on_compacted(compactions)
+
+        msg = stream_ollama(
+            messages,
+            model=model,
+            tools_enabled=has_tools,
+            tools=tools,
+            on_thinking=on_thinking,
+            on_content=on_content,
+            cancel_check=cancel_check,
+            num_ctx=num_ctx,
+            num_predict=-1,
+            max_parallel_slots=max_parallel_slots,
+        )
+
+        last_tokens = msg["tokens"]
+        last_prompt_tokens = int(last_tokens.get("prompt") or 0)
+        if on_tokens:
+            on_tokens(last_tokens)
+
+        raw_content = msg["content"]
+        step_thinking, clean_text = split_thinking_and_reply(raw_content, msg["thinking"])
+        if step_thinking:
+            all_thinking.append(step_thinking)
+            if not msg["thinking"] and on_thinking:
+                on_thinking(step_thinking + "\n")
+
+        tool_calls = msg["tool_calls"]
+        if has_tools and not tool_calls and "<tool_call>" in raw_content:
+            tool_calls = parse_xml_tool_fallback(raw_content)
+
+        if not tool_calls or not has_tools:
+            return {
+                "reply": clean_text or "(done)",
+                "raw_reply": raw_content,
+                "thinking": "\n\n".join(all_thinking).strip(),
+                "tools": all_tools,
+                "tokens": last_tokens,
+                "compactions": compactions,
+            }
+
+        messages.append({
+            "role": "assistant",
+            "content": raw_content,
+            "tool_calls": tool_calls,
+        })
+
+        for tc in tool_calls:
+            if cancel_check and cancel_check():
+                raise CancelledError()
+
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+
+            tool_counter += 1
+            tid = tool_counter
+            if on_tool_start:
+                on_tool_start(tid, name, args)
+
+            sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+            seen_call_counts[sig] = seen_call_counts.get(sig, 0) + 1
+            if seen_call_counts[sig] > 3:
+                consecutive_skips += 1
+                result = "Identical tool call repeated 3+ times; do NOT repeat it. Try a different approach or conclude with your report."
+            else:
+                consecutive_skips = 0
+                result, _ = execute_tool_with_meta(
+                    name,
+                    args,
+                    chat_id="",
+                    cancel_check=cancel_check,
+                    workspace_dir=workspace_dir,
+                    project_mode=True,
+                    max_output_chars=24000,
+                    shell_timeout=300,
+                )
+
+            rec = {"id": tid, "name": name, "args": args, "result": result}
+            all_tools.append(rec)
+            if on_tool_end:
+                on_tool_end(rec)
+            messages.append({"role": "tool", "content": result})
+
+        if consecutive_skips >= 6:
+            return {
+                "reply": clean_text or "Stopped repeated identical tool calls and moving forward.",
+                "raw_reply": raw_content,
+                "thinking": "\n\n".join(all_thinking).strip(),
+                "tools": all_tools,
+                "tokens": last_tokens,
+                "compactions": compactions,
+            }
+
+
+def _build_review_evidence(project_id: str, workspace_dir: Path, before_snap: dict, worker_runs: list) -> tuple:
+    changed = _collect_workspace_outputs(project_id, workspace_dir, before_snap)
+    lines = []
+    if changed:
+        lines.append("Changed/Created Files:")
+        for item in changed[:12]:
+            lines.append(f"- {item['name']} ({item['size']} B)")
+        root = workspace_dir.resolve()
+        shown = 0
+        for item in changed:
+            if shown >= 3 or item["size"] > 6000:
+                continue
+            fp = (root / item["name"]).resolve()
+            if fp.is_file() and fp.suffix.lower() not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".zip", ".bin", ".exe"):
+                try:
+                    raw = fp.read_bytes()
+                    if b"\x00" in raw[:512]:
+                        continue
+                    txt = raw.decode("utf-8", errors="replace").strip()
+                    if txt:
+                        lines.append(f"\nExcerpt `{item['name']}`:\n```\n{txt[:450]}\n```")
+                        shown += 1
+                except OSError:
+                    pass
+    else:
+        lines.append("Changed/Created Files: (none detected vs initial snapshot)")
+
+    if worker_runs:
+        lines.append("\nWorker Execution Evidence:")
+        for wr in worker_runs[-6:]:
+            tools_desc = []
+            for rec in (wr.get("tools") or [])[-4:]:
+                nm = rec.get("name", "")
+                res_s = re.sub(r"\s+", " ", str(rec.get("result") or "")).strip()[:280]
+                if nm in ("run_bash", "run_shell"):
+                    cmd = str((rec.get("args") or {}).get("command") or "")[:120]
+                    tools_desc.append(f"{nm}(`{cmd}`) -> {res_s}")
+                elif nm:
+                    tools_desc.append(f"{nm} -> {res_s[:140]}")
+            rep = re.sub(r"\s+", " ", str(wr.get("reply") or "")).strip()[:240]
+            lines.append(f"- {wr.get('task_id')} [{wr.get('status')}]: {rep}")
+            for td in tools_desc:
+                lines.append(f"  * {td}")
+    return "\n".join(lines), changed
+
+
+def run_project_stream(
+    *,
+    project_id: str,
+    user_text: str,
+    proj: dict,
+    workspace_dir: Path,
+    orchestrator_model: str,
+    default_worker_model: str,
+    worker_pool: list = None,
+    workers_count: int = 1,
+    active_packs: list = None,
+    attached_files: list = None,
+    num_ctx: int = NUM_CTX,
+    max_review_cycles: int = 1,
+    emit=None,
+    cancel_check=None,
+) -> dict:
+    packs = list(active_packs) if active_packs else ["files", "system"]
+    if "files" not in packs:
+        packs.append("files")
+    all_tools = build_tools_schema(packs, project_mode=True)
+    review_tool_names = {"list_files", "read_file", "run_bash", "run_shell", "read_doc"}
+    review_tools = [t for t in all_tools if t.get("function", {}).get("name") in review_tool_names]
+
+    allowed_workers = []
+    for m in [*(worker_pool or []), default_worker_model]:
+        ms = str(m or "").strip()
+        if ms and ms not in allowed_workers:
+            allowed_workers.append(ms)
+    if not allowed_workers:
+        allowed_workers = [default_worker_model]
+
+    pool_desc = ""
+    if len(allowed_workers) > 1:
+        pool_items = [
+            f"{m} ({infer_model_param_label(m) or 'custom'})" for m in allowed_workers
+        ]
+        pool_desc = (
+            "\nWorker Pool: " + ", ".join(pool_items) +
+            "\nSet \"model\" per task if routing to a specific worker, or leave \"\" for default."
+        )
+
+    before_snap = _snapshot_workspace_mtimes(workspace_dir)
+    all_tasks = []
+    worker_runs = []
+    reviews = []
+    total_tokens = {"used": 0, "prompt": 0, "output": 0, "max": num_ctx}
+    token_lock = threading.Lock()
+    state_lock = threading.Lock()
+    soul_txt = load_cube_soul().strip()
+
+    def add_tokens(tok: dict):
+        with token_lock:
+            total_tokens["prompt"] += int(tok.get("prompt") or 0)
+            total_tokens["output"] += int(tok.get("output") or 0)
+            total_tokens["used"] = int(tok.get("used") or 0)
+            total_tokens["max"] = int(tok.get("max") or num_ctx)
+            if emit:
+                emit({"type": "tokens", "tokens": dict(total_tokens)})
+
+    def emit_ev(ev: dict):
+        if emit:
+            emit(ev)
+
+    def sync_walkthrough(final_note: str = ""):
+        with state_lock:
+            wt = _build_walkthrough_md(user_text, workspace_dir, all_tasks, reviews, final_note=final_note)
+            proj["walkthrough_md"] = wt
+            proj["tasks"] = [dict(t) for t in all_tasks]
+            save_project(proj)
+            done_cnt = sum(1 for t in all_tasks if t.get("status") == "done")
+            emit_ev({
+                "type": "project_walkthrough",
+                "walkthrough_md": wt,
+                "done_count": done_cnt,
+                "total_count": len(all_tasks),
+            })
+
+    # Phase 1: Lightweight live-streamed Planning (no slow pre-plan tool loops)
+    emit_ev({"type": "project_phase", "phase": "planning", "label": "Planning steps"})
+    prior_plan = (proj.get("plan_md") or "").strip()
+    prior_wt = (proj.get("walkthrough_md") or "").strip()
+    prior_ctx = ""
+    if prior_plan or prior_wt:
+        prior_ctx = f"\nPrevious Plan/Progress:\n{(prior_plan or prior_wt)[:900]}\n"
+
+    plan_sys = (
+        f"You are Cube, Lead Project Orchestrator on {os_label()}. Workspace folder: {workspace_dir}\n"
+        "Be crisp and practical so compact local worker LLMs finish reliably:\n"
+        "- For simple or single-file requests, output ONLY 1 focused piece (T1).\n"
+        "- Only split into 2-4 small pieces (waves 1, 2...) when separate modules are truly needed.\n"
+        "- Keep briefs short (1-3 sentences) naming files to write and how to test."
+        + pool_desc
+        + (f"\nCube Soul Note:\n{soul_txt[:350]}" if soul_txt else "")
+        + "\n\nRespond using this exact concise format:\n"
+        "PLAN:\n"
+        "- Step 1: ...\n\n"
+        "TASKS:\n"
+        '[{"id":"T1","title":"Short title","wave":1,"model":"","files":["main.py"],"brief":"Exact steps to build and test."}]'
+    )
+    ws_preview = _build_workspace_preview(workspace_dir)
+    plan_user = (
+        f"Assignment:\n{user_text}\n\n"
+        f"Folder Tree ({workspace_dir}):\n{_snapshot_workspace(workspace_dir)}"
+        + (f"\n\nExisting File Previews:\n{ws_preview}" if ws_preview else "")
+        + (f"\n\nAttached files in folder: {', '.join(attached_files)}" if attached_files else "")
+        + prior_ctx
+    )
+
+    try:
+        plan_msg = stream_ollama(
+            [{"role": "system", "content": plan_sys}, {"role": "user", "content": plan_user}],
+            model=orchestrator_model,
+            tools_enabled=False,
+            tools=[],
+            on_thinking=lambda d: emit_ev({"type": "plan_thinking_delta", "text": d}),
+            on_content=lambda d: emit_ev({"type": "plan_delta", "text": d}),
+            cancel_check=cancel_check,
+            num_ctx=num_ctx,
+            num_predict=1024,
+            max_parallel_slots=1,
+        )
+        add_tokens(plan_msg["tokens"])
+        plan_raw = plan_msg.get("content", "")
+        understanding, plan_md, initial_tasks = _parse_orchestrator_plan(
+            plan_raw,
+            user_text,
+            allowed_workers,
+            default_worker_model,
+        )
+        all_tasks.extend(initial_tasks)
+        proj["plan_md"] = plan_md
+        emit_ev({
+            "type": "project_plan",
+            "project_id": project_id,
+            "understanding": understanding,
+            "plan_md": plan_md,
+            "tasks": [dict(t) for t in all_tasks],
+        })
+        sync_walkthrough()
+
+        def build_direct_worker_brief(task: dict) -> str:
+            if not worker_runs:
+                return task["brief"]
+            done_notes = "\n".join(
+                f"- {r['task_id']} ({r['status']}): {re.sub(r'\\s+', ' ', str(r.get('reply') or '')).strip()[:180]}"
+                for r in worker_runs[-4:]
+            )
+            return f"{task['brief']}\n\nPrevious completed pieces:\n{done_notes}"
+
+        def execute_single_task(task: dict, lane: int, w_total: int, refined_brief: str) -> dict:
+            t_start = time.monotonic()
+            run_key = f"{task['id']}-{len(worker_runs) + 1}-{secrets.token_hex(2)}"
+            w_model = task.get("model") or default_worker_model
+            task["status"] = "running"
+            sync_walkthrough()
+            emit_ev({
+                "type": "worker_start",
+                "run_key": run_key,
+                "task_id": task["id"],
+                "title": task["title"],
+                "model": w_model,
+                "wave": task.get("wave", 1),
+                "lane": lane,
+                "workers_total": w_total,
+            })
+
+            w_sys = (
+                f"You are an autonomous Worker LLM on {os_label()}.\n"
+                f"Workspace Rule: Stay strictly inside '{workspace_dir}'. Relative paths resolve here.\n"
+                "Create/update complete clean code directly (no stubs/placeholders), run one quick verification check if applicable, and give a short summary."
+                + (f"\nCube Soul Note:\n{soul_txt[:300]}" if soul_txt else "")
+            )
+            w_user = (
+                f"Goal: {understanding[:400]}\n\n"
+                f"Your Assigned Piece ({task['id']}): {task['title']}\n"
+                f"Target Files: {', '.join(task.get('files') or ['(inside workspace)'])}\n\n"
+                f"Instructions:\n{refined_brief}\n\n"
+                + (f"Verify: {task['verify']}\n\n" if task.get("verify") else "")
+                + f"Folder Tree ({workspace_dir}):\n{_snapshot_workspace(workspace_dir, limit=60)}"
+            )
+
+            captured_tools = []
+            try:
+                res = _run_uncapped_tool_agent(
+                    model=w_model,
+                    system_prompt=w_sys,
+                    user_prompt=w_user,
+                    tools=all_tools,
+                    workspace_dir=workspace_dir,
+                    num_ctx=num_ctx,
+                    max_parallel_slots=max(1, w_total),
+                    on_thinking=lambda d: emit_ev({"type": "worker_thinking_delta", "run_key": run_key, "task_id": task["id"], "text": d}),
+                    on_content=lambda d: emit_ev({"type": "worker_reply_delta", "run_key": run_key, "task_id": task["id"], "text": d}),
+                    on_tool_start=lambda tid, nm, ag: emit_ev({"type": "worker_tool_start", "run_key": run_key, "task_id": task["id"], "tool_id": tid, "name": nm, "args": ag}),
+                    on_tool_end=lambda rec: (
+                        captured_tools.append(rec),
+                        emit_ev({"type": "worker_tool_end", "run_key": run_key, "task_id": task["id"], "tool_id": rec["id"], "name": rec["name"], "args": rec["args"], "result": rec["result"]}),
+                    ),
+                    on_compacted=lambda cmp_n: emit_ev({"type": "worker_compacted", "run_key": run_key, "task_id": task["id"], "compactions": cmp_n}),
+                    on_tokens=add_tokens,
+                    cancel_check=cancel_check,
+                )
+                task["status"] = "done"
+                task["summary"] = res["reply"][:500]
+                run_rec = {
+                    "run_key": run_key,
+                    "task_id": task["id"],
+                    "title": task["title"],
+                    "model": w_model,
+                    "wave": task.get("wave", 1),
+                    "lane": lane,
+                    "workers_total": w_total,
+                    "status": "done",
+                    "thinking": res["thinking"],
+                    "tools": captured_tools,
+                    "reply": res["reply"],
+                    "tokens": res["tokens"],
+                    "compactions": res["compactions"],
+                    "elapsed": time.monotonic() - t_start,
+                }
+            except CancelledError:
+                task["status"] = "error"
+                raise
+            except Exception as exc:
+                task["status"] = "error"
+                task["summary"] = f"Error: {exc}"
+                run_rec = {
+                    "run_key": run_key,
+                    "task_id": task["id"],
+                    "title": task["title"],
+                    "model": w_model,
+                    "wave": task.get("wave", 1),
+                    "lane": lane,
+                    "workers_total": w_total,
+                    "status": "error",
+                    "thinking": "",
+                    "tools": captured_tools,
+                    "reply": f"**Worker Error:** `{exc}`",
+                    "tokens": {"used": 0, "max": num_ctx},
+                    "compactions": 0,
+                    "elapsed": time.monotonic() - t_start,
+                }
+
+            emit_ev({"type": "worker_done", **run_rec})
+            return run_rec
+
+        def run_task_queue(queue: list, cycle_label: str):
+            wave_nums = sorted({int(t.get("wave") or 1) for t in queue})
+            for wn in wave_nums:
+                if cancel_check and cancel_check():
+                    raise CancelledError()
+                wave_tasks = [t for t in queue if int(t.get("wave") or 1) == wn]
+                eff_workers = max(1, min(workers_count, len(wave_tasks)))
+                emit_ev({
+                    "type": "project_phase",
+                    "phase": "running",
+                    "label": f"{cycle_label}Wave {wn} ({len(wave_tasks)} piece{'s' if len(wave_tasks) != 1 else ''}, {eff_workers}x)",
+                })
+                if eff_workers == 1:
+                    for t in wave_tasks:
+                        brief = build_direct_worker_brief(t)
+                        rec = execute_single_task(t, 1, 1, brief)
+                        worker_runs.append(rec)
+                        sync_walkthrough()
+                else:
+                    prepared = [(t, idx + 1, build_direct_worker_brief(t)) for idx, t in enumerate(wave_tasks)]
+                    with ThreadPoolExecutor(max_workers=eff_workers) as pool_exec:
+                        futs = {
+                            pool_exec.submit(execute_single_task, t, lane, eff_workers, brief): t
+                            for t, lane, brief in prepared
+                        }
+                        pending = set(futs.keys())
+                        while pending:
+                            if cancel_check and cancel_check():
+                                for f in pending:
+                                    f.cancel()
+                                raise CancelledError()
+                            done_now = [f for f in list(pending) if f.done()]
+                            for f in done_now:
+                                pending.remove(f)
+                                worker_runs.append(f.result())
+                                sync_walkthrough()
+                            if pending:
+                                time.sleep(0.15)
+
+        run_task_queue(initial_tasks, "")
+
+        # Phase 3: Evidence-Backed Orchestrator Verification & Optional Fix Loop
+        cycle = 0
+        final_status = "complete"
+        final_summary = ""
+        last_snap = _snapshot_workspace_digests(workspace_dir)
+        stagnant_cycles = 0
+
+        while True:
+            if cancel_check and cancel_check():
+                raise CancelledError()
+            if max_review_cycles > 0 and cycle >= max_review_cycles:
+                final_summary = final_summary or f"Completed {sum(1 for t in all_tasks if t.get('status') == 'done')}/{len(all_tasks)} tasks in `{workspace_dir.name}`."
+                break
+            cycle += 1
+            rv_t0 = time.monotonic()
+            emit_ev({"type": "review_start", "cycle": cycle})
+
+            evidence_txt, changed_files = _build_review_evidence(project_id, workspace_dir, before_snap, worker_runs)
+            any_err = any(t.get("status") != "done" for t in all_tasks)
+            ran_shell = any(
+                rec.get("name") in ("run_bash", "run_shell")
+                for wr in worker_runs
+                for rec in (wr.get("tools") or [])
+            )
+            use_fast_review = (not any_err) and bool(changed_files) and (len(all_tasks) == 1 or ran_shell)
+
+            rev_sys = (
+                f"You are Cube, Lead Project Orchestrator verifying completed work inside '{workspace_dir}' on {os_label()}.\n"
+                + (
+                    "Review the changed files and execution evidence below cleanly in one response.\n"
+                    if use_fast_review
+                    else "Use `list_files`, `read_file`, or `run_bash`/`run_shell` only if needed to check files/tests, then give your verdict.\n"
+                )
+                + "End your response with:\n"
+                "[[REVIEW_DECISION]]\n"
+                "STATUS: COMPLETE or NEEDS_WORK\n"
+                "SUMMARY: (Concise 1-3 sentence verification summary)\n"
+                "[[FIX_TASKS_JSON]]\n"
+                '[{"id":"R' + str(cycle) + '-T1","title":"Fix description","wave":1,"model":"","files":["file.py"],"brief":"Exact fix"}]  (or [] if COMPLETE)'
+                + pool_desc
+            )
+            rev_user = (
+                f"Goal: {user_text}\n\n"
+                f"Folder Tree ({workspace_dir}):\n{_snapshot_workspace(workspace_dir, limit=60)}\n\n"
+                f"{evidence_txt}"
+            )
+            rev_tools = []
+            if use_fast_review:
+                rev_msg = stream_ollama(
+                    [{"role": "system", "content": rev_sys}, {"role": "user", "content": rev_user}],
+                    model=orchestrator_model,
+                    tools_enabled=False,
+                    tools=[],
+                    on_thinking=lambda d: emit_ev({"type": "review_thinking_delta", "cycle": cycle, "text": d}),
+                    on_content=lambda d: emit_ev({"type": "review_reply_delta", "cycle": cycle, "text": d}),
+                    cancel_check=cancel_check,
+                    num_ctx=num_ctx,
+                    num_predict=512,
+                    max_parallel_slots=1,
+                )
+                add_tokens(rev_msg["tokens"])
+                rev_thinking = rev_msg.get("thinking", "")
+                rev_raw = rev_msg.get("content", "")
+            else:
+                rev_res = _run_uncapped_tool_agent(
+                    model=orchestrator_model,
+                    system_prompt=rev_sys,
+                    user_prompt=rev_user,
+                    tools=review_tools,
+                    workspace_dir=workspace_dir,
+                    num_ctx=num_ctx,
+                    max_parallel_slots=1,
+                    on_thinking=lambda d: emit_ev({"type": "review_thinking_delta", "cycle": cycle, "text": d}),
+                    on_content=lambda d: emit_ev({"type": "review_reply_delta", "cycle": cycle, "text": d}),
+                    on_tool_start=lambda tid, nm, ag: emit_ev({"type": "review_tool_start", "cycle": cycle, "tool_id": tid, "name": nm, "args": ag}),
+                    on_tool_end=lambda rec: (
+                        rev_tools.append(rec),
+                        emit_ev({"type": "review_tool_end", "cycle": cycle, "tool_id": rec["id"], "name": rec["name"], "args": rec["args"], "result": rec["result"]}),
+                    ),
+                    on_tokens=add_tokens,
+                    cancel_check=cancel_check,
+                )
+                rev_thinking = rev_res["thinking"]
+                rev_raw = rev_res.get("raw_reply") or rev_res.get("reply", "")
+
+            decision, rev_summary, fix_tasks = _parse_review_decision(
+                rev_raw,
+                cycle,
+                allowed_workers,
+                default_worker_model,
+            )
+            rv_rec = {
+                "cycle": cycle,
+                "status": decision,
+                "summary": rev_summary,
+                "thinking": rev_thinking,
+                "tools": rev_tools,
+                "elapsed": time.monotonic() - rv_t0,
+            }
+            reviews.append(rv_rec)
+            emit_ev({"type": "review_done", **rv_rec})
+            sync_walkthrough()
+
+            if decision == "COMPLETE" or not fix_tasks:
+                final_summary = rev_summary
+                break
+
+            all_tasks.extend(fix_tasks)
+            emit_ev({"type": "project_tasks_added", "tasks": [dict(t) for t in fix_tasks]})
+            sync_walkthrough()
+            run_task_queue(fix_tasks, f"Fix #{cycle} · ")
+            final_summary = rev_summary
+
+            new_snap = _snapshot_workspace_digests(workspace_dir)
+            if new_snap == last_snap:
+                stagnant_cycles += 1
+                if stagnant_cycles >= 2:
+                    final_summary = (
+                        f"Paused after Fix Cycle #{cycle}: no workspace file changes occurred across consecutive fix passes.\n\n"
+                        + rev_summary
+                    )
+                    break
+            else:
+                stagnant_cycles = 0
+                last_snap = new_snap
+
+        sync_walkthrough(final_note=final_summary)
+        outputs = _collect_workspace_outputs(project_id, workspace_dir, before_snap)
+        done_tasks = sum(1 for t in all_tasks if t.get("status") == "done")
+        reply_md = (
+            f"### Project Finished ({done_tasks}/{len(all_tasks)} tasks verified in `{workspace_dir.name}`)\n\n"
+            f"{final_summary or 'All planned tasks completed and reviewed.'}"
+        )
+        return {
+            "reply": reply_md,
+            "status": final_status,
+            "understanding": understanding,
+            "plan_md": plan_md,
+            "walkthrough_md": proj.get("walkthrough_md", ""),
+            "tasks": all_tasks,
+            "worker_runs": worker_runs,
+            "reviews": reviews,
+            "outputs": outputs,
+            "tokens": total_tokens,
+            "cancelled": False,
+        }
+
+    except CancelledError:
+        sync_walkthrough(final_note="Stopped by user.")
+        outputs = _collect_workspace_outputs(project_id, workspace_dir, before_snap)
+        return {
+            "reply": "*(project stopped by user — partial plan, walkthrough, and workspace files saved)*",
+            "status": "stopped",
+            "understanding": locals().get("understanding", ""),
+            "plan_md": proj.get("plan_md", ""),
+            "walkthrough_md": proj.get("walkthrough_md", ""),
+            "tasks": all_tasks,
+            "worker_runs": worker_runs,
+            "reviews": reviews,
+            "outputs": outputs,
+            "tokens": total_tokens,
+            "cancelled": True,
+        }
 
 
 def save_uploaded_file(chat_id: str, filename: str, raw_bytes: bytes) -> dict:
@@ -2177,10 +3684,22 @@ WEB_HTML = r"""<!doctype html>
 
   /* Sidebar */
   aside {
-    width: 260px; background: var(--sidebar); border-right: 1px solid var(--border);
-    display: flex; flex-direction: column; flex-shrink: 0; transition: width 0.2s ease, opacity 0.2s ease;
+    width: 260px; background: var(--sidebar);
+    display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden;
+    transition: width 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.18s ease, visibility 0s linear 0s;
   }
-  aside.collapsed { width: 0; border-right: none; overflow: hidden; opacity: 0; pointer-events: none; visibility: hidden; }
+  #sidebar { border-right: 1px solid var(--border); }
+  aside.collapsed {
+    width: 0; border-right: none; border-left: none; opacity: 0; pointer-events: none; visibility: hidden;
+    transition: width 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.16s ease, visibility 0s linear 0.24s;
+  }
+  .side-inner {
+    height: 100%; display: flex; flex-direction: column; flex-shrink: 0;
+    transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .side-inner-left { width: 260px; min-width: 260px; }
+  .side-inner-right { width: 300px; min-width: 300px; }
+  #sidebar.collapsed .side-inner-left { transform: translateX(-14px); }
   .side-head {
     height: 52px; padding: 0 14px; border-bottom: 1px solid var(--border);
     display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
@@ -2202,13 +3721,34 @@ WEB_HTML = r"""<!doctype html>
     letter-spacing: 0.06em; color: var(--muted);
   }
   #chat-list { flex: 1; overflow-y: auto; padding: 4px 8px 12px; }
+  .side-folder-hdr {
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 10px 3px; font-size: 11.5px; font-weight: 600;
+    color: var(--white); letter-spacing: 0.01em;
+  }
+  .side-folder-hdr svg { flex: 0 0 auto; color: var(--m-2); }
+  .side-folder-name {
+    flex: 1; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
   .chat-item {
     display: flex; align-items: center; justify-content: space-between; gap: 6px;
     padding: 8px 10px; border-radius: 8px; cursor: pointer; color: var(--muted);
     margin-bottom: 2px; font-size: 13px;
   }
+  .chat-item.is-grouped-child { padding-left: 24px; }
   .chat-item:hover { background: var(--surface); color: var(--text); }
   .chat-item.active { background: var(--surface-2); color: var(--white); }
+  .work-dot {
+    width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+    background: var(--m-2); box-shadow: 0 0 8px var(--m-2), 0 0 0 2px var(--m-glow);
+    display: none; animation: workDotPulse 1.3s ease-in-out infinite;
+  }
+  .chat-item.is-working .work-dot { display: inline-block; }
+  @keyframes workDotPulse {
+    0%, 100% { opacity: 0.55; transform: scale(0.88); }
+    50%      { opacity: 1; transform: scale(1.12); }
+  }
   .chat-title-wrap { flex: 1; min-width: 0; overflow: hidden; }
   .chat-title-track { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chat-title-dup { display: none; }
@@ -2622,8 +4162,7 @@ WEB_HTML = r"""<!doctype html>
     padding: 0; display: grid; place-items: center; flex-shrink: 0;
     transition: color 0.15s, border-color 0.15s, background 0.15s;
   }
-  #plus-btn svg { transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1); }
-  #plus-btn.open svg { transform: rotate(45deg); }
+  #plus-btn svg { transition: none; }
   #plus-btn:hover, #plus-btn.open {
     color: var(--white); border-color: rgba(255, 255, 255, 0.34); background: rgba(255, 255, 255, 0.06);
   }
@@ -2714,10 +4253,18 @@ WEB_HTML = r"""<!doctype html>
   .file-dl-pill {
     display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px;
     border-radius: 8px; border: 1px solid var(--m-3); background: var(--surface-2);
-    color: var(--m-1); font-size: 12px; text-decoration: none;
+    color: var(--m-1); font-size: 12px; text-decoration: none; max-width: 100%;
     transition: background 0.15s, border-color 0.15s, color 0.15s;
   }
   .file-dl-pill:hover { background: var(--m-glow); border-color: var(--m-2); color: var(--white); }
+  .file-path-pill { font-family: var(--font-mono); font-size: 11.5px; text-align: left; }
+  .file-path-pill .file-dl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 520px; }
+  .file-path-copy {
+    flex-shrink: 0; font-family: var(--font-sans); font-size: 10.5px; font-weight: 500;
+    color: var(--muted); padding: 1px 6px; border-radius: 5px;
+    border: 1px solid var(--border); background: var(--bg);
+  }
+  .file-path-pill:hover .file-path-copy { color: var(--white); border-color: var(--m-3); }
   textarea#input {
     flex: 1; background: transparent; border: none; color: var(--white);
     caret-color: var(--m-2);
@@ -2794,24 +4341,38 @@ WEB_HTML = r"""<!doctype html>
   .drop-box b { color: var(--white); font-size: 16px; font-weight: 600; }
   .drop-box span { color: var(--muted); font-size: 12.5px; }
 
-  /* Modals (Soul, Quick Buttons, Settings, Pull Model, Manage Models, Manage Files) */
-  #soul-modal, #chips-modal, #settings-modal, #pull-modal, #models-modal, #files-modal {
+  /* Modals (Soul, Quick Buttons, Settings, Pull Model, Manage Models, Manage Files, Choose Folder, Confirm Delete) */
+  #soul-modal, #chips-modal, #settings-modal, #pull-modal, #models-modal, #files-modal, #folder-modal {
     position: fixed; inset: 0; background: rgba(0,0,0,0.72); display: none;
     align-items: center; justify-content: center; padding: 20px; z-index: 40;
   }
-  #soul-box, #chips-box, #settings-box, #pull-box, #models-box, #files-box {
+  #confirm-modal {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.56);
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+    display: none; align-items: center; justify-content: center; padding: 20px; z-index: 60;
+  }
+  #soul-box, #chips-box, #settings-box, #pull-box, #models-box, #files-box, #folder-box, #confirm-box {
     width: 100%; max-width: 640px; background: var(--surface); border: 1px solid var(--border);
     border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 14px;
     animation: modalIn 0.16s cubic-bezier(0.22, 1, 0.36, 1);
   }
+  #confirm-box { max-width: 400px; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.65); }
+  .confirm-head { display: flex; align-items: center; justify-content: space-between; font-size: 14px; color: var(--white); }
+  .confirm-msg { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.48; }
+  .confirm-actions { margin-top: 2px; }
+  .btn-danger {
+    background: rgba(239, 68, 68, 0.18); color: #fecaca; border: 1px solid rgba(239, 68, 68, 0.65);
+    font-weight: 600;
+  }
+  .btn-danger:hover { background: rgba(239, 68, 68, 0.32); color: var(--white); border-color: rgba(248, 113, 113, 0.9); }
   @keyframes modalIn {
     from { opacity: 0; transform: translateY(6px) scale(0.985); }
     to   { opacity: 1; transform: translateY(0) scale(1); }
   }
-  #settings-box { max-width: 480px; }
+  #settings-box { max-width: 540px; max-height: 86vh; overflow-y: auto; }
   #pull-box { max-width: 440px; }
   #models-box { max-width: 560px; }
-  #files-box { max-width: 600px; }
+  #files-box, #folder-box { max-width: 600px; }
   .soul-tabs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
   .soul-tab {
     padding: 5px 10px; border-radius: 7px; font-size: 12px;
@@ -2898,8 +4459,264 @@ WEB_HTML = r"""<!doctype html>
   .btn-white { background: var(--white); color: #111; border: none; font-weight: 600; }
   .btn-white:hover { background: #e4e4e7; }
 
+  /* Sidebar Chat / Projects Mode Toggle */
+  .side-mode-wrap { padding: 10px 10px 2px; flex-shrink: 0; }
+  .side-mode-switch {
+    position: relative; display: grid; grid-template-columns: 1fr 1fr; padding: 3px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+  }
+  .side-mode-thumb {
+    position: absolute; top: 3px; bottom: 3px; left: 3px;
+    width: calc(50% - 3px); border-radius: 7px;
+    background: var(--surface-2); border: 1px solid var(--m-3);
+    box-shadow: 0 0 0 2px var(--m-glow), 0 2px 6px rgba(0, 0, 0, 0.35);
+    transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1), border-color 0.2s ease, box-shadow 0.2s ease;
+    pointer-events: none; z-index: 0;
+  }
+  body.mode-project .side-mode-thumb { transform: translateX(100%); }
+  .side-mode-btn {
+    position: relative; z-index: 1;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    border: none; background: transparent; color: var(--muted);
+    font-size: 12px; font-weight: 500; padding: 6px 8px; border-radius: 7px;
+    transition: color 0.18s ease;
+  }
+  .side-mode-btn:hover { color: var(--white); background: transparent; border-color: transparent; }
+  .side-mode-btn.active { color: var(--white); background: transparent; }
+  .mode-work-dot {
+    width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+    background: var(--m-2); box-shadow: 0 0 8px var(--m-2), 0 0 0 2px var(--m-glow);
+    display: none; animation: workDotPulse 1.3s ease-in-out infinite;
+  }
+  .mode-work-dot.show { display: inline-block; }
+  .side-empty { padding: 12px 10px; font-size: 12px; color: var(--muted); text-align: center; }
+
+  /* Right Project Inspector Sidebar (Google AI Studio layout) */
+  .icon-btn.active { background: var(--surface); color: var(--white); border-color: var(--border); }
+  body.mode-project #welcome-mascot {
+    width: clamp(116px, 16vh, 152px); height: clamp(116px, 16vh, 152px);
+  }
+  .proj-cube-slot {
+    width: 64px; height: 64px; flex-shrink: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    margin: -10px 0;
+  }
+  body.mode-project .proj-cube-slot #welcome-mascot {
+    width: 64px; height: 64px;
+  }
+  .proj-cube-static { display: block; width: 60px; height: 60px; }
+  .proj-turn-row .proj-shell,
+  .proj-turn-row .proj-loader,
+  .proj-turn-row > .prose,
+  .proj-turn-row > .file-dl-row,
+  .proj-turn-row > .msg-actions { padding-left: 72px; }
+  .toggle-switch {
+    position: relative; display: inline-flex; align-items: center;
+    width: 36px; height: 20px; cursor: pointer; flex-shrink: 0;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .toggle-slider {
+    position: absolute; inset: 0; border-radius: 999px;
+    background: var(--bg); border: 1px solid var(--border);
+    transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  }
+  .toggle-slider::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--muted);
+    transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), background 0.18s ease;
+  }
+  .toggle-switch input:checked + .toggle-slider {
+    background: var(--m-glow); border-color: var(--m-3); box-shadow: 0 0 0 2px var(--m-glow);
+  }
+  .toggle-switch input:checked + .toggle-slider::after {
+    transform: translateX(16px); background: var(--m-1);
+  }
+  .right-aside {
+    width: 300px; background: var(--sidebar); border-left: 1px solid var(--border);
+    display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden;
+    transition: width 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.18s ease, visibility 0s linear 0s;
+  }
+  body:not(.mode-project) .right-aside { display: none; }
+  .right-aside.collapsed {
+    width: 0; border-left: none; opacity: 0; pointer-events: none; visibility: hidden;
+    transition: width 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.16s ease, visibility 0s linear 0.24s;
+  }
+  .right-aside.collapsed .side-inner-right { transform: translateX(14px); }
+  .right-side-head {
+    height: 52px; padding: 0 14px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0;
+  }
+  .right-side-title { font-size: 13px; font-weight: 600; color: var(--white); white-space: nowrap; }
+  .rp-saved-badge {
+    font-size: 11px; color: var(--m-1); background: var(--m-glow); border: 1px solid var(--m-3);
+    padding: 2px 7px; border-radius: 5px; opacity: 0; transition: opacity 0.2s ease;
+  }
+  .rp-saved-badge.show { opacity: 1; }
+  .right-side-scroll {
+    flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px 14px 18px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .rp-section { display: flex; flex-direction: column; gap: 10px; }
+  .rp-section + .rp-section { padding-top: 14px; border-top: 1px solid var(--border); }
+  .rp-sec-label {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted);
+  }
+  .rp-folder-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .rp-folder-card.unset { border-color: var(--m-3); background: rgba(255, 255, 255, 0.02); }
+  .rp-folder-path {
+    font-family: var(--font-mono); font-size: 11.5px; color: var(--white);
+    word-break: break-all; line-height: 1.4;
+  }
+  .rp-folder-path.unset { color: var(--m-2); font-family: var(--font-sans); font-size: 12px; }
+  .rp-folder-actions { display: flex; gap: 6px; }
+  .rp-folder-actions button { flex: 1; padding: 5px 8px; font-size: 12px; white-space: nowrap; }
+  .rp-field { display: flex; flex-direction: column; gap: 5px; }
+  .rp-field label { font-size: 12px; font-weight: 500; color: var(--text); }
+  .rp-field select {
+    width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 6px 9px; font: inherit; font-size: 12.5px;
+  }
+  .rp-field select:focus { outline: none; border-color: rgba(255,255,255,0.45); }
+  .rp-field input[type="range"] { width: 100%; height: 4px; cursor: pointer; accent-color: var(--m-2); }
+  .rp-row-split { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .rp-val { font-family: var(--font-mono); font-size: 11.5px; color: var(--white); }
+  .rp-hint { font-size: 11px; color: var(--muted); line-height: 1.38; }
+  .rp-role-summary {
+    font-family: var(--font-mono); font-size: 11px; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 8px; line-height: 1.4; word-break: break-word;
+  }
+  .rp-meta-line {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    font-size: 12px; color: var(--muted); padding-top: 2px;
+  }
+  .rp-pill-static {
+    font-family: var(--font-mono); font-size: 11px; color: var(--m-1);
+    background: var(--m-glow); border: 1px solid var(--m-3); padding: 2px 7px; border-radius: 5px;
+  }
+  .proj-folder-chip, .proj-roles-chip {
+    cursor: pointer; background: var(--surface-2); border-color: var(--border);
+  }
+  .proj-folder-chip.unset { border-color: var(--m-3); background: var(--m-glow); color: var(--m-1); }
+  .proj-folder-chip:hover, .proj-roles-chip:hover { border-color: rgba(255,255,255,0.45); color: var(--white); }
+
+  /* Multi-Model Worker Pool Pills */
+  .pool-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pool-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 9px; border-radius: 7px; font-size: 11.5px;
+    background: var(--bg); color: var(--muted); border: 1px solid var(--border);
+  }
+  .pool-pill.on { background: var(--m-glow); border-color: var(--m-3); color: var(--white); }
+
+  /* Folder Browser Modal */
+  #folder-shortcuts { display: flex; flex-wrap: wrap; gap: 6px; }
+  .folder-shortcuts { display: flex; flex-wrap: wrap; gap: 6px; }
+  .folder-shortcut-btn { padding: 4px 9px; font-size: 11.5px; border-radius: 6px; background: var(--bg); }
+  .folder-path-bar { display: flex; gap: 6px; align-items: center; }
+  .folder-path-bar input {
+    flex: 1; min-width: 0; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px;
+    font-family: var(--font-mono); font-size: 12px;
+  }
+  .folder-path-bar input:focus { outline: none; border-color: rgba(255,255,255,0.45); }
+  .folder-error { font-size: 12px; color: #ff9b9b; min-height: 0; }
+  .folder-error:empty { display: none; }
+  #folder-entries {
+    display: flex; flex-direction: column; gap: 4px;
+    max-height: 270px; overflow-y: auto; padding: 4px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .folder-entry {
+    display: flex; align-items: center; gap: 9px; width: 100%;
+    padding: 7px 10px; border: 1px solid transparent; border-radius: 6px;
+    background: transparent; color: var(--text); text-align: left; font-size: 13px;
+  }
+  .folder-entry:hover { background: var(--surface-2); border-color: rgba(255,255,255,0.16); color: var(--white); }
+  .folder-entry.up { color: var(--muted); font-family: var(--font-mono); font-size: 12px; }
+  .folder-ico { display: inline-flex; color: var(--m-2); flex-shrink: 0; min-width: 16px; justify-content: center; }
+  .folder-empty { padding: 14px; text-align: center; font-size: 12px; color: var(--muted); }
+  .folder-preview-path {
+    flex: 1; min-width: 140px; font-family: var(--font-mono); font-size: 11px;
+    color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* Long-Horizon Project Timeline & Cards */
+  .proj-badge, .proj-ws-tag, .proj-status-pill, .pr-verdict, .pw-lane {
+    font-size: 11px; padding: 2px 7px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--muted);
+  }
+  .proj-badge { color: var(--m-1); border-color: var(--m-3); background: var(--m-glow); }
+  .proj-ws-tag { font-family: var(--font-mono); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .proj-status-pill.is-complete, .pr-verdict.is-pass {
+    color: #bbf7d0; border-color: rgba(74, 222, 128, 0.45); background: rgba(74, 222, 128, 0.12);
+  }
+  .proj-status-pill.is-error {
+    color: #fecaca; border-color: rgba(248, 113, 113, 0.5); background: rgba(248, 113, 113, 0.12);
+  }
+  .pr-verdict.is-fix, .proj-status-pill.is-reviewing, .proj-status-pill.is-planning, .proj-status-pill.is-running {
+    color: var(--m-1); border-color: var(--m-3); background: var(--m-glow);
+  }
+  .proj-shell { display: flex; flex-direction: column; gap: 8px; padding-left: 22px; width: 100%; }
+  .proj-timeline { display: flex; flex-direction: column; gap: 7px; }
+  details.proj-card, details.proj-worker-card, details.proj-review-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 12px; width: 100%;
+  }
+  details.proj-card summary, details.proj-worker-card summary, details.proj-review-card summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px;
+    font-size: 12.5px; color: var(--white); user-select: none; flex-wrap: wrap;
+  }
+  details.proj-card summary::-webkit-details-marker,
+  details.proj-worker-card summary::-webkit-details-marker,
+  details.proj-review-card summary::-webkit-details-marker { display: none; }
+  .proj-card-title { font-weight: 600; }
+  .proj-card-meta { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+  .proj-art-links { margin-left: auto; display: inline-flex; gap: 6px; }
+  .proj-art-btn {
+    font-family: var(--font-mono); font-size: 11px; color: var(--m-1); text-decoration: none;
+    padding: 2px 7px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg);
+  }
+  .proj-art-btn:hover { border-color: var(--m-3); background: var(--m-glow); }
+  .proj-card-body, .proj-worker-body {
+    margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .proj-card-body .prose, .proj-worker-body .prose { padding-left: 0; font-size: 13.5px; }
+  .proj-card-body .steps-wrap, .proj-worker-body .steps-wrap { padding-left: 0; }
+  .proj-understanding { font-size: 13px; color: #d4d4d8; display: none; }
+  .proj-task-list {
+    list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px;
+  }
+  .proj-task-item {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 6px 9px; border-radius: 7px; background: var(--bg); border: 1px solid var(--border);
+    font-size: 12px; color: var(--text);
+  }
+  .proj-task-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .proj-task-item.is-running .proj-task-dot { background: var(--m-2); box-shadow: 0 0 6px var(--m-glow); }
+  .proj-task-item.is-done .proj-task-dot { background: #4ade80; }
+  .proj-task-item.is-error .proj-task-dot { background: #f87171; }
+  .proj-task-id { font-family: var(--font-mono); font-weight: 600; color: var(--m-2); }
+  .proj-task-title { flex: 1; min-width: 140px; }
+  .proj-task-wave { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); }
+  .proj-task-model, .pw-model {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--muted);
+  }
+  .pw-id { font-family: var(--font-mono); font-weight: 600; color: var(--worker-accent, var(--m-2)); }
+  .pw-title, .pr-title { font-weight: 500; flex: 1; min-width: 120px; }
+  .pw-ctx, .pw-time { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+  .proj-loader { padding-left: 22px; }
+
   @media (max-width: 720px) {
-    aside { position: fixed; top: 0; bottom: 0; left: 0; z-index: 25; }
+    #sidebar { position: fixed; top: 0; bottom: 0; left: 0; z-index: 25; }
+    #right-sidebar { position: fixed; top: 0; bottom: 0; right: 0; z-index: 26; box-shadow: -12px 0 32px rgba(0,0,0,0.55); }
     .ctx-badge { display: none; }
     .chip-edit-row, .setting-row { grid-template-columns: 1fr; }
     .setting-ctrl { justify-content: flex-start; }
@@ -2907,26 +4724,42 @@ WEB_HTML = r"""<!doctype html>
     .model-mgr-row { flex-direction: column; align-items: stretch; }
     .model-mgr-actions { justify-content: flex-end; }
     #plus-menu { width: calc(100vw - 44px); }
+    .proj-shell { padding-left: 0; }
   }
 </style>
 </head>
 <body>
   <aside id="sidebar" class="collapsed">
-    <div class="side-head">
-      <div class="brand">
-        <div class="m-mark" id="brand-mark"><span></span><span></span><span></span><span></span><span></span></div>
-        <span>local agent</span>
+    <div class="side-inner side-inner-left">
+      <div class="side-head">
+        <div class="brand">
+          <div class="m-mark" id="brand-mark"><span></span><span></span><span></span><span></span><span></span></div>
+          <span>local agent</span>
+        </div>
       </div>
-    </div>
-    <div class="side-actions">
-      <button class="btn-new" onclick="newChat()">+ New chat</button>
-      <button onclick="openSoul()" title="Edit soul.md">Soul</button>
-    </div>
-    <div class="side-label">Saved chats</div>
-    <div id="chat-list"></div>
-    <div class="side-foot">
-      <span>__OS_NAME__</span>
-      <button type="button" class="quit-btn" onclick="quitServer()" title="Stop local server">Quit app</button>
+      <div class="side-mode-wrap">
+        <div class="side-mode-switch" role="tablist" aria-label="Workspace mode">
+          <span class="side-mode-thumb" aria-hidden="true"></span>
+          <button type="button" class="side-mode-btn active" id="mode-btn-chat" role="tab" aria-selected="true" onclick="setAppMode('chat')">
+            <span>Chat</span>
+            <span class="mode-work-dot" id="mode-dot-chat" aria-hidden="true"></span>
+          </button>
+          <button type="button" class="side-mode-btn" id="mode-btn-project" role="tab" aria-selected="false" onclick="setAppMode('project')">
+            <span>Projects</span>
+            <span class="mode-work-dot" id="mode-dot-project" aria-hidden="true"></span>
+          </button>
+        </div>
+      </div>
+      <div class="side-actions">
+        <button class="btn-new" id="side-new-btn" onclick="newSession()">+ New chat</button>
+        <button id="side-soul-btn" onclick="openSoul()" title="Edit soul.md">Soul</button>
+      </div>
+      <div class="side-label" id="side-history-label">Saved chats</div>
+      <div id="chat-list"></div>
+      <div class="side-foot">
+        <span>__OS_NAME__</span>
+        <button type="button" class="quit-btn" onclick="quitServer()" title="Stop local server">Quit app</button>
+      </div>
     </div>
   </aside>
 
@@ -2949,7 +4782,10 @@ WEB_HTML = r"""<!doctype html>
       <div class="head-right">
         <span id="ctx-badge" class="ctx-badge" title="Context tokens used in this chat">ctx 0 / __CTX_K__</span>
         <button type="button" class="icon-btn" onclick="openSettings()" title="Settings">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l-.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+        <button type="button" class="icon-btn" id="right-sidebar-btn" style="display:none;" onclick="toggleRightSidebar()" title="Toggle project settings panel">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="9" y1="3.5" x2="9" y2="8.5"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="16" y1="9.5" x2="16" y2="14.5"/><line x1="4" y1="18" x2="20" y2="18"/><line x1="7" y1="15.5" x2="7" y2="20.5"/></svg>
         </button>
       </div>
     </header>
@@ -2973,7 +4809,7 @@ WEB_HTML = r"""<!doctype html>
           <div class="q-rotator" aria-live="polite">
             <h1 id="rotating-q">What are we working on?</h1>
           </div>
-          <p>Running locally via Ollama <b id="welcome-model">__MODEL__</b></p>
+          <p id="welcome-sub">Running locally via Ollama <b id="welcome-model">__MODEL__</b></p>
         </div>
 
         <form class="composer" onsubmit="event.preventDefault(); handleSendOrStop();">
@@ -2992,7 +4828,7 @@ WEB_HTML = r"""<!doctype html>
             <button type="button" id="send-btn" onclick="handleSendOrStop()" title="Send"></button>
           </div>
         </form>
-        <div class="hint">Enter to send · Shift+Enter for newline · Drop files or click + · Chats saved in __CHATS_PATH__</div>
+        <div class="hint" id="composer-hint" data-chat-hint="Enter to send · Shift+Enter for newline · Drop files or click + · Chats saved in __CHATS_PATH__">Enter to send · Shift+Enter for newline · Drop files or click + · Chats saved in __CHATS_PATH__</div>
       </div>
 
       <div class="empty-spacer" id="empty-spacer">
@@ -3001,16 +4837,98 @@ WEB_HTML = r"""<!doctype html>
     </div>
   </main>
 
+  <aside id="right-sidebar" class="right-aside collapsed" aria-label="Project settings">
+    <div class="side-inner side-inner-right">
+      <div class="right-side-head">
+        <span class="right-side-title">Project settings</span>
+        <span id="rp-saved-badge" class="rp-saved-badge">Saved</span>
+      </div>
+      <div class="right-side-scroll">
+        <div class="rp-section">
+          <div class="rp-sec-label">Workspace folder</div>
+          <div id="rp-folder-card" class="rp-folder-card unset">
+            <div id="rp-folder-path" class="rp-folder-path unset">No folder selected</div>
+            <div class="rp-folder-actions">
+              <button type="button" class="btn-white" id="rp-folder-btn" onclick="openFolderModal()">Choose folder...</button>
+              <button type="button" onclick="pickNativeFolder()" title="Native OS folder dialog">OS Dialog</button>
+            </div>
+            <div class="rp-hint">The AI stays inside this folder and creates files/subfolders here.</div>
+          </div>
+        </div>
+
+        <div class="rp-section">
+          <div class="rp-sec-label">Models &amp; roles</div>
+          <div class="rp-field">
+            <label for="rp-proj-orch">Orchestrator model</label>
+            <select id="rp-proj-orch" onchange="saveRightPanelSettings()"></select>
+          </div>
+          <div class="rp-field">
+            <label for="rp-proj-worker">Primary worker</label>
+            <select id="rp-proj-worker" onchange="saveRightPanelSettings()"></select>
+          </div>
+          <div class="rp-field">
+            <label>Worker pool (multi-model)</label>
+            <div class="pool-pills" id="rp-proj-pool"></div>
+            <div class="rp-hint">Pick 2+ models so the Orchestrator can route pieces to different LLMs.</div>
+          </div>
+          <div id="rp-role-summary" class="rp-role-summary"></div>
+        </div>
+
+        <div class="rp-section">
+          <div class="rp-sec-label">Run settings</div>
+          <div class="rp-field">
+            <div class="rp-row-split">
+              <label for="rp-proj-workers">Parallel workers</label>
+              <span class="rp-val" id="rp-proj-workers-val">1 (Sequential)</span>
+            </div>
+            <input type="range" id="rp-proj-workers" min="1" max="4" step="1" value="1" oninput="updateProjWorkersLabel(this.value)" onchange="saveRightPanelSettings()" />
+            <div class="rp-hint">1 = CPU safe · 2–4 = parallel wave lanes.</div>
+          </div>
+          <div class="rp-field">
+            <label for="rp-proj-ctx">Context window</label>
+            <select id="rp-proj-ctx" onchange="saveRightPanelSettings()">
+              <option value="16384">16k (16,384)</option>
+              <option value="32768">32k (32,768)</option>
+              <option value="65536">64k (65,536)</option>
+              <option value="131072">128k (131,072)</option>
+            </select>
+          </div>
+          <div class="rp-field">
+            <label for="rp-proj-cycles">Review &amp; fix loops</label>
+            <select id="rp-proj-cycles" onchange="saveRightPanelSettings()">
+              <option value="1">1 cycle (Fast)</option>
+              <option value="2">Up to 2 cycles</option>
+              <option value="3">Up to 3 cycles</option>
+              <option value="6">Up to 6 cycles</option>
+              <option value="0">Uncapped (until verified)</option>
+            </select>
+          </div>
+          <div class="rp-meta-line">
+            <label for="rp-show-chips" style="cursor:pointer;">Show starter buttons</label>
+            <label class="toggle-switch" title="Show or hide starter prompt buttons">
+              <input type="checkbox" id="rp-show-chips" checked onchange="saveRightPanelSettings()" />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="rp-meta-line">
+            <span>Tool calls per piece</span>
+            <span class="rp-pill-static">Uncapped</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
   <div id="soul-modal">
     <div id="soul-box">
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>Souls (up to 4 presets, applies live)</b>
-        <span style="color:var(--muted);font-size:12px;">__SOUL_PATH__</span>
+        <b id="soul-modal-title">Souls (up to 4 presets, applies live)</b>
+        <span id="soul-modal-path" style="color:var(--muted);font-size:12px;">__SOUL_PATH__</span>
       </div>
       <div id="soul-tabs" class="soul-tabs"></div>
       <div class="soul-meta-row">
         <input id="soul-name" type="text" maxlength="24" spellcheck="false" placeholder="Soul name..." oninput="updateActiveSoulName(this.value)" />
-        <button type="button" onclick="restoreOriginalSoul()" title="Restore default original soul">Restore original</button>
+        <button type="button" id="soul-restore-btn" onclick="restoreOriginalSoul()" title="Restore default soul">Restore original</button>
         <button type="button" onclick="deleteCurrentSoul()" title="Delete selected soul">Delete</button>
       </div>
       <textarea id="soul-text" spellcheck="false" placeholder="Write instructions for this soul..."></textarea>
@@ -3025,7 +4943,7 @@ WEB_HTML = r"""<!doctype html>
     <div id="chips-box">
       <div style="display:flex;justify-content:space-between;align-items:center;">
         <b>Edit quick buttons</b>
-        <span style="color:var(--muted);font-size:12px;">Shown under new chat bar</span>
+        <span id="chips-modal-sub" style="color:var(--muted);font-size:12px;">Shown under new chat bar</span>
       </div>
       <div id="chips-rows"></div>
       <div class="modal-split">
@@ -3100,6 +5018,18 @@ WEB_HTML = r"""<!doctype html>
           <input type="text" id="set-tts-voice" spellcheck="false" placeholder="default (or Zoey, Freya...)" />
         </div>
       </div>
+      <div class="setting-row">
+        <div class="setting-meta">
+          <b>Quick prompt buttons</b>
+          <span>Show starter buttons below prompt box</span>
+        </div>
+        <div class="setting-ctrl">
+          <label class="toggle-switch" title="Show or hide quick prompt buttons">
+            <input type="checkbox" id="set-show-chips" checked />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
       <div class="modal-split">
         <button type="button" onclick="closeSettings(); openModelsModal();">Manage models...</button>
         <div class="modal-row">
@@ -3158,7 +5088,7 @@ WEB_HTML = r"""<!doctype html>
   <div id="files-modal">
     <div id="files-box">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
-        <b>Manage attached & generated files</b>
+        <b>Manage attached &amp; generated files</b>
         <span id="files-summary" style="color:var(--muted);font-size:12px;"></span>
       </div>
       <div id="files-rows"></div>
@@ -3170,6 +5100,50 @@ WEB_HTML = r"""<!doctype html>
         <div class="modal-row">
           <button type="button" class="btn-white" onclick="closeFilesModal()">Done</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="folder-modal">
+    <div id="folder-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <div>
+          <b>Choose project folder</b>
+          <div style="color:var(--muted);font-size:12px;margin-top:2px;">The AI stays inside this PC folder and creates files/subfolders here.</div>
+        </div>
+        <button type="button" id="folder-os-btn" onclick="pickNativeFolder()" title="Open native OS folder picker">OS Picker...</button>
+      </div>
+      <div class="folder-shortcuts" id="folder-shortcuts"></div>
+      <div class="folder-path-bar">
+        <input id="folder-path-input" type="text" spellcheck="false" placeholder="Path to folder..." onkeydown="if(event.key==='Enter'){event.preventDefault();browseFolder(this.value);}" />
+        <button type="button" onclick="browseFolder(document.getElementById('folder-path-input').value)">Go</button>
+        <button type="button" onclick="toggleFolderMkdir()" title="Create a new subfolder inside current folder">+ Folder</button>
+      </div>
+      <div id="folder-mkdir-row" class="folder-path-bar" style="display:none;">
+        <input id="folder-mkdir-name" type="text" spellcheck="false" placeholder="New subfolder name..." onkeydown="if(event.key==='Enter'){event.preventDefault();submitFolderMkdir();}" />
+        <button type="button" class="btn-white" onclick="submitFolderMkdir()">Create</button>
+      </div>
+      <div id="folder-error" class="folder-error"></div>
+      <div id="folder-entries"></div>
+      <div class="modal-split">
+        <span id="folder-selected-preview" class="folder-preview-path"></span>
+        <div class="modal-row">
+          <button type="button" onclick="closeFolderModal()">Cancel</button>
+          <button type="button" class="btn-white" onclick="confirmFolderSelection()">Use this folder</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div id="confirm-box">
+      <div class="confirm-head">
+        <b id="confirm-title">Delete?</b>
+      </div>
+      <p id="confirm-msg" class="confirm-msg"></p>
+      <div class="modal-row confirm-actions">
+        <button type="button" id="confirm-no-btn" onclick="closeConfirmModal()">No, don't delete</button>
+        <button type="button" id="confirm-yes-btn" class="btn-danger" onclick="confirmModalAccept()">Yes, delete</button>
       </div>
     </div>
   </div>
@@ -3188,9 +5162,14 @@ WEB_HTML = r"""<!doctype html>
   </div>
 
 <script src="/lfm3-mascot.js"></script>
+<script src="/cube-mascot.js"></script>
 <script>
 const MAX_CTX = __NUM_CTX__;
+let appMode = "chat";
 let currentChatId = null;
+let currentProjectId = null;
+let currentProjectWorkspace = "";
+let selectedProjectDir = "";
 let draftChatId = null;
 let currentModel = "__MODEL__";
 let availableModels = ["__MODEL__"];
@@ -3200,7 +5179,17 @@ let modelParams = {};
 let ollamaRunning = true;
 let pullingModel = false;
 let toolsEnabled = localStorage.getItem("local_agent_tools") === "1";
-let activePacks = { web: false, files: false, system: toolsEnabled };
+let chatPacks = { web: false, files: false, system: toolsEnabled };
+let projectPacks = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem("local_agent_project_packs") || "null");
+    if (saved && typeof saved === "object") {
+      return { web: !!saved.web, files: saved.files !== false, system: saved.system !== false };
+    }
+  } catch (_) {}
+  return { web: false, files: true, system: true };
+})();
+let activePacks = appMode === "project" ? projectPacks : chatPacks;
 let pendingFiles = [];
 let busy = false;
 let currentAbort = null;
@@ -3272,6 +5261,7 @@ function getModelParamLabel(name) {
 }
 
 let welcomeMascot = null;
+let welcomeMascotKind = "";
 
 function applyModelTheme(modelName) {
   const pal = getModelPalette(modelName);
@@ -3286,10 +5276,11 @@ function applyModelTheme(modelName) {
     mpEl.style.display = pLbl ? "" : "none";
   }
   const wm = document.getElementById("welcome-model");
-  if (wm) wm.textContent = modelName;
+  if (wm) wm.textContent = (typeof appMode !== "undefined" && appMode === "project") ? getActiveOrchestratorModel() : modelName;
   if (welcomeMascot && typeof welcomeMascot.setRingColors === "function") {
     welcomeMascot.setRingColors(pal[3], pal[4]);
   }
+  if (typeof syncCubeLight === "function") syncCubeLight();
 }
 
 function isModelInstalled(name) {
@@ -3453,7 +5444,9 @@ function syncPlusMenuState() {
 function togglePack(pack) {
   if (!(pack in activePacks)) return;
   activePacks[pack] = !activePacks[pack];
-  if (pack === "system") {
+  if (appMode === "project") {
+    try { localStorage.setItem("local_agent_project_packs", JSON.stringify(projectPacks)); } catch (_) {}
+  } else if (pack === "system") {
     toolsEnabled = activePacks.system;
     localStorage.setItem("local_agent_tools", toolsEnabled ? "1" : "0");
   }
@@ -3640,6 +5633,7 @@ function renderComposerBar() {
   }
 
   const desired = [];
+
   for (const id of enabledIds) {
     const meta = PACK_META.find(p => p.id === id);
     const key = "pack:" + id;
@@ -3778,7 +5772,8 @@ async function uploadFiles(fileList) {
   if (!files.length) return;
   let attachedAny = false;
   for (const file of files) {
-    const cid = currentChatId || draftChatId || "";
+    const activeId = appMode === "project" ? currentProjectId : currentChatId;
+    const cid = activeId || draftChatId || "";
     const placeholder = { name: file.name, size: file.size, outline: "", uploading: true };
     pendingFiles.push(placeholder);
     renderComposerBar();
@@ -3796,7 +5791,7 @@ async function uploadFiles(fileList) {
         setUploadNotice(data.error || `Upload failed (${res.status})`);
         continue;
       }
-      if (!currentChatId && data.chat_id) draftChatId = data.chat_id;
+      if (!activeId && data.chat_id) draftChatId = data.chat_id;
       const saved = {
         chat_id: data.chat_id,
         name: data.name,
@@ -3830,7 +5825,8 @@ async function removePendingFile(idx) {
   if (!f || f.uploading) return;
   pendingFiles.splice(idx, 1);
   renderComposerBar();
-  const cid = f.chat_id || currentChatId || draftChatId;
+  const activeId = appMode === "project" ? currentProjectId : currentChatId;
+  const cid = f.chat_id || activeId || draftChatId;
   if (cid && f.name) {
     try {
       await fetch(`/api/files/${encodeURIComponent(cid)}/${encodeURIComponent(f.name)}`, { method: "DELETE" });
@@ -4366,9 +6362,15 @@ function submitPullModal() {
 function selectModel(m) {
   currentModel = m;
   modelChosenByUser = true;
+  if (appMode === "project" && typeof syncProjectOrchestratorModel === "function") {
+    syncProjectOrchestratorModel(m, { save: true });
+    document.getElementById("model-menu").classList.remove("open");
+    return;
+  }
   applyModelTheme(m);
   renderModelMenu();
   updateSetupBanner();
+  refreshProjectBarIndicators();
   document.getElementById("model-menu").classList.remove("open");
 }
 
@@ -4392,7 +6394,7 @@ async function loadModels(retryOnBoot = true) {
     installedModelDetails = Array.isArray(info.installed_details) ? info.installed_details : [];
     modelParams = (info && info.model_params && typeof info.model_params === "object") ? info.model_params : {};
     if (Array.isArray(info.models) && info.models.length) availableModels = info.models;
-    if (!currentChatId && !modelChosenByUser && info.default_model) {
+    if (!currentChatId && !currentProjectId && !modelChosenByUser && info.default_model) {
       if ((typeof appSettings !== "undefined" && appSettings.default_model) || !isModelInstalled(currentModel)) {
         currentModel = info.default_model;
       }
@@ -4401,6 +6403,8 @@ async function loadModels(retryOnBoot = true) {
   applyModelTheme(currentModel);
   renderModelMenu();
   updateSetupBanner();
+  if (typeof syncRightPanelFromSettings === "function") syncRightPanelFromSettings();
+  refreshProjectBarIndicators();
   if (ollamaRunning && typeof appSettings !== "undefined" && appSettings.tts_auto && !_bootTtsWarmed) {
     warmTtsModel(false);
   }
@@ -4582,24 +6586,49 @@ function appendStreamCursor(proseEl) {
   }
 }
 
+async function _writeClipboardText(rawText) {
+  const txt = String(rawText ?? "");
+  try {
+    if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(txt);
+      return true;
+    }
+  } catch {}
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = txt;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0;";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = typeof document.execCommand === "function" ? document.execCommand("copy") : false;
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 function copyCode(btn) {
   const code = btn.closest(".code-block").querySelector("code").textContent;
-  navigator.clipboard.writeText(code);
+  _writeClipboardText(code);
   btn.textContent = "Copied!";
   setTimeout(() => btn.textContent = "Copy", 1400);
 }
 
 function copyInline(el) {
-  navigator.clipboard.writeText(el.textContent);
+  _writeClipboardText(el.textContent);
   const old = el.style.borderColor;
   el.style.borderColor = "#ffffff";
   setTimeout(() => el.style.borderColor = old, 900);
 }
 
 function copyText(btn, rawText) {
-  navigator.clipboard.writeText(rawText);
+  const prev = btn.dataset.copyLabel || btn.textContent || "Copy";
+  btn.dataset.copyLabel = prev;
+  _writeClipboardText(rawText);
   btn.textContent = "Copied!";
-  setTimeout(() => btn.textContent = "Copy", 1400);
+  setTimeout(() => btn.textContent = prev, 1400);
 }
 
 let activeTtsAudio = null;
@@ -5452,50 +7481,162 @@ function refreshTitleOverflow() {
   }
 }
 
-async function loadChatList() {
-  const res = await fetch("/api/chats");
-  const chats = await res.json();
+const SVG_FOLDER = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+let _pendingConfirmFn = null;
+
+function openConfirmModal({ title = "Are you sure?", message = "", yesLabel = "Yes, delete", noLabel = "No, don't delete", onConfirm = null } = {}) {
+  const modal = document.getElementById("confirm-modal");
+  const titleEl = document.getElementById("confirm-title");
+  const msgEl = document.getElementById("confirm-msg");
+  const yesBtn = document.getElementById("confirm-yes-btn");
+  const noBtn = document.getElementById("confirm-no-btn");
+  if (!modal) {
+    if (typeof onConfirm === "function") onConfirm();
+    return;
+  }
+  _pendingConfirmFn = typeof onConfirm === "function" ? onConfirm : null;
+  if (titleEl) titleEl.textContent = title;
+  if (msgEl) msgEl.textContent = message;
+  if (yesBtn) yesBtn.textContent = yesLabel;
+  if (noBtn) noBtn.textContent = noLabel;
+  modal.style.display = "flex";
+}
+
+function closeConfirmModal() {
+  _pendingConfirmFn = null;
+  const modal = document.getElementById("confirm-modal");
+  if (modal) modal.style.display = "none";
+}
+
+async function confirmModalAccept() {
+  const fn = _pendingConfirmFn;
+  closeConfirmModal();
+  if (typeof fn === "function") await fn();
+}
+
+function _buildHistoryRow(c, { isProj, activeId, sessionMode, groupedChild = false }) {
+  const label = c.title || c.id;
+  const isWorking = (typeof isSessionWorking === "function") && isSessionWorking(sessionMode, c.id);
+  const div = document.createElement("div");
+  div.className = "chat-item"
+    + (c.id === activeId ? " active" : "")
+    + (isWorking ? " is-working" : "")
+    + (groupedChild ? " is-grouped-child" : "");
+  div.dataset.sessionId = c.id;
+  div.dataset.sessionMode = sessionMode;
+  if (isProj && c.workspace_dir) div.title = `${label}\n${c.workspace_dir}`;
+  div.onclick = () => (isProj ? openProject(c.id) : openChat(c.id));
+
+  const wdot = document.createElement("span");
+  wdot.className = "work-dot";
+  wdot.setAttribute("aria-hidden", "true");
+  div.appendChild(wdot);
+
+  const wrap = document.createElement("div");
+  wrap.className = "chat-title-wrap";
+  const track = document.createElement("div");
+  track.className = "chat-title-track";
+
+  const mainSpan = document.createElement("span");
+  mainSpan.className = "chat-title-main";
+  mainSpan.textContent = label;
+
+  const dupSpan = document.createElement("span");
+  dupSpan.className = "chat-title-dup";
+  dupSpan.setAttribute("aria-hidden", "true");
+  dupSpan.textContent = label;
+
+  track.appendChild(mainSpan);
+  track.appendChild(dupSpan);
+  wrap.appendChild(track);
+
+  const del = document.createElement("button");
+  del.className = "del-btn";
+  del.innerHTML = SVG_CLOSE;
+  del.title = isProj ? "Delete project history (keeps PC folder)" : "Delete chat";
+  del.onclick = (e) => {
+    e.stopPropagation();
+    openConfirmModal({
+      title: isProj ? `Delete "${label}"?` : `Delete "${label}"?`,
+      message: isProj
+        ? "Remove this project from Saved projects? Files inside your PC folder will NOT be deleted."
+        : "Permanently remove this saved chat from history?",
+      yesLabel: "Yes, delete",
+      noLabel: "No, don't delete",
+      onConfirm: async () => {
+        if (typeof abortRunBySession === "function") abortRunBySession(sessionMode, c.id);
+        const delUrl = isProj ? `/api/projects/${encodeURIComponent(c.id)}` : `/api/chats/${encodeURIComponent(c.id)}`;
+        await fetch(delUrl, { method: "DELETE" });
+        if (isProj) {
+          if (currentProjectId === c.id) newProject();
+          else loadHistoryList();
+        } else {
+          if (currentChatId === c.id) newChat();
+          else loadHistoryList();
+        }
+      },
+    });
+  };
+  div.appendChild(wrap);
+  div.appendChild(del);
+  return div;
+}
+
+async function loadHistoryList() {
+  const isProj = appMode === "project";
+  const endpoint = isProj ? "/api/projects" : "/api/chats";
+  const res = await fetch(endpoint);
+  const items = await res.json();
   const list = document.getElementById("chat-list");
   list.innerHTML = "";
-  for (const c of chats) {
-    const label = c.title || c.id;
-    const div = document.createElement("div");
-    div.className = "chat-item" + (c.id === currentChatId ? " active" : "");
-    div.onclick = () => openChat(c.id);
+  if (!Array.isArray(items) || !items.length) {
+    const emp = document.createElement("div");
+    emp.className = "side-empty";
+    emp.textContent = isProj ? "No projects yet" : "No saved chats yet";
+    list.appendChild(emp);
+    if (typeof syncWorkingIndicators === "function") syncWorkingIndicators();
+    return;
+  }
+  const activeId = isProj ? currentProjectId : currentChatId;
+  const sessionMode = isProj ? "project" : "chat";
 
-    const wrap = document.createElement("div");
-    wrap.className = "chat-title-wrap";
-    const track = document.createElement("div");
-    track.className = "chat-title-track";
-
-    const mainSpan = document.createElement("span");
-    mainSpan.className = "chat-title-main";
-    mainSpan.textContent = label;
-
-    const dupSpan = document.createElement("span");
-    dupSpan.className = "chat-title-dup";
-    dupSpan.setAttribute("aria-hidden", "true");
-    dupSpan.textContent = label;
-
-    track.appendChild(mainSpan);
-    track.appendChild(dupSpan);
-    wrap.appendChild(track);
-
-    const del = document.createElement("button");
-    del.className = "del-btn";
-    del.innerHTML = SVG_CLOSE;
-    del.title = "Delete chat";
-    del.onclick = async (e) => {
-      e.stopPropagation();
-      await fetch("/api/chats/" + encodeURIComponent(c.id), { method: "DELETE" });
-      if (currentChatId === c.id) newChat();
-      else loadChatList();
-    };
-    div.appendChild(wrap);
-    div.appendChild(del);
-    list.appendChild(div);
+  if (isProj) {
+    const groups = [];
+    const byFolder = new Map();
+    for (const c of items) {
+      const wsDir = String(c.workspace_dir || "").trim();
+      const key = wsDir || "__none__";
+      let grp = byFolder.get(key);
+      if (!grp) {
+        grp = { wsDir, items: [] };
+        byFolder.set(key, grp);
+        groups.push(grp);
+      }
+      grp.items.push(c);
+    }
+    for (const grp of groups) {
+      const folderName = grp.wsDir ? (grp.wsDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || grp.wsDir) : "No folder";
+      const hdr = document.createElement("div");
+      hdr.className = "side-folder-hdr";
+      hdr.title = grp.wsDir || "No workspace folder assigned";
+      hdr.innerHTML = `${SVG_FOLDER}<span class="side-folder-name"></span>`;
+      hdr.querySelector(".side-folder-name").textContent = folderName;
+      list.appendChild(hdr);
+      for (const c of grp.items) {
+        list.appendChild(_buildHistoryRow(c, { isProj, activeId, sessionMode, groupedChild: true }));
+      }
+    }
+  } else {
+    for (const c of items) {
+      list.appendChild(_buildHistoryRow(c, { isProj, activeId, sessionMode, groupedChild: false }));
+    }
   }
   refreshTitleOverflow();
+  if (typeof syncWorkingIndicators === "function") syncWorkingIndicators();
+}
+
+function loadChatList() {
+  return loadHistoryList();
 }
 
 const WELCOME_QUESTIONS = [
@@ -5506,14 +7647,25 @@ const WELCOME_QUESTIONS = [
   "Want to inspect a file or folder?",
   "Got a quick tech question?",
 ];
+const PROJECT_WELCOME_QUESTIONS = [
+  "Ready to start a long-horizon project?",
+  "Plan first, delegate piece-by-piece, and review",
+  "Pick a PC folder and let workers build",
+  "Orchestrate small models without losing context",
+];
 let qIndex = 0;
 let qTimer = null;
 let qSwapTimer = null;
+
+function activeWelcomeList() {
+  return appMode === "project" ? PROJECT_WELCOME_QUESTIONS : WELCOME_QUESTIONS;
+}
 
 function rotateWelcomeQuestion() {
   const main = document.getElementById("main-pane");
   const el = document.getElementById("rotating-q");
   if (!main || !el || !main.classList.contains("is-empty") || document.hidden) return;
+  const list = activeWelcomeList();
   el.classList.add("q-exit");
   clearTimeout(qSwapTimer);
   qSwapTimer = setTimeout(() => {
@@ -5521,10 +7673,10 @@ function rotateWelcomeQuestion() {
       el.classList.remove("q-exit");
       return;
     }
-    qIndex = (qIndex + 1) % WELCOME_QUESTIONS.length;
+    qIndex = (qIndex + 1) % list.length;
     el.classList.remove("q-exit");
     el.classList.add("q-enter");
-    el.textContent = WELCOME_QUESTIONS[qIndex];
+    el.textContent = list[qIndex];
     void el.offsetWidth;
     el.classList.remove("q-enter");
   }, 260);
@@ -5545,23 +7697,257 @@ function stopQuestionRotation() {
 }
 
 let welcomeMascotPauseTimer = null;
+let cubeWakeTimer = null;
+
+function getActiveOrchestratorModel() {
+  if (appMode === "project" && currentModel) {
+    const customOrch = (typeof appSettings !== "undefined" && appSettings.project_orchestrator_model)
+      ? String(appSettings.project_orchestrator_model).trim()
+      : "";
+    return customOrch || currentModel;
+  }
+  const customOrch = (typeof appSettings !== "undefined" && appSettings.project_orchestrator_model)
+    ? String(appSettings.project_orchestrator_model).trim()
+    : "";
+  return customOrch || currentModel;
+}
+
+function getCubeColorKey(modelName) {
+  const n = String(modelName || "").toLowerCase();
+  if (n.includes("gemma") || n.includes("granite") || n.includes("ganite")) return "azure";
+  if (n.includes("lfm") || n.includes("qwen")) return "purple";
+  if (n.includes("red") || n.includes("crimson")) return "red";
+  return "white";
+}
+
+function syncCubeLight(modelOverride) {
+  if (!welcomeMascot || welcomeMascotKind !== "cube") return;
+  const orchModel = String(modelOverride || getActiveOrchestratorModel() || currentModel || "");
+  const colorKey = getCubeColorKey(orchModel);
+  const pal = getModelPalette(orchModel);
+  if (typeof welcomeMascot.setPalette === "function") {
+    welcomeMascot.setPalette(pal, colorKey);
+  } else if (typeof welcomeMascot.setColor === "function") {
+    welcomeMascot.setColor(colorKey);
+  }
+}
+
+function syncProjectOrchestratorModel(modelName, { save = true, refreshBanner = true } = {}) {
+  const nextModel = String(modelName || currentModel || "").trim();
+  if (!nextModel) return;
+  currentModel = nextModel;
+  modelChosenByUser = true;
+  if (typeof appSettings !== "undefined") {
+    appSettings.project_orchestrator_model = nextModel;
+  }
+  const sel = document.getElementById("rp-proj-orch");
+  if (sel) {
+    const opts = Array.from(sel.options || []);
+    if (!opts.some(o => o.value === nextModel) && typeof document.createElement === "function") {
+      const opt = document.createElement("option");
+      opt.value = nextModel;
+      const p = getModelParamLabel(nextModel);
+      opt.textContent = p ? `${nextModel} · ${p}` : nextModel;
+      sel.appendChild(opt);
+    }
+    sel.value = nextModel;
+  }
+  applyModelTheme(nextModel);
+  renderModelMenu();
+  if (refreshBanner) updateSetupBanner();
+  renderComposerBar();
+  refreshProjectBarIndicators();
+  if (save) {
+    fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_orchestrator_model: nextModel }),
+    }).then(r => r.json()).then(d => {
+      if (d && d.settings && typeof appSettings !== "undefined") {
+        appSettings.project_orchestrator_model = d.settings.project_orchestrator_model || nextModel;
+      }
+      if (typeof flashRightSavedBadge === "function") flashRightSavedBadge();
+    }).catch(() => {});
+  }
+}
+
+let _cubeSvgSeq = 0;
+function buildStaticCubeSvg(modelName) {
+  const pal = getModelPalette(modelName);
+  const cGlow = pal[2] || "#a78bfa";
+  const cMid = pal[3] || "#8b5cf6";
+  const gid = "cg-" + (++_cubeSvgSeq);
+  return `<svg class="proj-cube-static" viewBox="0 0 32 32" width="60" height="60" aria-hidden="true"><defs><radialGradient id="${gid}" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="${pal[0] || "#ffffff"}" stop-opacity="0.95"/><stop offset="55%" stop-color="${cGlow}" stop-opacity="0.5"/><stop offset="100%" stop-color="${cMid}" stop-opacity="0"/></radialGradient></defs><circle cx="16" cy="16" r="12" fill="url(#${gid})"/><polygon points="16,4 27,10.2 16,16.4 5,10.2" fill="#22232a" stroke="#4a4c58" stroke-width="1"/><polygon points="5,10.2 16,16.4 16,28 5,21.8" fill="#121216" stroke="#3c3e48" stroke-width="1"/><polygon points="27,10.2 16,16.4 16,28 27,21.8" fill="#191a20" stroke="#424450" stroke-width="1"/><line x1="16" y1="16.4" x2="16" y2="28" stroke="${cGlow}" stroke-width="1.2" stroke-opacity="0.75"/></svg>`;
+}
+
+function syncCubeState() {
+  if (!welcomeMascot || welcomeMascotKind !== "cube" || typeof welcomeMascot.setState !== "function") return;
+  const activeViewed = (typeof getViewedActiveRun === "function") ? Boolean(getViewedActiveRun("project")) : busy;
+  if (activeViewed && appMode === "project") {
+    clearTimeout(cubeWakeTimer);
+    cubeWakeTimer = null;
+    welcomeMascot.setState("loading");
+  } else {
+    welcomeMascot.setState("closed");
+  }
+}
+
+function wakeCubeMascot(durationMs = 4500) {
+  if (appMode !== "project" || !welcomeMascot || welcomeMascotKind !== "cube") return;
+  const activeViewed = (typeof getViewedActiveRun === "function") ? Boolean(getViewedActiveRun("project")) : busy;
+  if (activeViewed) {
+    if (typeof welcomeMascot.setState === "function") welcomeMascot.setState("loading");
+    return;
+  }
+  if (typeof welcomeMascot.setState === "function") welcomeMascot.setState("opened");
+  clearTimeout(cubeWakeTimer);
+  cubeWakeTimer = setTimeout(() => {
+    cubeWakeTimer = null;
+    const stillWorking = (typeof getViewedActiveRun === "function") ? Boolean(getViewedActiveRun("project")) : busy;
+    if (!stillWorking && welcomeMascot && welcomeMascotKind === "cube" && typeof welcomeMascot.setState === "function") {
+      welcomeMascot.setState("closed");
+    }
+  }, durationMs);
+}
+
+function _getProjectCubeSlots() {
+  const col = document.getElementById("chat-col");
+  if (!col) return [];
+  const slots = [];
+  for (const ch of Array.from(col.children || [])) {
+    if (ch && ch.classList && ch.classList.contains("proj-turn-row") && typeof ch.querySelector === "function") {
+      const s = ch.querySelector(".proj-cube-slot");
+      if (s) slots.push(s);
+    }
+  }
+  return slots;
+}
+
+function _resizeWelcomeMascot() {
+  if (welcomeMascot && typeof welcomeMascot._resize === "function") {
+    welcomeMascot._resize();
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => {
+        if (welcomeMascot && typeof welcomeMascot._resize === "function") welcomeMascot._resize();
+      });
+    }
+  }
+}
+
+function syncMascotDockPosition(isEmpty) {
+  const welcome = document.getElementById("welcome");
+  if (!welcome) return;
+  let box = document.getElementById("welcome-mascot");
+  if (!box && typeof document.createElement === "function") {
+    box = document.createElement("div");
+    box.id = "welcome-mascot";
+    welcome.insertBefore(box, welcome.firstChild);
+    welcomeMascot = null;
+    welcomeMascotKind = "";
+  }
+  if (!box) return;
+  const slots = _getProjectCubeSlots();
+  const activeSlot = (appMode === "project" && !isEmpty && slots.length) ? slots[slots.length - 1] : null;
+  for (const s of slots) {
+    if (s === activeSlot) continue;
+    if (!s.contains(box) && (!s.children || !s.children.length)) {
+      s.innerHTML = buildStaticCubeSvg(s.dataset.orchModel || currentModel);
+    }
+  }
+  if (activeSlot) {
+    if (box.parentElement !== activeSlot) {
+      const prevParent = box.parentElement;
+      activeSlot.innerHTML = "";
+      activeSlot.appendChild(box);
+      if (prevParent && prevParent.classList && prevParent.classList.contains("proj-cube-slot") && prevParent !== activeSlot) {
+        prevParent.innerHTML = buildStaticCubeSvg(prevParent.dataset.orchModel || currentModel);
+      }
+      _resizeWelcomeMascot();
+    }
+  } else if (box.parentElement !== welcome) {
+    const prevParent = box.parentElement;
+    welcome.insertBefore(box, welcome.firstChild);
+    if (prevParent && prevParent.classList && prevParent.classList.contains("proj-cube-slot")) {
+      prevParent.innerHTML = buildStaticCubeSvg(prevParent.dataset.orchModel || currentModel);
+    }
+    _resizeWelcomeMascot();
+  }
+}
+
+function clearChatColumn() {
+  syncMascotDockPosition(true);
+  const col = document.getElementById("chat-col");
+  if (col) col.innerHTML = "";
+}
 
 function initWelcomeMascot() {
-  const box = document.getElementById("welcome-mascot");
-  if (!box || welcomeMascot || typeof BooMascot === "undefined") return;
-  const pal = getModelPalette(currentModel);
-  welcomeMascot = BooMascot.mount(box, {
-    variant: "with-purple",
-    face: "soft",
-    theme: "dark",
-    mood: "auto",
-    mouth: "happy",
-    ringTop: pal[3],
-    ringBottom: pal[4],
-  });
+  const welcome = document.getElementById("welcome");
+  let box = document.getElementById("welcome-mascot");
+  if (!box && welcome && typeof document.createElement === "function") {
+    box = document.createElement("div");
+    box.id = "welcome-mascot";
+    welcome.insertBefore(box, welcome.firstChild);
+    welcomeMascot = null;
+    welcomeMascotKind = "";
+  }
+  if (!box) return;
+  if (!box.dataset.cubeClickBound) {
+    box.dataset.cubeClickBound = "1";
+    box.addEventListener("click", () => {
+      if (appMode === "project") wakeCubeMascot(4500);
+    });
+  }
   const main = document.getElementById("main-pane");
-  if (main && !main.classList.contains("is-empty") && typeof welcomeMascot.setPaused === "function") {
-    welcomeMascot.setPaused(true);
+  const isEmpty = !main || main.classList.contains("is-empty");
+  syncMascotDockPosition(isEmpty);
+  const wantKind = appMode === "project" ? "cube" : "boo";
+  if (welcomeMascot && welcomeMascotKind === wantKind) {
+    if (wantKind === "cube") {
+      if (typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
+      syncCubeLight();
+      syncCubeState();
+    } else if (typeof welcomeMascot.setPaused === "function") {
+      welcomeMascot.setPaused(!isEmpty);
+    }
+    return;
+  }
+  clearTimeout(cubeWakeTimer);
+  cubeWakeTimer = null;
+  if (welcomeMascot && typeof welcomeMascot.destroy === "function") {
+    welcomeMascot.destroy();
+  }
+  welcomeMascot = null;
+  welcomeMascotKind = "";
+  box.innerHTML = "";
+
+  if (wantKind === "cube" && typeof CubeMascot !== "undefined") {
+    const orchModel = getActiveOrchestratorModel();
+    const isWorking = (typeof getViewedActiveRun === "function") ? Boolean(getViewedActiveRun("project")) : busy;
+    box.title = "Cube mascot (click to wake)";
+    welcomeMascot = CubeMascot.mount(box, {
+      color: getCubeColorKey(orchModel),
+      palette: getModelPalette(orchModel),
+      state: isWorking ? "loading" : "closed",
+      glowMode: "pulse",
+    });
+    welcomeMascotKind = "cube";
+  } else if (typeof BooMascot !== "undefined") {
+    const pal = getModelPalette(currentModel);
+    box.title = "LFM3 mascot (click to poke)";
+    welcomeMascot = BooMascot.mount(box, {
+      variant: "with-purple",
+      face: "soft",
+      theme: "dark",
+      mood: "auto",
+      mouth: "happy",
+      ringTop: pal[3],
+      ringBottom: pal[4],
+    });
+    welcomeMascotKind = "boo";
+  }
+
+  if (welcomeMascot && typeof welcomeMascot.setPaused === "function") {
+    welcomeMascot.setPaused(wantKind === "boo" && !isEmpty);
   }
 }
 
@@ -5570,11 +7956,29 @@ function setEmptyState(isEmpty) {
   if (!main) return;
   const wasEmpty = main.classList.contains("is-empty");
   main.classList.toggle("is-empty", isEmpty);
+  syncMascotDockPosition(isEmpty);
   clearTimeout(welcomeMascotPauseTimer);
-  if (isEmpty && !wasEmpty) {
-    qIndex = 0;
+  if (isEmpty) {
     const el = document.getElementById("rotating-q");
-    if (el) el.textContent = WELCOME_QUESTIONS[0];
+    if (el && !wasEmpty) {
+      qIndex = 0;
+      el.textContent = activeWelcomeList()[0];
+    } else if (el && !activeWelcomeList().includes(el.textContent)) {
+      qIndex = 0;
+      el.textContent = activeWelcomeList()[0];
+    }
+  }
+  if (appMode === "project" && welcomeMascotKind === "cube") {
+    if (isEmpty) {
+      if (!wasEmpty || !qTimer) startQuestionRotation();
+    } else {
+      stopQuestionRotation();
+    }
+    if (welcomeMascot && typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
+    syncCubeState();
+    return;
+  }
+  if (isEmpty && !wasEmpty) {
     startQuestionRotation();
     if (welcomeMascot && typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
   } else if (isEmpty) {
@@ -5622,11 +8026,35 @@ function scrollFollow(anchorRow) {
   }
 }
 
-function buildOutputsRow(outputs) {
+function _joinDisplayPath(wsDir, relName) {
+  const rel = String(relName || "").trim();
+  const base = String(wsDir || "").replace(/[\\/]+$/, "");
+  if (!base) return rel;
+  const sep = base.includes("\\") ? "\\" : "/";
+  return `${base}${sep}${rel.split("/").join(sep)}`;
+}
+
+function buildOutputsRow(outputs, opts = {}) {
   const wrap = document.createElement("div");
   wrap.className = "file-dl-row";
+  const isProjOut = Boolean(opts && opts.projectMode);
+  const wsDir = (opts && opts.workspaceDir) ? String(opts.workspaceDir) : "";
   for (const out of outputs) {
-    if (!out || !out.url || !out.name) continue;
+    if (!out || !out.name) continue;
+    if (isProjOut) {
+      const fullPath = String(out.path || _joinDisplayPath(wsDir, out.name));
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "file-dl-pill file-path-pill";
+      btn.title = `Saved on disk: ${fullPath} (click to copy path)`;
+      btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span class="file-dl-name"></span><span class="file-path-copy">Copy path</span>`;
+      btn.querySelector(".file-dl-name").textContent = out.size ? `${fullPath} (${fmtFileSize(out.size)})` : fullPath;
+      const copyEl = btn.querySelector(".file-path-copy");
+      btn.onclick = () => copyText(copyEl, fullPath);
+      wrap.appendChild(btn);
+      continue;
+    }
+    if (!out.url) continue;
     const a = document.createElement("a");
     a.className = "file-dl-pill";
     a.href = out.url;
@@ -5640,6 +8068,7 @@ function buildOutputsRow(outputs) {
 }
 
 function renderMessage(m) {
+  if (m && m.role === "project") return renderProjectTurn(m);
   setEmptyState(false);
   const col = document.getElementById("chat-col");
   const row = document.createElement("div");
@@ -5705,31 +8134,167 @@ function renderMessage(m) {
   return row;
 }
 
+function newSession() {
+  if (appMode === "project") newProject();
+  else newChat();
+}
+
+function getActiveProjectWorkspace() {
+  return currentProjectWorkspace || selectedProjectDir || "";
+}
+
+function refreshProjectBarIndicators() {
+  const ws = getActiveProjectWorkspace();
+  const rpPathEl = document.getElementById("rp-folder-path");
+  const rpCard = document.getElementById("rp-folder-card");
+  if (rpPathEl) {
+    rpPathEl.textContent = ws || "No folder selected";
+    rpPathEl.title = ws || "Choose an existing folder on your PC to start";
+    rpPathEl.classList.toggle("unset", !ws);
+  }
+  if (rpCard) rpCard.classList.toggle("unset", !ws);
+
+  const rpSummary = document.getElementById("rp-role-summary");
+  if (rpSummary && typeof appSettings !== "undefined") {
+    const orch = getActiveOrchestratorModel();
+    const wk = appSettings.project_worker_model || orch;
+    const pool = Array.isArray(appSettings.project_worker_pool) ? appSettings.project_worker_pool : [];
+    const wCount = Number(appSettings.project_workers) || 1;
+    const wDesc = pool.length >= 2
+      ? `Pool (${pool.length} LLMs)`
+      : (wk === orch ? "Same LLM" : wk);
+    rpSummary.textContent = `${orch} -> ${wDesc} · ${wCount}x ${wCount > 1 ? "parallel" : "sequential"}`;
+  }
+  if (appMode === "project") {
+    const wm = document.getElementById("welcome-model");
+    if (wm) wm.textContent = getActiveOrchestratorModel();
+  }
+  syncCubeLight();
+}
+
+function applyAppModeUI(reloadList = true) {
+  const isProj = appMode === "project";
+  document.body.classList.toggle("mode-project", isProj);
+  const bChat = document.getElementById("mode-btn-chat");
+  const bProj = document.getElementById("mode-btn-project");
+  if (bChat) {
+    bChat.classList.toggle("active", !isProj);
+    bChat.setAttribute("aria-selected", String(!isProj));
+  }
+  if (bProj) {
+    bProj.classList.toggle("active", isProj);
+    bProj.setAttribute("aria-selected", String(isProj));
+  }
+  const newBtn = document.getElementById("side-new-btn");
+  if (newBtn) newBtn.textContent = isProj ? "+ New project" : "+ New chat";
+  const soulBtn = document.getElementById("side-soul-btn");
+  if (soulBtn) {
+    soulBtn.textContent = "Soul";
+    soulBtn.title = isProj ? "Edit Cube Soul (cube_soul.md)" : "Edit Soul (soul.md)";
+  }
+  const lbl = document.getElementById("side-history-label");
+  if (lbl) lbl.textContent = isProj ? "Saved projects" : "Saved chats";
+  const inp = document.getElementById("input");
+  if (inp) {
+    inp.placeholder = isProj
+      ? "Describe a long-horizon project to plan, build piece-by-piece, and review..."
+      : "Ask anything or drop files...";
+  }
+  const welcomeSub = document.getElementById("welcome-sub");
+  if (welcomeSub) {
+    const shownModel = isProj ? getActiveOrchestratorModel() : currentModel;
+    welcomeSub.innerHTML = isProj
+      ? `Long-Horizon Orchestrator via <b id="welcome-model">${escHtml(shownModel)}</b>`
+      : `Running locally via Ollama <b id="welcome-model">${escHtml(shownModel)}</b>`;
+  }
+  const hint = document.getElementById("composer-hint");
+  if (hint) {
+    hint.textContent = isProj
+      ? "Works strictly inside chosen PC folder · Uncapped tools & tokens · Enter to run"
+      : hint.dataset.chatHint || hint.textContent;
+  }
+  activePacks = isProj ? projectPacks : chatPacks;
+  syncPlusMenuState();
+  if (typeof syncRightPanelFromSettings === "function") syncRightPanelFromSettings();
+  if (typeof syncRightSidebarVisibility === "function") syncRightSidebarVisibility();
+  initWelcomeMascot();
+  renderChips();
+  renderComposerBar();
+  refreshProjectBarIndicators();
+  if (typeof syncWorkingIndicators === "function") syncWorkingIndicators();
+  if (reloadList) loadHistoryList();
+}
+
+function setAppMode(mode) {
+  const next = mode === "project" ? "project" : "chat";
+  if (next === appMode) return;
+  currentViewToken += 1;
+  if (activeStreamFlush) activeStreamFlush();
+  stopTtsPlayback();
+  userScrolledAway = false;
+  activeStreamRow = null;
+  appMode = next;
+
+  currentChatId = null;
+  currentProjectId = null;
+  currentProjectWorkspace = "";
+  draftChatId = null;
+  pendingFiles = [];
+  uploadNotice = "";
+  clearChatColumn();
+  if (appMode === "project" && currentModel) {
+    appSettings.project_orchestrator_model = currentModel;
+  }
+  setEmptyState(true);
+  updateCtxBadge(0, appMode === "project" ? (Number(appSettings.project_num_ctx) || MAX_CTX) : MAX_CTX);
+  applyAppModeUI(true);
+  if (appMode === "project" && currentModel) {
+    syncProjectOrchestratorModel(currentModel, { save: true, refreshBanner: false });
+  }
+  syncBusyUI();
+}
+
 async function openChat(id) {
-  if (busy && currentAbort) currentAbort.abort();
+  const viewTok = ++currentViewToken;
+  if (appMode !== "chat") {
+    appMode = "chat";
+    applyAppModeUI(false);
+  }
   if (activeStreamFlush) activeStreamFlush();
   stopTtsPlayback();
   userScrolledAway = false;
   activeStreamRow = null;
   closePlusMenu();
   draftChatId = null;
+  currentProjectId = null;
+  currentProjectWorkspace = "";
   pendingFiles = [];
   renderComposerBar();
   const res = await fetch("/api/chats/" + encodeURIComponent(id));
   const data = await res.json();
+  if (currentViewToken !== viewTok) return;
   currentChatId = data.id;
   if (data.model) selectModel(data.model);
   const tok = data.tokens || {};
   updateCtxBadge(tok.used || 0, tok.max || MAX_CTX);
-  document.getElementById("chat-col").innerHTML = "";
+  clearChatColumn();
   const msgs = data.ui_messages || [];
-  setEmptyState(msgs.length === 0);
+  const activeRun = findActiveRun("chat", data.id);
+  setEmptyState(msgs.length === 0 && !activeRun);
   for (const m of msgs) renderMessage(m);
-  loadChatList();
+  if (activeRun && !activeRun.done) {
+    mountLiveChatRun(activeRun);
+  }
+  syncBusyUI();
+  loadHistoryList();
 }
 
 function newChat() {
-  if (busy && currentAbort) currentAbort.abort();
+  if (appMode !== "chat") {
+    setAppMode("chat");
+    return;
+  }
+  currentViewToken += 1;
   if (activeStreamFlush) activeStreamFlush();
   stopTtsPlayback();
   userScrolledAway = false;
@@ -5740,10 +8305,254 @@ function newChat() {
   pendingFiles = [];
   renderComposerBar();
   updateCtxBadge(0, MAX_CTX);
-  document.getElementById("chat-col").innerHTML = "";
+  clearChatColumn();
   setEmptyState(true);
-  loadChatList();
+  syncBusyUI();
+  loadHistoryList();
   document.getElementById("input").focus();
+}
+
+async function openProject(id) {
+  const viewTok = ++currentViewToken;
+  if (appMode !== "project") {
+    appMode = "project";
+    applyAppModeUI(false);
+  }
+  if (activeStreamFlush) activeStreamFlush();
+  stopTtsPlayback();
+  userScrolledAway = false;
+  activeStreamRow = null;
+  closePlusMenu();
+  draftChatId = null;
+  currentChatId = null;
+  pendingFiles = [];
+  const res = await fetch("/api/projects/" + encodeURIComponent(id));
+  const data = await res.json();
+  if (currentViewToken !== viewTok) return;
+  currentProjectId = data.id;
+  currentProjectWorkspace = data.workspace_dir || "";
+  if (data.orchestrator_model) syncProjectOrchestratorModel(data.orchestrator_model, { save: false });
+  const tok = data.tokens || {};
+  updateCtxBadge(tok.used || 0, tok.max || (Number(appSettings.project_num_ctx) || MAX_CTX));
+  renderComposerBar();
+  refreshProjectBarIndicators();
+  clearChatColumn();
+  const msgs = data.ui_messages || [];
+  const activeRun = findActiveRun("project", data.id);
+  setEmptyState(msgs.length === 0 && !activeRun);
+  for (const m of msgs) renderMessage(m);
+  if (activeRun && !activeRun.done) {
+    mountLiveProjectRun(activeRun);
+  }
+  syncBusyUI();
+  loadHistoryList();
+}
+
+function newProject() {
+  if (appMode !== "project") {
+    setAppMode("project");
+    return;
+  }
+  currentViewToken += 1;
+  if (activeStreamFlush) activeStreamFlush();
+  stopTtsPlayback();
+  userScrolledAway = false;
+  activeStreamRow = null;
+  closePlusMenu();
+  currentProjectId = null;
+  currentProjectWorkspace = "";
+  selectedProjectDir = "";
+  draftChatId = null;
+  pendingFiles = [];
+  uploadNotice = "";
+  renderComposerBar();
+  refreshProjectBarIndicators();
+  updateCtxBadge(0, Number(appSettings.project_num_ctx) || MAX_CTX);
+  clearChatColumn();
+  setEmptyState(true);
+  syncBusyUI();
+  loadHistoryList();
+  document.getElementById("input").focus();
+}
+
+/* Folder Browser Modal (Antigravity-style workspace selection) */
+let folderBrowserPath = "";
+let folderBrowserParent = "";
+
+function closeFolderModal() {
+  const modal = document.getElementById("folder-modal");
+  if (modal) modal.style.display = "none";
+}
+
+async function openFolderModal(noticeText = "") {
+  const modal = document.getElementById("folder-modal");
+  if (!modal) return;
+  const errEl = document.getElementById("folder-error");
+  if (errEl) errEl.textContent = noticeText || "";
+  const mkWrap = document.getElementById("folder-mkdir-row");
+  if (mkWrap) mkWrap.style.display = "none";
+  modal.style.display = "flex";
+  await browseFolder(getActiveProjectWorkspace() || "");
+}
+
+async function browseFolder(targetPath = "") {
+  const errEl = document.getElementById("folder-error");
+  if (errEl) errEl.textContent = "";
+  try {
+    const qs = targetPath ? `?path=${encodeURIComponent(targetPath)}` : "";
+    const res = await fetch("/api/fs/list" + qs);
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      if (errEl) errEl.textContent = data.error || "Cannot open folder";
+      return;
+    }
+    folderBrowserPath = data.path || "";
+    folderBrowserParent = data.parent || "";
+    const pathInp = document.getElementById("folder-path-input");
+    if (pathInp) pathInp.value = folderBrowserPath;
+    const curPreview = document.getElementById("folder-selected-preview");
+    if (curPreview) curPreview.textContent = folderBrowserPath || "(root)";
+
+    const shortcuts = document.getElementById("folder-shortcuts");
+    if (shortcuts) {
+      shortcuts.innerHTML = "";
+      for (const sc of (data.shortcuts || [])) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "folder-shortcut-btn";
+        b.textContent = sc.label;
+        b.title = sc.path;
+        b.onclick = () => browseFolder(sc.path);
+        shortcuts.appendChild(b);
+      }
+    }
+
+    const list = document.getElementById("folder-entries");
+    if (list) {
+      list.innerHTML = "";
+      if (folderBrowserParent && folderBrowserParent !== folderBrowserPath) {
+        const up = document.createElement("button");
+        up.type = "button";
+        up.className = "folder-entry up";
+        up.innerHTML = `<span class="folder-ico">..</span><span>Parent folder</span>`;
+        up.onclick = () => browseFolder(folderBrowserParent);
+        list.appendChild(up);
+      }
+      const dirs = data.dirs || [];
+      if (!dirs.length) {
+        const empty = document.createElement("div");
+        empty.className = "folder-empty";
+        empty.textContent = "No subfolders here — you can select this folder or create a new subfolder.";
+        list.appendChild(empty);
+      } else {
+        for (const d of dirs) {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = "folder-entry";
+          row.innerHTML = `<span class="folder-ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span><span class="folder-entry-name"></span>`;
+          row.querySelector(".folder-entry-name").textContent = d.name;
+          row.onclick = () => browseFolder(d.path);
+          list.appendChild(row);
+        }
+      }
+    }
+  } catch (err) {
+    if (errEl) errEl.textContent = String(err);
+  }
+}
+
+async function pickNativeFolder() {
+  const errEl = document.getElementById("folder-error");
+  const btn = document.getElementById("folder-os-btn");
+  if (btn) btn.disabled = true;
+  if (errEl) errEl.textContent = "Opening system folder dialog...";
+  try {
+    const res = await fetch("/api/pick-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initial_dir: folderBrowserPath || getActiveProjectWorkspace() || "" }),
+    });
+    const data = await res.json();
+    if (data && data.ok && data.path) {
+      applySelectedProjectFolder(data.path);
+      closeFolderModal();
+      return;
+    }
+    if (data && data.cancelled) {
+      if (errEl) errEl.textContent = "";
+    } else {
+      if (errEl) errEl.textContent = (data && data.error) || "System dialog unavailable; pick a folder below.";
+    }
+  } catch (err) {
+    if (errEl) errEl.textContent = String(err);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function toggleFolderMkdir() {
+  const row = document.getElementById("folder-mkdir-row");
+  const inp = document.getElementById("folder-mkdir-name");
+  if (!row) return;
+  const show = row.style.display === "none";
+  row.style.display = show ? "flex" : "none";
+  if (show && inp) {
+    inp.value = "";
+    inp.focus();
+  }
+}
+
+async function submitFolderMkdir() {
+  const inp = document.getElementById("folder-mkdir-name");
+  const errEl = document.getElementById("folder-error");
+  const name = inp ? inp.value.trim() : "";
+  if (!name || !folderBrowserPath) return;
+  try {
+    const res = await fetch("/api/fs/mkdir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ parent: folderBrowserPath, name }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      if (errEl) errEl.textContent = data.error || "Could not create folder";
+      return;
+    }
+    document.getElementById("folder-mkdir-row").style.display = "none";
+    await browseFolder(data.path);
+  } catch (err) {
+    if (errEl) errEl.textContent = String(err);
+  }
+}
+
+function applySelectedProjectFolder(pathStr) {
+  const p = String(pathStr || "").trim();
+  if (!p) return;
+  selectedProjectDir = p;
+  if (currentProjectId) currentProjectWorkspace = p;
+  uploadNotice = "";
+  renderComposerBar();
+  refreshProjectBarIndicators();
+}
+
+async function confirmFolderSelection() {
+  const pathInp = document.getElementById("folder-path-input");
+  const raw = (pathInp ? pathInp.value.trim() : "") || folderBrowserPath;
+  const errEl = document.getElementById("folder-error");
+  if (!raw) {
+    if (errEl) errEl.textContent = "Please choose or enter a folder path.";
+    return;
+  }
+  const res = await fetch("/api/fs/list?path=" + encodeURIComponent(raw));
+  const data = await res.json();
+  if (!res.ok || data.error || !data.path) {
+    if (errEl) errEl.textContent = (data && data.error) || "Folder does not exist.";
+    return;
+  }
+  applySelectedProjectFolder(data.path);
+  closeFolderModal();
+  const inp = document.getElementById("input");
+  if (inp) inp.focus();
 }
 
 let audioCtx = null;
@@ -5763,6 +8572,13 @@ let appSettings = {
   tts_model: "lfm3-audio:2b",
   tts_voice: "",
   tts_auto: false,
+  project_workers: 1,
+  project_num_ctx: MAX_CTX,
+  project_orchestrator_model: "",
+  project_worker_model: "",
+  project_worker_pool: [],
+  project_max_review_cycles: 1,
+  show_prompt_chips: true,
 };
 
 function playDoneChime(force = false, soundName = appSettings.sound) {
@@ -5798,8 +8614,835 @@ function playDoneChime(force = false, soundName = appSettings.sound) {
   } catch (_) {}
 }
 
-async function sendMsg() {
-  if (busy) return;
+function createProjectTurnView(opts) {
+  const col = document.getElementById("chat-col");
+  const row = document.createElement("div");
+  row.className = "msg-row assistant proj-turn-row";
+  const orchModel = opts.orchModel || currentModel;
+  const pal = getModelPalette(orchModel);
+  row.style.setProperty("--msg-accent", pal[2]);
+
+  const wsDir = opts.workspaceDir || "";
+  const wsBase = wsDir ? (wsDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || wsDir) : "workspace";
+  row.innerHTML = `
+    <div class="asst-head">
+      <div class="proj-cube-slot" title="Cube"></div>
+      <span class="asst-name"></span>
+      <span class="proj-badge">Orchestrator</span>
+      <span class="proj-ws-tag"></span>
+      <span class="proj-status-pill">Planning...</span>
+      <span class="asst-time"></span>
+    </div>
+    <div class="proj-shell">
+      <details class="proj-card proj-plan-card" open>
+        <summary>${SVG_TRIANGLE}<span class="proj-card-title">Implementation Plan</span><span class="proj-card-meta">0 tasks</span></summary>
+        <div class="proj-card-body">
+          <div class="pw-plan-steps steps-wrap" style="display:none;"></div>
+          <div class="proj-plan-stream prose" style="display:none;"></div>
+          <div class="proj-understanding"></div>
+          <ul class="proj-task-list"></ul>
+          <div class="proj-plan-md prose"></div>
+        </div>
+      </details>
+      <details class="proj-card proj-walk-card">
+        <summary>
+          ${SVG_TRIANGLE}
+          <span class="proj-card-title">Walkthrough</span>
+          <span class="proj-card-meta">waiting...</span>
+          <span class="proj-art-links"></span>
+        </summary>
+        <div class="proj-card-body">
+          <div class="proj-walk-md prose">(Walkthrough updates as each piece completes.)</div>
+        </div>
+      </details>
+      <div class="proj-timeline"></div>
+    </div>
+    <div class="proj-loader css-loader" style="display:none;">
+      <span class="ring-spin"></span>
+      <div class="bars"><span></span><span></span><span></span><span></span><span></span></div>
+      <span class="loader-sec">Planning... 0.0s</span>
+    </div>
+  `;
+  const cubeSlot = row.querySelector(".proj-cube-slot");
+  if (cubeSlot) cubeSlot.dataset.orchModel = orchModel;
+  row.querySelector(".asst-name").textContent = orchModel;
+  const wsEl = row.querySelector(".proj-ws-tag");
+  wsEl.textContent = wsBase;
+  wsEl.title = wsDir;
+  if (opts.elapsed) {
+    row.querySelector(".asst-time").textContent = `· ${Number(opts.elapsed).toFixed(1)}s`;
+  }
+  col.appendChild(row);
+  if (appMode === "project" && typeof syncMascotDockPosition === "function") {
+    syncMascotDockPosition(false);
+  }
+
+  const statusPill = row.querySelector(".proj-status-pill");
+  const planCard = row.querySelector(".proj-plan-card");
+  const planMeta = planCard.querySelector(".proj-card-meta");
+  const planStepsWrap = planCard.querySelector(".pw-plan-steps");
+  const planStreamEl = planCard.querySelector(".proj-plan-stream");
+  const understandingEl = planCard.querySelector(".proj-understanding");
+  const taskListEl = planCard.querySelector(".proj-task-list");
+  const planMdEl = planCard.querySelector(".proj-plan-md");
+  const walkCard = row.querySelector(".proj-walk-card");
+  const walkMeta = walkCard.querySelector(".proj-card-meta");
+  const walkLinks = walkCard.querySelector(".proj-art-links");
+  const walkMdEl = walkCard.querySelector(".proj-walk-md");
+  const timeline = row.querySelector(".proj-timeline");
+  const loaderEl = row.querySelector(".proj-loader");
+  const loaderSec = loaderEl.querySelector(".loader-sec");
+
+  let projectId = opts.projectId || "";
+  let tasksState = [];
+  const workerNodes = new Map();
+  const reviewNodes = new Map();
+  let finalDone = false;
+  let planThinkBox = null;
+  let planStreamBuf = "";
+
+  function appendPlanThinking(txt) {
+    if (!planStepsWrap || !txt) return;
+    planStepsWrap.style.display = "";
+    if (!planThinkBox) {
+      planThinkBox = buildThinkingBox("", orchModel);
+      planStepsWrap.appendChild(planThinkBox);
+    }
+    const tb = planThinkBox.querySelector(".think-body");
+    tb.textContent += txt;
+    tb.scrollTop = tb.scrollHeight;
+    planThinkBox.querySelector(".think-label").textContent = `Thinking (${tb.textContent.length} chars)`;
+  }
+
+  function appendPlanDelta(txt) {
+    if (!planStreamEl || !txt) return;
+    planStreamBuf += txt;
+    planStreamEl.style.display = "block";
+    planStreamEl.innerHTML = renderStreamingMarkdown(planStreamBuf);
+  }
+
+  function renderTaskChecklist() {
+    taskListEl.innerHTML = "";
+    let doneCnt = 0;
+    for (const t of tasksState) {
+      if (t.status === "done") doneCnt++;
+      const li = document.createElement("li");
+      li.className = "proj-task-item is-" + (t.status || "pending");
+      const mName = t.model || opts.workerModel || orchModel;
+      const mPal = getModelPalette(mName);
+      li.innerHTML = `
+        <span class="proj-task-dot"></span>
+        <span class="proj-task-id"></span>
+        <span class="proj-task-title"></span>
+        <span class="proj-task-wave"></span>
+        <span class="proj-task-model"><span class="opt-dot" style="background:${mPal[2]};"></span><span class="ptm-name"></span></span>
+      `;
+      li.querySelector(".proj-task-id").textContent = t.id || "";
+      li.querySelector(".proj-task-title").textContent = t.title || "";
+      li.querySelector(".proj-task-wave").textContent = `W${t.wave || 1}`;
+      li.querySelector(".ptm-name").textContent = mName;
+      taskListEl.appendChild(li);
+    }
+    planMeta.textContent = tasksState.length ? `${doneCnt}/${tasksState.length} done` : "0 tasks";
+  }
+
+  function updateArtifactLinks(pid) {
+    if (pid) projectId = pid;
+    if (!projectId || walkLinks.children.length) return;
+    const mkLink = (fname, label) => {
+      const a = document.createElement("a");
+      a.className = "proj-art-btn";
+      a.href = `/api/projects/${encodeURIComponent(projectId)}/artifacts/${fname}`;
+      a.download = fname;
+      a.textContent = label;
+      a.onclick = (e) => e.stopPropagation();
+      return a;
+    };
+    walkLinks.appendChild(mkLink("implementation_plan.md", "plan.md"));
+    walkLinks.appendChild(mkLink("walkthrough.md", "walkthrough.md"));
+  }
+  if (projectId) updateArtifactLinks(projectId);
+
+  function setStatus(status, labelText) {
+    const clean = String(status || "running").toLowerCase();
+    statusPill.className = "proj-status-pill is-" + clean;
+    statusPill.textContent = labelText || status || "Working";
+  }
+
+  function setPlan(ev) {
+    if (ev.project_id) updateArtifactLinks(ev.project_id);
+    if (planStreamEl) {
+      planStreamEl.style.display = "none";
+      planStreamEl.innerHTML = "";
+    }
+    if (ev.understanding) {
+      understandingEl.innerHTML = renderMarkdown(ev.understanding);
+      understandingEl.style.display = "block";
+    }
+    if (ev.plan_md) planMdEl.innerHTML = renderMarkdown(ev.plan_md);
+    if (Array.isArray(ev.tasks)) {
+      tasksState = ev.tasks.map(t => ({ ...t }));
+      renderTaskChecklist();
+    }
+  }
+
+  function setWalkthrough(mdText, doneCnt, totalCnt) {
+    if (mdText) walkMdEl.innerHTML = renderMarkdown(mdText);
+    if (totalCnt !== undefined) walkMeta.textContent = `${doneCnt || 0}/${totalCnt} tasks logged`;
+    else if (mdText) walkMeta.textContent = "updated";
+  }
+
+  function markTaskStatus(taskId, status, modelUsed) {
+    const found = tasksState.find(t => t.id === taskId);
+    if (found) {
+      found.status = status;
+      if (modelUsed) found.model = modelUsed;
+      renderTaskChecklist();
+    }
+  }
+
+  function upsertTasks(newTasks) {
+    if (!Array.isArray(newTasks)) return;
+    for (const nt of newTasks) {
+      if (!tasksState.some(t => t.id === nt.id)) tasksState.push({ ...nt });
+    }
+    renderTaskChecklist();
+  }
+
+  function ensureWorkerCard(info) {
+    const key = info.run_key || info.task_id;
+    let rec = workerNodes.get(key);
+    if (!rec) {
+      const mName = info.model || opts.workerModel || orchModel;
+      const mPal = getModelPalette(mName);
+      const det = document.createElement("details");
+      det.className = "proj-worker-card";
+      det.open = !!opts.live;
+      det.style.setProperty("--worker-accent", mPal[2]);
+      det.innerHTML = `
+        <summary>
+          ${SVG_TRIANGLE}
+          <span class="pw-id"></span>
+          <span class="pw-title"></span>
+          <span class="pw-lane" style="display:none;"></span>
+          <span class="pw-model"><span class="opt-dot" style="background:${mPal[2]};"></span><span class="pw-model-name"></span></span>
+          <span class="pw-ctx"></span>
+          <span class="pw-time"></span>
+        </summary>
+        <div class="proj-worker-body">
+          <div class="pw-steps steps-wrap"></div>
+          <div class="pw-report prose"></div>
+        </div>
+      `;
+      const tri = det.querySelector(".tri-svg");
+      if (tri) {
+        tri.style.color = mPal[2];
+        if (opts.live && info.status !== "done" && info.status !== "error") tri.classList.add("running");
+      }
+      det.querySelector(".pw-id").textContent = info.task_id || "Task";
+      det.querySelector(".pw-title").textContent = info.title || "";
+      det.querySelector(".pw-model-name").textContent = mName;
+      if (info.lane && (Number(info.workers_total) > 1 || Number(opts.workersCount) > 1)) {
+        const laneEl = det.querySelector(".pw-lane");
+        laneEl.textContent = `Lane ${info.lane}`;
+        laneEl.style.display = "inline-flex";
+      }
+      timeline.appendChild(det);
+      rec = {
+        det,
+        tri,
+        ctxEl: det.querySelector(".pw-ctx"),
+        timeEl: det.querySelector(".pw-time"),
+        stepsWrap: det.querySelector(".pw-steps"),
+        reportEl: det.querySelector(".pw-report"),
+        thinkBox: null,
+        toolCards: {},
+        modelName: mName,
+        reportBuf: "",
+      };
+      workerNodes.set(key, rec);
+    }
+    return rec;
+  }
+
+  function applyWorkerToolStart(rec, ev) {
+    const card = buildToolCard({ id: ev.tool_id || ev.id, name: ev.name, args: ev.args || {} }, true, rec.modelName);
+    rec.toolCards[ev.tool_id || ev.id] = card;
+    rec.stepsWrap.appendChild(card);
+  }
+
+  function applyWorkerToolEnd(rec, ev) {
+    const card = rec.toolCards[ev.tool_id || ev.id];
+    const mPal = getModelPalette(rec.modelName);
+    if (card) {
+      const tri = card.querySelector(".tri-svg");
+      if (tri) { tri.classList.remove("running"); tri.style.color = mPal[2]; }
+      card.querySelector(".tool-out").textContent = ev.result || "(no output)";
+    } else {
+      rec.stepsWrap.appendChild(buildToolCard({ name: ev.name, args: ev.args || {}, result: ev.result }, false, rec.modelName));
+    }
+  }
+
+  function finishWorkerCard(rec, info) {
+    if (rec.tri) rec.tri.classList.remove("running");
+    if (info.elapsed !== undefined) rec.timeEl.textContent = `${Number(info.elapsed).toFixed(1)}s`;
+    if (info.tokens) {
+      const u = info.tokens.used || 0;
+      const mx = info.tokens.max || MAX_CTX;
+      const cmp = info.compactions ? ` · cmp×${info.compactions}` : "";
+      rec.ctxEl.textContent = `ctx ${fmtTok(u)}/${fmtTok(mx)}${cmp}`;
+    }
+    const rep = info.reply !== undefined ? info.reply : rec.reportBuf;
+    if (rep) rec.reportEl.innerHTML = renderMarkdown(rep);
+  }
+
+  function ensureReviewCard(cycle) {
+    const key = Number(cycle) || 1;
+    let rec = reviewNodes.get(key);
+    if (!rec) {
+      const det = document.createElement("details");
+      det.className = "proj-review-card";
+      det.open = true;
+      det.innerHTML = `
+        <summary>
+          ${SVG_TRIANGLE}
+          <span class="pr-title">Orchestrator Review #${key}</span>
+          <span class="pw-model"><span class="opt-dot" style="background:${pal[2]};"></span><span class="pr-model"></span></span>
+          <span class="pr-verdict is-running">Inspecting...</span>
+          <span class="pw-time"></span>
+        </summary>
+        <div class="proj-worker-body">
+          <div class="pw-steps steps-wrap"></div>
+          <div class="pr-summary prose"></div>
+        </div>
+      `;
+      const tri = det.querySelector(".tri-svg");
+      if (tri) {
+        tri.style.color = pal[2];
+        if (opts.live) tri.classList.add("running");
+      }
+      det.querySelector(".pr-model").textContent = orchModel;
+      timeline.appendChild(det);
+      rec = {
+        det,
+        tri,
+        verdictEl: det.querySelector(".pr-verdict"),
+        timeEl: det.querySelector(".pw-time"),
+        stepsWrap: det.querySelector(".pw-steps"),
+        summaryEl: det.querySelector(".pr-summary"),
+        summaryBuf: "",
+        thinkBox: null,
+        toolCards: {},
+      };
+      reviewNodes.set(key, rec);
+    }
+    return rec;
+  }
+
+  function appendReviewDelta(cycle, txt) {
+    const rRec = ensureReviewCard(cycle);
+    rRec.summaryBuf += txt || "";
+    rRec.summaryEl.innerHTML = renderStreamingMarkdown(rRec.summaryBuf);
+  }
+
+  function finishProjectTurn(data) {
+    if (finalDone) return;
+    finalDone = true;
+    if (loaderEl.isConnected) loaderEl.remove();
+    const st = data.status || "complete";
+    const stLbl = st === "complete" ? "Completed" : (st === "stopped" ? "Stopped" : (st === "error" ? "Error" : "Paused"));
+    setStatus(st, stLbl);
+    if (data.elapsed !== undefined) row.querySelector(".asst-time").textContent = `· ${Number(data.elapsed).toFixed(1)}s`;
+    if (data.walkthrough_md) setWalkthrough(data.walkthrough_md);
+    if (data.plan_md) planMdEl.innerHTML = renderMarkdown(data.plan_md);
+
+    const prose = document.createElement("div");
+    prose.className = "prose";
+    const finalText = data.reply || "(project finished)";
+    prose.innerHTML = renderMarkdown(finalText);
+    row.appendChild(prose);
+
+    if (Array.isArray(data.outputs) && data.outputs.length) {
+      row.appendChild(buildOutputsRow(data.outputs, {
+        projectMode: true,
+        workspaceDir: data.workspace_dir || opts.workspaceDir || currentProjectWorkspace || "",
+      }));
+    }
+    row.appendChild(buildMsgActions(finalText));
+  }
+
+  return {
+    row, loaderEl, loaderSec,
+    setStatus, appendPlanThinking, appendPlanDelta, setPlan, setWalkthrough, markTaskStatus, upsertTasks,
+    ensureWorkerCard, applyWorkerToolStart, applyWorkerToolEnd, finishWorkerCard,
+    ensureReviewCard, appendReviewDelta, finishProjectTurn, updateArtifactLinks,
+  };
+}
+
+function renderProjectTurn(m) {
+  const view = createProjectTurnView({
+    projectId: currentProjectId,
+    orchModel: m.orchestrator_model || currentModel,
+    workerModel: m.worker_model || m.orchestrator_model || currentModel,
+    workersCount: m.workers_count || 1,
+    workspaceDir: m.workspace_dir || "",
+    elapsed: m.elapsed,
+    live: false,
+  });
+  setEmptyState(false);
+  view.setPlan({
+    project_id: currentProjectId,
+    understanding: m.understanding || "",
+    plan_md: m.plan_md || "",
+    tasks: m.tasks || [],
+  });
+  for (const r of (m.worker_runs || [])) {
+    const rec = view.ensureWorkerCard(r);
+    if (r.thinking) {
+      rec.thinkBox = buildThinkingBox(r.thinking, rec.modelName);
+      rec.thinkBox.querySelector(".think-label").textContent = `Thinking (${r.thinking.length} chars)`;
+      rec.stepsWrap.appendChild(rec.thinkBox);
+    }
+    for (const t of (r.tools || [])) {
+      rec.stepsWrap.appendChild(buildToolCard(t, false, rec.modelName));
+    }
+    view.finishWorkerCard(rec, r);
+    rec.det.open = false;
+  }
+  for (const rv of (m.reviews || [])) {
+    const rRec = view.ensureReviewCard(rv.cycle || 1);
+    if (rRec.tri) rRec.tri.classList.remove("running");
+    if (rv.thinking) {
+      rRec.thinkBox = buildThinkingBox(rv.thinking, m.orchestrator_model || currentModel);
+      rRec.stepsWrap.appendChild(rRec.thinkBox);
+    }
+    for (const t of (rv.tools || [])) {
+      rRec.stepsWrap.appendChild(buildToolCard(t, false, m.orchestrator_model || currentModel));
+    }
+    const verdict = (rv.status || "COMPLETE").toUpperCase();
+    rRec.verdictEl.textContent = verdict === "COMPLETE" ? "PASS" : "NEEDS FIX";
+    rRec.verdictEl.className = "pr-verdict " + (verdict === "COMPLETE" ? "is-pass" : "is-fix");
+    if (rv.elapsed !== undefined) rRec.timeEl.textContent = `${Number(rv.elapsed).toFixed(1)}s`;
+    rRec.summaryEl.innerHTML = renderMarkdown(rv.summary || "");
+    rRec.det.open = false;
+  }
+  view.finishProjectTurn({
+    status: m.status || "complete",
+    reply: m.text || "(project finished)",
+    walkthrough_md: m.walkthrough_md || "",
+    plan_md: m.plan_md || "",
+    outputs: m.outputs || [],
+    elapsed: m.elapsed,
+  });
+  scrollBottom();
+  return view.row;
+}
+
+const activeRuns = new Map();
+let runSeq = 0;
+let currentViewToken = 1;
+
+function getViewedActiveRun(mode = appMode) {
+  for (const run of activeRuns.values()) {
+    if (run.done || run.mode !== mode) continue;
+    if (run.viewToken === currentViewToken) return run;
+    if (run.sessionId && (mode === "project" ? currentProjectId === run.sessionId : currentChatId === run.sessionId)) {
+      return run;
+    }
+  }
+  return null;
+}
+
+function findActiveRun(mode, sessionId) {
+  if (!sessionId) return null;
+  for (const run of activeRuns.values()) {
+    if (!run.done && run.mode === mode && run.sessionId === sessionId) return run;
+  }
+  return null;
+}
+
+function isSessionWorking(mode, sessionId) {
+  return Boolean(findActiveRun(mode, sessionId));
+}
+
+function hasBackgroundWorking(mode) {
+  const viewed = getViewedActiveRun(mode);
+  for (const run of activeRuns.values()) {
+    if (run.done || run.mode !== mode) continue;
+    if (appMode !== mode || run !== viewed) return true;
+  }
+  return false;
+}
+
+function syncWorkingIndicators() {
+  const chatDot = document.getElementById("mode-dot-chat");
+  const projDot = document.getElementById("mode-dot-project");
+  if (chatDot) chatDot.classList.toggle("show", hasBackgroundWorking("chat"));
+  if (projDot) projDot.classList.toggle("show", hasBackgroundWorking("project"));
+  for (const item of document.querySelectorAll("#chat-list .chat-item")) {
+    const sid = item.dataset ? item.dataset.sessionId : "";
+    const smode = item.dataset ? item.dataset.sessionMode : "";
+    item.classList.toggle("is-working", Boolean(sid && smode && isSessionWorking(smode, sid)));
+  }
+}
+
+function syncBusyUI() {
+  const viewed = getViewedActiveRun();
+  busy = Boolean(viewed);
+  currentAbort = viewed ? viewed.abortCtrl : null;
+  setSendBtnState(busy);
+  syncCubeState();
+  syncWorkingIndicators();
+}
+
+function abortRunBySession(mode, sessionId) {
+  const run = findActiveRun(mode, sessionId);
+  if (!run) return;
+  run.done = true;
+  activeRuns.delete(run.runId);
+  try { if (run.abortCtrl) run.abortCtrl.abort(); } catch (_) {}
+  syncBusyUI();
+}
+
+function applyProjectRunEvent(run, ev, onLive) {
+  const st = run.projectState;
+  const live = () => (run.viewToken === currentViewToken && run.liveView && run.liveView.row.isConnected) ? run.liveView : null;
+
+  if (ev.project_id) run.sessionId = ev.project_id;
+  if (ev.workspace_dir) st.workspaceDir = ev.workspace_dir;
+
+  if (ev.type === "project_phase") {
+    st.phase = ev.phase || "running";
+    st.phaseLabel = ev.label || ev.phase || "Working";
+    const lv = live();
+    if (lv) {
+      lv.loaderSec.textContent = `${st.phaseLabel}... ${((performance.now() - run.tStart) / 1000).toFixed(1)}s`;
+      lv.setStatus(st.phase, st.phaseLabel);
+      if (ev.project_id) {
+        currentProjectId = ev.project_id;
+        currentProjectWorkspace = st.workspaceDir;
+        lv.updateArtifactLinks(ev.project_id);
+        refreshProjectBarIndicators();
+      }
+      scrollFollow(lv.row);
+    }
+    if (ev.project_id && onLive) onLive("list");
+  } else if (ev.type === "title") {
+    const lv = live();
+    if (lv) {
+      currentProjectId = ev.project_id;
+      currentProjectWorkspace = st.workspaceDir;
+      lv.updateArtifactLinks(ev.project_id);
+      refreshProjectBarIndicators();
+    }
+    if (onLive) onLive("list");
+  } else if (ev.type === "plan_thinking_delta") {
+    st.planThinkBuf += ev.text || "";
+    const lv = live();
+    if (lv) { lv.appendPlanThinking(ev.text || ""); scrollFollow(lv.row); }
+  } else if (ev.type === "plan_delta") {
+    st.planStreamBuf += ev.text || "";
+    const lv = live();
+    if (lv) { lv.appendPlanDelta(ev.text || ""); scrollFollow(lv.row); }
+  } else if (ev.type === "project_plan") {
+    st.planEvent = ev;
+    if (Array.isArray(ev.tasks)) st.tasks = ev.tasks.map(t => ({ ...t }));
+    const lv = live();
+    if (lv) { lv.setPlan(ev); scrollFollow(lv.row); }
+  } else if (ev.type === "project_tasks_added") {
+    if (Array.isArray(ev.tasks)) {
+      for (const nt of ev.tasks) {
+        if (!st.tasks.some(t => t.id === nt.id)) st.tasks.push({ ...nt });
+      }
+    }
+    const lv = live();
+    if (lv) { lv.upsertTasks(ev.tasks || []); scrollFollow(lv.row); }
+  } else if (ev.type === "project_walkthrough") {
+    st.walkthrough_md = ev.walkthrough_md || "";
+    st.walkthrough_done = ev.done_count;
+    st.walkthrough_total = ev.total_count;
+    const lv = live();
+    if (lv) { lv.setWalkthrough(st.walkthrough_md, st.walkthrough_done, st.walkthrough_total); scrollFollow(lv.row); }
+  } else if (ev.type === "worker_start") {
+    const found = st.tasks.find(t => t.id === ev.task_id);
+    if (found) { found.status = "running"; if (ev.model) found.model = ev.model; }
+    const key = ev.run_key || ev.task_id;
+    if (!st.workerMap.has(key)) {
+      const w = { ...ev, status: "running", thinking: "", tools: [], compactions: 0, reportBuf: "", doneInfo: null };
+      st.workerMap.set(key, w);
+      st.workerOrder.push(w);
+    }
+    const lv = live();
+    if (lv) {
+      lv.markTaskStatus(ev.task_id, "running", ev.model);
+      lv.ensureWorkerCard(ev);
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "worker_thinking_delta") {
+    const key = ev.run_key || ev.task_id;
+    const w = st.workerMap.get(key);
+    if (w) w.thinking += ev.text || "";
+    const lv = live();
+    if (lv) {
+      const rec = lv.ensureWorkerCard(ev);
+      if (!rec.thinkBox) {
+        rec.thinkBox = buildThinkingBox("", rec.modelName);
+        rec.stepsWrap.prepend(rec.thinkBox);
+      }
+      const tb = rec.thinkBox.querySelector(".think-body");
+      tb.textContent += ev.text || "";
+      tb.scrollTop = tb.scrollHeight;
+      rec.thinkBox.querySelector(".think-label").textContent = `Thinking (${tb.textContent.length} chars)`;
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "worker_tool_start") {
+    const key = ev.run_key || ev.task_id;
+    const w = st.workerMap.get(key);
+    if (w) w.tools.push({ id: ev.tool_id || ev.id, name: ev.name, args: ev.args || {}, result: null, done: false });
+    const lv = live();
+    if (lv) {
+      const rec = lv.ensureWorkerCard(ev);
+      lv.applyWorkerToolStart(rec, ev);
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "worker_tool_end") {
+    const key = ev.run_key || ev.task_id;
+    const w = st.workerMap.get(key);
+    if (w) {
+      const t = w.tools.find(x => x.id === (ev.tool_id || ev.id));
+      if (t) { t.result = ev.result || "(no output)"; t.done = true; }
+      else w.tools.push({ id: ev.tool_id || ev.id, name: ev.name, args: ev.args || {}, result: ev.result || "(no output)", done: true });
+    }
+    const lv = live();
+    if (lv) {
+      const rec = lv.ensureWorkerCard(ev);
+      lv.applyWorkerToolEnd(rec, ev);
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "worker_compacted") {
+    const key = ev.run_key || ev.task_id;
+    const w = st.workerMap.get(key);
+    if (w) w.compactions = ev.compactions || 1;
+    const lv = live();
+    if (lv) {
+      const rec = lv.ensureWorkerCard(ev);
+      rec.ctxEl.textContent = `compacted ×${ev.compactions || 1}`;
+    }
+  } else if (ev.type === "worker_reply_delta") {
+    const key = ev.run_key || ev.task_id;
+    const w = st.workerMap.get(key);
+    if (w) w.reportBuf += ev.text || "";
+    const lv = live();
+    if (lv) {
+      const rec = lv.ensureWorkerCard(ev);
+      rec.reportBuf += ev.text || "";
+      rec.reportEl.innerHTML = renderStreamingMarkdown(rec.reportBuf);
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "worker_done") {
+    const stVal = ev.status === "error" ? "error" : "done";
+    const found = st.tasks.find(t => t.id === ev.task_id);
+    if (found) { found.status = stVal; if (ev.model) found.model = ev.model; }
+    const key = ev.run_key || ev.task_id;
+    const w = st.workerMap.get(key);
+    if (w) { w.status = stVal; w.doneInfo = ev; }
+    const lv = live();
+    if (lv) {
+      const rec = lv.ensureWorkerCard(ev);
+      lv.markTaskStatus(ev.task_id, stVal, ev.model);
+      lv.finishWorkerCard(rec, ev);
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "review_start") {
+    const cyc = Number(ev.cycle) || 1;
+    st.phase = "reviewing";
+    st.phaseLabel = `Orchestrator review #${cyc}`;
+    if (!st.reviewMap.has(cyc)) {
+      const rv = { cycle: cyc, thinking: "", tools: [], summaryBuf: "", doneEv: null };
+      st.reviewMap.set(cyc, rv);
+      st.reviewOrder.push(rv);
+    }
+    const lv = live();
+    if (lv) {
+      lv.setStatus("reviewing", st.phaseLabel);
+      lv.ensureReviewCard(cyc);
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "review_thinking_delta") {
+    const cyc = Number(ev.cycle) || 1;
+    let rv = st.reviewMap.get(cyc);
+    if (!rv) { rv = { cycle: cyc, thinking: "", tools: [], summaryBuf: "", doneEv: null }; st.reviewMap.set(cyc, rv); st.reviewOrder.push(rv); }
+    rv.thinking += ev.text || "";
+    const lv = live();
+    if (lv) {
+      const rRec = lv.ensureReviewCard(cyc);
+      if (!rRec.thinkBox) {
+        rRec.thinkBox = buildThinkingBox("", st.orchModel);
+        rRec.stepsWrap.prepend(rRec.thinkBox);
+      }
+      const tb = rRec.thinkBox.querySelector(".think-body");
+      tb.textContent += ev.text || "";
+      tb.scrollTop = tb.scrollHeight;
+      rRec.thinkBox.querySelector(".think-label").textContent = `Thinking (${tb.textContent.length} chars)`;
+    }
+  } else if (ev.type === "review_reply_delta") {
+    const cyc = Number(ev.cycle) || 1;
+    let rv = st.reviewMap.get(cyc);
+    if (!rv) { rv = { cycle: cyc, thinking: "", tools: [], summaryBuf: "", doneEv: null }; st.reviewMap.set(cyc, rv); st.reviewOrder.push(rv); }
+    rv.summaryBuf += ev.text || "";
+    const lv = live();
+    if (lv) { lv.appendReviewDelta(cyc, ev.text || ""); scrollFollow(lv.row); }
+  } else if (ev.type === "review_tool_start") {
+    const cyc = Number(ev.cycle) || 1;
+    let rv = st.reviewMap.get(cyc);
+    if (!rv) { rv = { cycle: cyc, thinking: "", tools: [], summaryBuf: "", doneEv: null }; st.reviewMap.set(cyc, rv); st.reviewOrder.push(rv); }
+    rv.tools.push({ id: ev.tool_id, name: ev.name, args: ev.args || {}, result: null, done: false });
+    const lv = live();
+    if (lv) {
+      const rRec = lv.ensureReviewCard(cyc);
+      const card = buildToolCard({ id: ev.tool_id, name: ev.name, args: ev.args || {} }, true, st.orchModel);
+      rRec.toolCards[ev.tool_id] = card;
+      rRec.stepsWrap.appendChild(card);
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "review_tool_end") {
+    const cyc = Number(ev.cycle) || 1;
+    const rv = st.reviewMap.get(cyc);
+    if (rv) {
+      const t = rv.tools.find(x => x.id === ev.tool_id);
+      if (t) { t.result = ev.result || "(no output)"; t.done = true; }
+      else rv.tools.push({ id: ev.tool_id, name: ev.name, args: ev.args || {}, result: ev.result || "(no output)", done: true });
+    }
+    const lv = live();
+    if (lv) {
+      const rRec = lv.ensureReviewCard(cyc);
+      const card = rRec.toolCards[ev.tool_id];
+      const oPal = getModelPalette(st.orchModel);
+      if (card) {
+        const tri = card.querySelector(".tri-svg");
+        if (tri) { tri.classList.remove("running"); tri.style.color = oPal[2]; }
+        card.querySelector(".tool-out").textContent = ev.result || "(no output)";
+      }
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "review_done") {
+    const cyc = Number(ev.cycle) || 1;
+    let rv = st.reviewMap.get(cyc);
+    if (!rv) { rv = { cycle: cyc, thinking: "", tools: [], summaryBuf: "", doneEv: null }; st.reviewMap.set(cyc, rv); st.reviewOrder.push(rv); }
+    rv.doneEv = ev;
+    const lv = live();
+    if (lv) {
+      const rRec = lv.ensureReviewCard(cyc);
+      if (rRec.tri) rRec.tri.classList.remove("running");
+      const verdict = (ev.status || "COMPLETE").toUpperCase();
+      rRec.verdictEl.textContent = verdict === "COMPLETE" ? "PASS" : "NEEDS FIX";
+      rRec.verdictEl.className = "pr-verdict " + (verdict === "COMPLETE" ? "is-pass" : "is-fix");
+      if (ev.elapsed !== undefined) rRec.timeEl.textContent = `${Number(ev.elapsed).toFixed(1)}s`;
+      rRec.summaryEl.innerHTML = renderMarkdown(ev.summary || "");
+      scrollFollow(lv.row);
+    }
+  } else if (ev.type === "tokens" && ev.tokens) {
+    st.tokens = ev.tokens;
+    if (live()) updateCtxBadge(ev.tokens.used || 0, ev.tokens.max || MAX_CTX);
+  } else if (ev.type === "done") {
+    run.serverDone = true;
+    const lv = live();
+    if (lv) {
+      currentProjectId = ev.project_id;
+      currentProjectWorkspace = ev.workspace_dir || st.workspaceDir;
+      lv.updateArtifactLinks(ev.project_id);
+      if (ev.tokens) updateCtxBadge(ev.tokens.used || 0, ev.tokens.max || MAX_CTX);
+      lv.finishProjectTurn(ev);
+      refreshProjectBarIndicators();
+    }
+    playDoneChime();
+    if (onLive) onLive("list");
+  }
+}
+
+function mountLiveProjectRun(run) {
+  const st = run.projectState;
+  const view = createProjectTurnView({
+    projectId: run.sessionId,
+    orchModel: st.orchModel,
+    workerModel: st.workerModel,
+    workersCount: st.workersCount,
+    workspaceDir: st.workspaceDir,
+    live: true,
+  });
+  view.loaderEl.style.display = "inline-flex";
+  view.loaderSec.textContent = `${st.phaseLabel}... ${((performance.now() - run.tStart) / 1000).toFixed(1)}s`;
+  view.setStatus(st.phase, st.phaseLabel);
+  if (st.planThinkBuf) view.appendPlanThinking(st.planThinkBuf);
+  if (st.planEvent) view.setPlan(st.planEvent);
+  else if (st.planStreamBuf) view.appendPlanDelta(st.planStreamBuf);
+  if (st.walkthrough_md) view.setWalkthrough(st.walkthrough_md, st.walkthrough_done, st.walkthrough_total);
+  if (st.tokens) updateCtxBadge(st.tokens.used || 0, st.tokens.max || MAX_CTX);
+
+  for (const w of st.workerOrder) {
+    const rec = view.ensureWorkerCard(w);
+    if (w.thinking) {
+      rec.thinkBox = buildThinkingBox(w.thinking, rec.modelName);
+      rec.thinkBox.querySelector(".think-label").textContent = `Thinking (${w.thinking.length} chars)`;
+      rec.stepsWrap.prepend(rec.thinkBox);
+    }
+    for (const t of w.tools) {
+      if (t.done) view.applyWorkerToolEnd(rec, { ...t, tool_id: t.id });
+      else view.applyWorkerToolStart(rec, { ...t, tool_id: t.id });
+    }
+    if (w.compactions) rec.ctxEl.textContent = `compacted ×${w.compactions}`;
+    if (w.reportBuf) {
+      rec.reportBuf = w.reportBuf;
+      rec.reportEl.innerHTML = renderStreamingMarkdown(w.reportBuf);
+    }
+    if (w.doneInfo) {
+      view.markTaskStatus(w.task_id, w.status, w.model);
+      view.finishWorkerCard(rec, w.doneInfo);
+    } else {
+      view.markTaskStatus(w.task_id, "running", w.model);
+    }
+  }
+
+  for (const rv of st.reviewOrder) {
+    const rRec = view.ensureReviewCard(rv.cycle);
+    if (rv.thinking) {
+      rRec.thinkBox = buildThinkingBox(rv.thinking, st.orchModel);
+      rRec.thinkBox.querySelector(".think-label").textContent = `Thinking (${rv.thinking.length} chars)`;
+      rRec.stepsWrap.prepend(rRec.thinkBox);
+    }
+    for (const t of rv.tools) {
+      const card = buildToolCard({ id: t.id, name: t.name, args: t.args || {} }, !t.done, st.orchModel);
+      if (t.done) {
+        const tri = card.querySelector(".tri-svg");
+        const oPal = getModelPalette(st.orchModel);
+        if (tri) { tri.classList.remove("running"); tri.style.color = oPal[2]; }
+        card.querySelector(".tool-out").textContent = t.result || "(no output)";
+      }
+      rRec.toolCards[t.id] = card;
+      rRec.stepsWrap.appendChild(card);
+    }
+    if (rv.summaryBuf) {
+      rRec.summaryBuf = rv.summaryBuf;
+      rRec.summaryEl.innerHTML = renderStreamingMarkdown(rv.summaryBuf);
+    }
+    if (rv.doneEv) {
+      if (rRec.tri) rRec.tri.classList.remove("running");
+      const verdict = (rv.doneEv.status || "COMPLETE").toUpperCase();
+      rRec.verdictEl.textContent = verdict === "COMPLETE" ? "PASS" : "NEEDS FIX";
+      rRec.verdictEl.className = "pr-verdict " + (verdict === "COMPLETE" ? "is-pass" : "is-fix");
+      if (rv.doneEv.elapsed !== undefined) rRec.timeEl.textContent = `${Number(rv.doneEv.elapsed).toFixed(1)}s`;
+      rRec.summaryEl.innerHTML = renderMarkdown(rv.doneEv.summary || "");
+    }
+  }
+
+  run.viewToken = currentViewToken;
+  run.liveView = view;
+  activeStreamRow = view.row;
+  scrollBottom();
+}
+
+async function sendProjectMsg() {
+  if (getViewedActiveRun("project")) return;
   if (pendingFiles.some(f => f.uploading)) {
     setUploadNotice("Please wait for file upload to finish.");
     return;
@@ -5808,10 +9451,20 @@ async function sendMsg() {
   const text = input.value.trim();
   const attachedNames = pendingFiles.map(f => f.name);
   if (!text && !attachedNames.length) return;
-  if (activeStreamFlush) activeStreamFlush();
+
+  const wsDir = getActiveProjectWorkspace();
+  if (!wsDir) {
+    setUploadNotice("Pick a folder on your PC before starting this project.");
+    openFolderModal("Choose an existing folder on your PC where the AI should work.");
+    return;
+  }
+
   userScrolledAway = false;
-  const requestChatId = currentChatId || draftChatId;
+  const requestProjectId = currentProjectId || draftChatId;
   const enabledPacksList = getEnabledPacksList();
+  const activeOrch = getActiveOrchestratorModel();
+  const activeWorker = (appSettings.project_worker_model || activeOrch).trim() || activeOrch;
+  const workersCount = Math.max(1, Math.min(4, Number(appSettings.project_workers) || 1));
 
   unlockAudio();
   closePlusMenu();
@@ -5819,10 +9472,8 @@ async function sendMsg() {
   autoResize(input);
   pendingFiles = [];
   draftChatId = null;
+  uploadNotice = "";
   renderComposerBar();
-  busy = true;
-  currentAbort = new AbortController();
-  setSendBtnState(true);
 
   renderMessage({
     role: "user",
@@ -5830,7 +9481,145 @@ async function sendMsg() {
     attachments: attachedNames,
   });
 
-  const activeModel = currentModel;
+  const view = createProjectTurnView({
+    projectId: requestProjectId,
+    orchModel: activeOrch,
+    workerModel: activeWorker,
+    workersCount,
+    workspaceDir: wsDir,
+    live: true,
+  });
+  view.loaderEl.style.display = "inline-flex";
+  activeStreamRow = view.row;
+  scrollBottom();
+
+  const abortCtrl = new AbortController();
+  const tStart = performance.now();
+  const runId = "proj-run-" + (++runSeq);
+  const run = {
+    runId,
+    mode: "project",
+    sessionId: requestProjectId || "",
+    viewToken: currentViewToken,
+    abortCtrl,
+    done: false,
+    serverDone: false,
+    tStart,
+    liveView: view,
+    projectState: {
+      orchModel: activeOrch,
+      workerModel: activeWorker,
+      workersCount,
+      workspaceDir: wsDir,
+      phase: "planning",
+      phaseLabel: "Planning assignment",
+      planThinkBuf: "",
+      planStreamBuf: "",
+      planEvent: null,
+      tasks: [],
+      walkthrough_md: "",
+      walkthrough_done: undefined,
+      walkthrough_total: undefined,
+      workerMap: new Map(),
+      workerOrder: [],
+      reviewMap: new Map(),
+      reviewOrder: [],
+      tokens: null,
+    },
+  };
+  activeRuns.set(runId, run);
+  syncCubeLight(activeOrch);
+  syncBusyUI();
+
+  const secTimer = setInterval(() => {
+    if (run.viewToken === currentViewToken && run.liveView && run.liveView.loaderSec) {
+      const s = ((performance.now() - tStart) / 1000).toFixed(1);
+      run.liveView.loaderSec.textContent = `${run.projectState.phaseLabel}... ${s}s`;
+    }
+  }, 120);
+
+  const onLiveEvent = (kind) => {
+    syncWorkingIndicators();
+    if (kind === "list" && appMode === "project") loadHistoryList();
+  };
+
+  try {
+    const res = await fetch("/api/project", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_id: requestProjectId,
+        workspace_dir: wsDir,
+        model: currentModel,
+        orchestrator_model: activeOrch,
+        worker_model: activeWorker,
+        worker_pool: appSettings.project_worker_pool || [],
+        workers_count: workersCount,
+        num_ctx: Number(appSettings.project_num_ctx) || MAX_CTX,
+        max_review_cycles: (appSettings.project_max_review_cycles === undefined || appSettings.project_max_review_cycles === null)
+          ? 1
+          : Math.max(0, Number(appSettings.project_max_review_cycles) || 0),
+        message: text,
+        enabled_packs: enabledPacksList.length ? enabledPacksList : ["files", "system"],
+        attached_files: attachedNames,
+      }),
+      signal: abortCtrl.signal,
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.error || `HTTP ${res.status}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+
+      for (const ln of lines) {
+        if (!ln.trim()) continue;
+        applyProjectRunEvent(run, JSON.parse(ln), onLiveEvent);
+      }
+    }
+    if (!run.serverDone && run.viewToken === currentViewToken && run.liveView && run.liveView.row.isConnected) {
+      run.liveView.finishProjectTurn({ status: "complete", reply: "(project stream closed)", elapsed: (performance.now() - tStart) / 1000 });
+    }
+  } catch (err) {
+    clearInterval(secTimer);
+    if (run.viewToken === currentViewToken && run.liveView && run.liveView.row.isConnected) {
+      if (err && err.name === "AbortError") {
+        run.liveView.finishProjectTurn({
+          status: "stopped",
+          reply: "*(project stopped by user — partial plan, walkthrough, and files saved)*",
+          elapsed: (performance.now() - tStart) / 1000,
+        });
+      } else {
+        run.liveView.finishProjectTurn({
+          status: "error",
+          reply: "**Project Error:** `" + String(err) + "`",
+          elapsed: (performance.now() - tStart) / 1000,
+        });
+      }
+    }
+    if (err && err.name === "AbortError" && appMode === "project") setTimeout(loadHistoryList, 350);
+  } finally {
+    clearInterval(secTimer);
+    run.done = true;
+    activeRuns.delete(runId);
+    if (activeStreamRow === (run.liveView && run.liveView.row)) activeStreamRow = null;
+    syncBusyUI();
+    if (appMode === "project") loadHistoryList();
+    if (run.viewToken === currentViewToken) input.focus();
+  }
+}
+
+function createChatLiveRow(activeModel, tStart) {
   const pal = getModelPalette(activeModel);
   const col = document.getElementById("chat-col");
   const row = document.createElement("div");
@@ -5851,36 +9640,24 @@ async function sendMsg() {
   `;
   row.querySelector(".asst-name").textContent = activeModel;
   col.appendChild(row);
-  scrollBottom();
-
   const stepsWrap = row.querySelector(".steps-wrap");
   const loaderEl = row.querySelector(".css-loader");
   const loaderSec = row.querySelector(".loader-sec");
-
-  const tStart = performance.now();
   let loaderPhase = "Thinking";
   let workingHoldUntil = 0;
   let pendingPhaseTimer = null;
+
   function applyLoaderPhase(phase) {
-    if (phase === "loading") {
-      loaderEl.classList.add("is-loading");
-      loaderPhase = "Loading model";
-    } else if (phase === "working") {
-      loaderEl.classList.remove("is-loading");
-      loaderPhase = "Working";
-    } else {
-      loaderEl.classList.remove("is-loading");
-      loaderPhase = "Thinking";
-    }
+    if (phase === "loading") { loaderEl.classList.add("is-loading"); loaderPhase = "Loading model"; }
+    else if (phase === "working") { loaderEl.classList.remove("is-loading"); loaderPhase = "Working"; }
+    else { loaderEl.classList.remove("is-loading"); loaderPhase = "Thinking"; }
     const s = ((performance.now() - tStart) / 1000).toFixed(1);
     loaderSec.textContent = `${loaderPhase}... ${s}s`;
   }
   function setLoaderPhase(phase, minHoldMs = 0) {
     clearTimeout(pendingPhaseTimer);
     pendingPhaseTimer = null;
-    if (phase === "working" && minHoldMs > 0) {
-      workingHoldUntil = Math.max(workingHoldUntil, performance.now() + minHoldMs);
-    }
+    if (phase === "working" && minHoldMs > 0) workingHoldUntil = Math.max(workingHoldUntil, performance.now() + minHoldMs);
     if (phase === "thinking" && performance.now() < workingHoldUntil) {
       applyLoaderPhase("working");
       pendingPhaseTimer = setTimeout(() => {
@@ -5891,148 +9668,237 @@ async function sendMsg() {
     }
     applyLoaderPhase(phase);
   }
+  return { row, stepsWrap, loaderEl, loaderSec, pal, setLoaderPhase, getPhaseLabel: () => loaderPhase, clearTimers: () => clearTimeout(pendingPhaseTimer) };
+}
+
+function mountLiveChatRun(run) {
+  const cs = run.chatState;
+  const dom = createChatLiveRow(cs.model, run.tStart);
+  if (cs.phase) dom.setLoaderPhase(cs.phase);
+  let thinkBox = null;
+  if (cs.thinkBuf) {
+    thinkBox = buildThinkingBox(cs.thinkBuf, cs.model);
+    thinkBox.querySelector(".think-label").textContent = `Thinking (${cs.thinkBuf.length} chars)`;
+    dom.stepsWrap.prepend(thinkBox);
+  }
+  const toolCards = {};
+  for (const t of cs.toolsList) {
+    const card = buildToolCard(t, !t.done, cs.model);
+    toolCards[t.id] = card;
+    dom.stepsWrap.appendChild(card);
+  }
+  let liveProse = null;
+  function ensureLiveProse() {
+    if (liveProse && liveProse.isConnected) return liveProse;
+    liveProse = document.createElement("div");
+    liveProse.className = "prose";
+    if (dom.loaderEl.isConnected && dom.loaderEl.parentElement === dom.row) dom.row.insertBefore(liveProse, dom.loaderEl);
+    else dom.row.appendChild(liveProse);
+    return liveProse;
+  }
+  if (cs.streamTarget) {
+    const prose = ensureLiveProse();
+    if (dom.loaderEl.isConnected) dom.loaderEl.style.display = "none";
+    prose.innerHTML = renderStreamingMarkdown(cs.streamTarget);
+    appendStreamCursor(prose);
+  }
+  if (cs.tokens) updateCtxBadge(cs.tokens.used || 0, cs.tokens.max || MAX_CTX);
+
+  run.viewToken = currentViewToken;
+  run.liveChat = { dom, thinkBox, toolCards, ensureLiveProse, getLiveProse: () => liveProse, setLiveProse: (v) => { liveProse = v; } };
+  activeStreamRow = dom.row;
+  scrollBottom();
+}
+
+async function sendMsg() {
+  if (appMode === "project") return await sendProjectMsg();
+  if (getViewedActiveRun("chat")) return;
+  if (pendingFiles.some(f => f.uploading)) {
+    setUploadNotice("Please wait for file upload to finish.");
+    return;
+  }
+  const input = document.getElementById("input");
+  const text = input.value.trim();
+  const attachedNames = pendingFiles.map(f => f.name);
+  if (!text && !attachedNames.length) return;
+  if (activeStreamFlush) activeStreamFlush();
+  userScrolledAway = false;
+  const requestChatId = currentChatId || draftChatId;
+  const enabledPacksList = getEnabledPacksList();
+
+  unlockAudio();
+  closePlusMenu();
+  input.value = "";
+  autoResize(input);
+  pendingFiles = [];
+  draftChatId = null;
+  renderComposerBar();
+
+  renderMessage({
+    role: "user",
+    text: text || "(attached files)",
+    attachments: attachedNames,
+  });
+
+  const activeModel = currentModel;
+  const tStart = performance.now();
+  const dom = createChatLiveRow(activeModel, tStart);
+  scrollBottom();
+
+  const abortCtrl = new AbortController();
+  const runId = "chat-run-" + (++runSeq);
+  const cs = {
+    model: activeModel,
+    phase: "thinking",
+    thinkBuf: "",
+    toolsList: [],
+    turnOutputs: [],
+    streamTarget: "",
+    streamShown: 0,
+    streamFinalReply: null,
+    streamOutputs: [],
+    streamServerDone: false,
+    streamFinalized: false,
+    tokens: null,
+  };
+  const run = {
+    runId,
+    mode: "chat",
+    sessionId: requestChatId || "",
+    viewToken: currentViewToken,
+    abortCtrl,
+    done: false,
+    tStart,
+    chatState: cs,
+    liveChat: {
+      dom,
+      thinkBox: null,
+      toolCards: {},
+      liveProse: null,
+      ensureLiveProse() {
+        if (this.liveProse && this.liveProse.isConnected) return this.liveProse;
+        this.liveProse = document.createElement("div");
+        this.liveProse.className = "prose";
+        if (this.dom.loaderEl.isConnected && this.dom.loaderEl.parentElement === this.dom.row) this.dom.row.insertBefore(this.liveProse, this.dom.loaderEl);
+        else this.dom.row.appendChild(this.liveProse);
+        return this.liveProse;
+      },
+    },
+  };
+  activeRuns.set(runId, run);
+  activeStreamRow = dom.row;
+  syncBusyUI();
+
   const secTimer = setInterval(() => {
-    const s = ((performance.now() - tStart) / 1000).toFixed(1);
-    loaderSec.textContent = `${loaderPhase}... ${s}s`;
+    if (run.viewToken === currentViewToken && run.liveChat && run.liveChat.dom && run.liveChat.dom.loaderSec.isConnected) {
+      const s = ((performance.now() - tStart) / 1000).toFixed(1);
+      run.liveChat.dom.loaderSec.textContent = `${run.liveChat.dom.getPhaseLabel()}... ${s}s`;
+    }
   }, 100);
 
-  let thinkBox = null;
-  const toolCards = {};
-  const turnOutputs = [];
   const autoSpeakActive = Boolean(appSettings.tts_auto);
   const speechModel = appSettings.tts_model || "lfm3-audio:2b";
   const speechBuf = autoSpeakActive ? new SpeechSentenceBuffer() : null;
   let liveSpeech = null;
   let speechDoneFlushed = false;
+  let streamTimer = null;
+
+  function isLiveView() {
+    return run.viewToken === currentViewToken && run.liveChat && run.liveChat.dom && run.liveChat.dom.row.isConnected;
+  }
   function flushSpeechChunks(pieces) {
-    if (!autoSpeakActive || !pieces || !pieces.length) return;
-    if (!liveSpeech) {
-      liveSpeech = createLiveSpeechSession(speechModel, appSettings.tts_voice || "", row.querySelector(".asst-head"));
-    }
-    if (liveSpeech && !liveSpeech.aborted) {
-      for (const p of pieces) liveSpeech.enqueue(p);
-    }
+    if (!autoSpeakActive || !pieces || !pieces.length || !isLiveView()) return;
+    if (!liveSpeech) liveSpeech = createLiveSpeechSession(speechModel, appSettings.tts_voice || "", run.liveChat.dom.row.querySelector(".asst-head"));
+    if (liveSpeech && !liveSpeech.aborted) { for (const p of pieces) liveSpeech.enqueue(p); }
   }
   function finalizeLiveSpeech(replyText) {
     if (!autoSpeakActive || !speechBuf || speechDoneFlushed) return;
     speechDoneFlushed = true;
     const cleanReply = String(replyText || "");
-    if (!cleanReply || cleanReply.startsWith("**Error:**")) return;
+    if (!cleanReply || cleanReply.startsWith("**Error:**") || !isLiveView()) return;
     const tail = speechBuf.finish(cleanReply);
-    if (!liveSpeech && tail.length) {
-      liveSpeech = createLiveSpeechSession(speechModel, appSettings.tts_voice || "", row.querySelector(".asst-head"));
-    }
+    if (!liveSpeech && tail.length) liveSpeech = createLiveSpeechSession(speechModel, appSettings.tts_voice || "", run.liveChat.dom.row.querySelector(".asst-head"));
     if (liveSpeech && !liveSpeech.aborted) liveSpeech.finish(tail);
   }
-
-  let streamTarget = "";
-  let streamShown = 0;
-  let streamFinalReply = null;
-  let streamOutputs = [];
-  let streamServerDone = false;
-  let streamFinalized = false;
-  let streamTimer = null;
-  let liveProse = null;
-
-  activeStreamRow = row;
-
-  function ensureLiveProse() {
-    if (liveProse && liveProse.isConnected) return liveProse;
-    liveProse = document.createElement("div");
-    liveProse.className = "prose";
-    if (loaderEl.isConnected && loaderEl.parentElement === row) {
-      row.insertBefore(liveProse, loaderEl);
-    } else {
-      row.appendChild(liveProse);
-    }
-    return liveProse;
-  }
-
   function resetLiveDraft() {
     clearInterval(streamTimer);
     streamTimer = null;
-    streamTarget = "";
-    streamShown = 0;
+    cs.streamTarget = "";
+    cs.streamShown = 0;
     if (speechBuf) speechBuf.reset();
-    if (liveProse && liveProse.isConnected) liveProse.remove();
-    liveProse = null;
-    if (loaderEl.isConnected) loaderEl.style.display = "";
+    if (run.liveChat) {
+      if (run.liveChat.liveProse && run.liveChat.liveProse.isConnected) run.liveChat.liveProse.remove();
+      run.liveChat.liveProse = null;
+      if (run.liveChat.dom.loaderEl.isConnected) run.liveChat.dom.loaderEl.style.display = "";
+    }
   }
-
   function finishReply() {
-    if (streamFinalized) return;
-    streamFinalized = true;
+    if (cs.streamFinalized) return;
+    cs.streamFinalized = true;
     clearInterval(streamTimer);
     streamTimer = null;
     if (activeStreamFlush === flushImmediate) activeStreamFlush = null;
-    if (activeStreamRow === row) activeStreamRow = null;
-    if (!row.isConnected) return;
-
-    const finalText = streamFinalReply !== null ? streamFinalReply : (streamTarget || "(empty)");
-    const prose = ensureLiveProse();
-    prose.innerHTML = renderMarkdown(finalText);
-    if (loaderEl.isConnected) loaderEl.remove();
-    if (!stepsWrap.children.length) stepsWrap.remove();
-
-    if (streamOutputs.length) {
-      row.appendChild(buildOutputsRow(streamOutputs));
-    }
-
+    if (!isLiveView()) return;
+    const lc = run.liveChat;
+    if (activeStreamRow === lc.dom.row) activeStreamRow = null;
+    const finalText = cs.streamFinalReply !== null ? cs.streamFinalReply : (cs.streamTarget || "(empty)");
+    const prose = lc.ensureLiveProse ? lc.ensureLiveProse() : null;
+    if (prose) prose.innerHTML = renderMarkdown(finalText);
+    if (lc.dom.loaderEl.isConnected) lc.dom.loaderEl.remove();
+    if (!lc.dom.stepsWrap.children.length) lc.dom.stepsWrap.remove();
+    if (cs.streamOutputs.length) lc.dom.row.appendChild(buildOutputsRow(cs.streamOutputs));
     const acts = buildMsgActions(finalText);
-    row.appendChild(acts);
-    loadChatList();
+    lc.dom.row.appendChild(acts);
+    if (appMode === "chat") loadChatList();
     playDoneChime();
     const spk = acts.querySelector(".speak-btn");
     if (autoSpeakActive && !finalText.startsWith("**Error:**")) {
       finalizeLiveSpeech(finalText);
-      if (spk && liveSpeech) {
-        liveSpeech.attachFinalButton(spk);
-      }
+      if (spk && liveSpeech) liveSpeech.attachFinalButton(spk);
     } else if (liveSpeech && liveSpeech.liveHeaderBtn && liveSpeech.liveHeaderBtn.isConnected) {
       liveSpeech.stop();
     }
   }
-
   function flushImmediate() {
     clearInterval(streamTimer);
     streamTimer = null;
     if (activeStreamFlush === flushImmediate) activeStreamFlush = null;
-    if (streamServerDone && !streamFinalized) {
-      streamShown = streamTarget.length;
+    if (cs.streamServerDone && !cs.streamFinalized) {
+      cs.streamShown = cs.streamTarget.length;
       finishReply();
     }
   }
   activeStreamFlush = flushImmediate;
 
   function renderRevealTick() {
-    if (!row.isConnected) {
+    if (!isLiveView()) {
       clearInterval(streamTimer);
       streamTimer = null;
       if (activeStreamFlush === flushImmediate) activeStreamFlush = null;
       return;
     }
-    const backlog = streamTarget.length - streamShown;
+    const lc = run.liveChat;
+    const backlog = cs.streamTarget.length - cs.streamShown;
     if (backlog > 0) {
-      const step = streamServerDone
+      const step = cs.streamServerDone
         ? Math.max(2, Math.min(28, Math.ceil(backlog / 9)))
         : Math.max(1, Math.min(8, Math.ceil(backlog / 14)));
-      streamShown = snapStreamSliceEnd(streamTarget, Math.min(streamTarget.length, streamShown + step));
-      if (streamServerDone && streamShown >= streamTarget.length) {
+      cs.streamShown = snapStreamSliceEnd(cs.streamTarget, Math.min(cs.streamTarget.length, cs.streamShown + step));
+      if (cs.streamServerDone && cs.streamShown >= cs.streamTarget.length) {
         finishReply();
         return;
       }
-      const prose = ensureLiveProse();
-      if (loaderEl.isConnected) loaderEl.style.display = "none";
-      prose.innerHTML = renderStreamingMarkdown(streamTarget.slice(0, streamShown));
+      const prose = lc.ensureLiveProse();
+      if (lc.dom.loaderEl.isConnected) lc.dom.loaderEl.style.display = "none";
+      prose.innerHTML = renderStreamingMarkdown(cs.streamTarget.slice(0, cs.streamShown));
       appendStreamCursor(prose);
-      scrollFollow(row);
-    } else if (streamServerDone) {
+      scrollFollow(lc.dom.row);
+    } else if (cs.streamServerDone) {
       finishReply();
     }
   }
-
   function ensureRevealLoop() {
-    if (streamTimer || streamFinalized) return;
+    if (streamTimer || cs.streamFinalized || !isLiveView()) return;
     streamTimer = setInterval(renderRevealTick, 32);
   }
 
@@ -6048,7 +9914,7 @@ async function sendMsg() {
         enabled_packs: enabledPacksList,
         attached_files: attachedNames,
       }),
-      signal: currentAbort.signal,
+      signal: abortCtrl.signal,
     });
 
     if (!res.ok) {
@@ -6070,68 +9936,94 @@ async function sendMsg() {
       for (const ln of lines) {
         if (!ln.trim()) continue;
         const ev = JSON.parse(ln);
+        if (ev.chat_id) run.sessionId = ev.chat_id;
 
         if (ev.type === "phase") {
-          setLoaderPhase(ev.phase);
-        } else if (ev.type === "title") {
-          currentChatId = ev.chat_id;
-          loadChatList();
-        } else if (ev.type === "thinking_delta") {
-          if (!thinkBox) {
-            thinkBox = buildThinkingBox("", activeModel);
-            stepsWrap.prepend(thinkBox);
+          cs.phase = ev.phase;
+          if (isLiveView()) {
+            if (ev.chat_id) currentChatId = ev.chat_id;
+            run.liveChat.dom.setLoaderPhase(ev.phase);
           }
-          const tb = thinkBox.querySelector(".think-body");
-          tb.textContent += ev.text;
-          tb.scrollTop = tb.scrollHeight;
-          thinkBox.querySelector(".think-label").textContent = `Thinking (${tb.textContent.length} chars)`;
-          scrollFollow(row);
+          syncWorkingIndicators();
+          if (ev.chat_id && appMode === "chat") loadChatList();
+        } else if (ev.type === "title") {
+          if (isLiveView()) currentChatId = ev.chat_id;
+          syncWorkingIndicators();
+          if (appMode === "chat") loadChatList();
+        } else if (ev.type === "thinking_delta") {
+          cs.thinkBuf += ev.text || "";
+          if (isLiveView()) {
+            const lc = run.liveChat;
+            if (!lc.thinkBox) {
+              lc.thinkBox = buildThinkingBox("", activeModel);
+              lc.dom.stepsWrap.prepend(lc.thinkBox);
+            }
+            const tb = lc.thinkBox.querySelector(".think-body");
+            tb.textContent += ev.text;
+            tb.scrollTop = tb.scrollHeight;
+            lc.thinkBox.querySelector(".think-label").textContent = `Thinking (${tb.textContent.length} chars)`;
+            scrollFollow(lc.dom.row);
+          }
         } else if (ev.type === "tool_start") {
           resetLiveDraft();
-          setLoaderPhase("working", 400);
-          const card = buildToolCard(ev, true, activeModel);
-          toolCards[ev.id] = card;
-          stepsWrap.appendChild(card);
-          scrollFollow(row);
-        } else if (ev.type === "tool_end") {
-          const card = toolCards[ev.id];
-          if (card) {
-            const tri = card.querySelector(".tri-svg");
-            if (tri) {
-              tri.classList.remove("running");
-              tri.style.color = pal[2];
-            }
-            card.querySelector(".tool-out").textContent = ev.result || "(no output)";
+          const tRec = { id: ev.id, name: ev.name, args: ev.args || {}, result: null, done: false };
+          cs.toolsList.push(tRec);
+          cs.phase = "working";
+          if (isLiveView()) {
+            const lc = run.liveChat;
+            lc.dom.setLoaderPhase("working", 400);
+            const card = buildToolCard(ev, true, activeModel);
+            lc.toolCards[ev.id] = card;
+            lc.dom.stepsWrap.appendChild(card);
+            scrollFollow(lc.dom.row);
           }
-          setLoaderPhase("working", 250);
-          scrollFollow(row);
+        } else if (ev.type === "tool_end") {
+          const tRec = cs.toolsList.find(x => x.id === ev.id);
+          if (tRec) { tRec.result = ev.result || "(no output)"; tRec.done = true; }
+          if (isLiveView()) {
+            const lc = run.liveChat;
+            const card = lc.toolCards[ev.id];
+            if (card) {
+              const tri = card.querySelector(".tri-svg");
+              if (tri) { tri.classList.remove("running"); tri.style.color = lc.dom.pal[2]; }
+              card.querySelector(".tool-out").textContent = ev.result || "(no output)";
+            }
+            lc.dom.setLoaderPhase("working", 250);
+            scrollFollow(lc.dom.row);
+          }
         } else if (ev.type === "reply_delta" && ev.text) {
-          streamTarget += ev.text;
+          cs.streamTarget += ev.text;
           ensureRevealLoop();
           if (speechBuf) flushSpeechChunks(speechBuf.pushDelta(ev.text));
         } else if (ev.type === "file_ready" && ev.name && ev.url) {
           const item = { name: ev.name, url: ev.url, size: ev.size };
-          const idx = turnOutputs.findIndex(o => o.name === ev.name);
-          if (idx >= 0) turnOutputs[idx] = item;
-          else turnOutputs.push(item);
+          const idx = cs.turnOutputs.findIndex(o => o.name === ev.name);
+          if (idx >= 0) cs.turnOutputs[idx] = item;
+          else cs.turnOutputs.push(item);
         } else if (ev.type === "tokens" && ev.tokens) {
-          updateCtxBadge(ev.tokens.used, ev.tokens.max);
+          cs.tokens = ev.tokens;
+          if (isLiveView()) updateCtxBadge(ev.tokens.used, ev.tokens.max);
         } else if (ev.type === "done") {
           clearInterval(secTimer);
-          clearTimeout(pendingPhaseTimer);
-          if (loaderEl.isConnected) loaderEl.remove();
-          currentChatId = ev.chat_id;
-          if (ev.tokens) updateCtxBadge(ev.tokens.used, ev.tokens.max);
-          if (ev.elapsed) row.querySelector(".asst-time").textContent = `· ${ev.elapsed.toFixed(1)}s`;
-          if (!stepsWrap.children.length) stepsWrap.remove();
-
-          streamFinalReply = ev.reply || "(empty)";
-          streamTarget = streamFinalReply;
-          streamShown = Math.min(streamShown, streamTarget.length);
-          streamOutputs = (Array.isArray(ev.outputs) && ev.outputs.length) ? ev.outputs : turnOutputs.slice();
-          streamServerDone = true;
-          finalizeLiveSpeech(streamFinalReply);
-          if (!streamTarget.length || streamShown >= streamTarget.length) {
+          run.liveChat.dom.clearTimers();
+          if (isLiveView()) {
+            const lc = run.liveChat;
+            if (lc.dom.loaderEl.isConnected) lc.dom.loaderEl.remove();
+            currentChatId = ev.chat_id;
+            if (ev.tokens) updateCtxBadge(ev.tokens.used, ev.tokens.max);
+            if (ev.elapsed) lc.dom.row.querySelector(".asst-time").textContent = `· ${ev.elapsed.toFixed(1)}s`;
+            if (!lc.dom.stepsWrap.children.length) lc.dom.stepsWrap.remove();
+          }
+          cs.streamFinalReply = ev.reply || "(empty)";
+          cs.streamTarget = cs.streamFinalReply;
+          cs.streamShown = Math.min(cs.streamShown, cs.streamTarget.length);
+          cs.streamOutputs = (Array.isArray(ev.outputs) && ev.outputs.length) ? ev.outputs : cs.turnOutputs.slice();
+          cs.streamServerDone = true;
+          finalizeLiveSpeech(cs.streamFinalReply);
+          if (!isLiveView()) {
+            if (appMode === "chat") loadChatList();
+            playDoneChime();
+          } else if (!cs.streamTarget.length || cs.streamShown >= cs.streamTarget.length) {
             finishReply();
           } else {
             ensureRevealLoop();
@@ -6144,32 +10036,42 @@ async function sendMsg() {
     clearInterval(secTimer);
     clearInterval(streamTimer);
     streamTimer = null;
-    clearTimeout(pendingPhaseTimer);
+    if (run.liveChat && run.liveChat.dom) run.liveChat.dom.clearTimers();
     if (activeStreamFlush === flushImmediate) activeStreamFlush = null;
-    if (activeStreamRow === row) activeStreamRow = null;
-    if (loaderEl.isConnected) loaderEl.remove();
-    const prose = ensureLiveProse();
-    if (err && err.name === "AbortError") {
-      const elapsed = ((performance.now() - tStart) / 1000).toFixed(1);
-      row.querySelector(".asst-time").textContent = `· stopped (${elapsed}s)`;
-      const partial = streamShown > 0 ? streamTarget.slice(0, streamShown) + "\n\n*(stopped by user)*" : "*(stopped by user)*";
-      prose.innerHTML = renderMarkdown(partial);
-      setTimeout(loadChatList, 300);
-    } else {
-      prose.innerHTML = renderMarkdown("**Error:** `" + String(err) + "`");
+    if (isLiveView()) {
+      const lc = run.liveChat;
+      if (activeStreamRow === lc.dom.row) activeStreamRow = null;
+      if (lc.dom.loaderEl.isConnected) lc.dom.loaderEl.remove();
+      const prose = lc.ensureLiveProse();
+      if (err && err.name === "AbortError") {
+        const elapsed = ((performance.now() - tStart) / 1000).toFixed(1);
+        lc.dom.row.querySelector(".asst-time").textContent = `· stopped (${elapsed}s)`;
+        const partial = cs.streamShown > 0 ? cs.streamTarget.slice(0, cs.streamShown) + "\n\n*(stopped by user)*" : "*(stopped by user)*";
+        prose.innerHTML = renderMarkdown(partial);
+      } else {
+        prose.innerHTML = renderMarkdown("**Error:** `" + String(err) + "`");
+      }
+      if (!lc.dom.stepsWrap.children.length) lc.dom.stepsWrap.remove();
     }
-    if (!stepsWrap.children.length) stepsWrap.remove();
+    if (err && err.name === "AbortError" && appMode === "chat") setTimeout(loadChatList, 300);
   } finally {
     clearInterval(secTimer);
-    clearTimeout(pendingPhaseTimer);
-    busy = false;
-    currentAbort = null;
-    setSendBtnState(false);
-    input.focus();
+    if (run.liveChat && run.liveChat.dom) run.liveChat.dom.clearTimers();
+    run.done = true;
+    activeRuns.delete(runId);
+    syncBusyUI();
+    if (appMode === "chat") loadChatList();
+    if (isLiveView()) input.focus();
   }
 }
 
-let soulState = { active_id: "original", original: "", slots: [] };
+let soulState = { mode: "chat", file: "", active_id: "original", original: "", slots: [] };
+
+function getSoulDefaultMeta(mode = soulState.mode) {
+  return mode === "project"
+    ? { id: "cube", name: "Cube", newName: "Cube", title: "Cube Souls (Projects mode · up to 4 presets, applies live)", restoreText: "Restore Cube" }
+    : { id: "original", name: "Original", newName: "Soul", title: "Souls (up to 4 presets, applies live)", restoreText: "Restore original" };
+}
 
 function getActiveSoulSlot() {
   return soulState.slots.find(s => s.id === soulState.active_id) || soulState.slots[0] || null;
@@ -6178,13 +10080,22 @@ function getActiveSoulSlot() {
 function syncCurrentSoulInputs() {
   const cur = getActiveSoulSlot();
   if (!cur) return;
+  const def = getSoulDefaultMeta();
   const nm = document.getElementById("soul-name");
   const tx = document.getElementById("soul-text");
-  if (nm) cur.name = (nm.value.trim() || "Soul").slice(0, 24);
+  if (nm) cur.name = (nm.value.trim() || def.newName).slice(0, 24);
   if (tx) cur.content = tx.value;
 }
 
 function renderSoulModal() {
+  const def = getSoulDefaultMeta();
+  const titleEl = document.getElementById("soul-modal-title");
+  if (titleEl) titleEl.textContent = def.title;
+  const pathEl = document.getElementById("soul-modal-path");
+  if (pathEl && soulState.file) pathEl.textContent = soulState.file;
+  const restBtn = document.getElementById("soul-restore-btn");
+  if (restBtn) restBtn.textContent = def.restoreText;
+
   const tabs = document.getElementById("soul-tabs");
   const cur = getActiveSoulSlot();
   if (tabs) {
@@ -6194,7 +10105,7 @@ function renderSoulModal() {
       btn.type = "button";
       btn.dataset.soulId = slot.id;
       btn.className = "soul-tab" + (cur && slot.id === cur.id ? " active" : "");
-      btn.textContent = slot.name || "Soul";
+      btn.textContent = slot.name || def.newName;
       btn.onclick = () => selectSoulSlot(slot.id);
       tabs.appendChild(btn);
     }
@@ -6222,7 +10133,8 @@ function selectSoulSlot(id) {
 function updateActiveSoulName(val) {
   const cur = getActiveSoulSlot();
   if (!cur) return;
-  cur.name = (val.trim() || "Soul").slice(0, 24);
+  const def = getSoulDefaultMeta();
+  cur.name = (val.trim() || def.newName).slice(0, 24);
   const btn = document.querySelector(`#soul-tabs .soul-tab[data-soul-id="${cur.id}"]`);
   if (btn) btn.textContent = cur.name;
 }
@@ -6230,9 +10142,10 @@ function updateActiveSoulName(val) {
 function addSoulSlot() {
   syncCurrentSoulInputs();
   if (soulState.slots.length >= 4) return;
+  const def = getSoulDefaultMeta();
   const num = soulState.slots.length + 1;
-  const id = "soul-" + Date.now().toString(36);
-  soulState.slots.push({ id, name: `Soul ${num}`, content: "" });
+  const id = (soulState.mode === "project" ? "cube-" : "soul-") + Date.now().toString(36);
+  soulState.slots.push({ id, name: `${def.newName} ${num}`, content: "" });
   soulState.active_id = id;
   renderSoulModal();
   const tx = document.getElementById("soul-text");
@@ -6242,9 +10155,10 @@ function addSoulSlot() {
 function deleteCurrentSoul() {
   const cur = getActiveSoulSlot();
   if (!cur) return;
+  const def = getSoulDefaultMeta();
   soulState.slots = soulState.slots.filter(s => s.id !== cur.id);
   if (!soulState.slots.length) {
-    soulState.slots.push({ id: "original", name: "Original", content: soulState.original || "" });
+    soulState.slots.push({ id: def.id, name: def.name, content: soulState.original || "" });
   }
   soulState.active_id = soulState.slots[0].id;
   renderSoulModal();
@@ -6252,19 +10166,20 @@ function deleteCurrentSoul() {
 
 function restoreOriginalSoul() {
   syncCurrentSoulInputs();
+  const def = getSoulDefaultMeta();
   const origText = soulState.original || "";
-  const existingOrig = soulState.slots.find(s => s.id === "original");
+  const existingOrig = soulState.slots.find(s => s.id === def.id);
   if (existingOrig) {
-    existingOrig.name = "Original";
+    existingOrig.name = def.name;
     existingOrig.content = origText;
-    soulState.active_id = "original";
+    soulState.active_id = def.id;
   } else if (soulState.slots.length < 4) {
-    soulState.slots.unshift({ id: "original", name: "Original", content: origText });
-    soulState.active_id = "original";
+    soulState.slots.unshift({ id: def.id, name: def.name, content: origText });
+    soulState.active_id = def.id;
   } else {
     const cur = getActiveSoulSlot();
     if (cur) {
-      cur.name = "Original";
+      cur.name = def.name;
       cur.content = origText;
     }
   }
@@ -6272,10 +10187,14 @@ function restoreOriginalSoul() {
 }
 
 async function openSoul() {
-  const res = await fetch("/api/soul");
+  const mode = appMode === "project" ? "project" : "chat";
+  const def = getSoulDefaultMeta(mode);
+  const res = await fetch("/api/soul?mode=" + encodeURIComponent(mode));
   const data = await res.json();
   if (data && Array.isArray(data.slots) && data.slots.length) {
     soulState = {
+      mode,
+      file: data.file || "",
       active_id: data.active_id || data.slots[0].id,
       original: data.original || data.content || "",
       slots: data.slots.slice(0, 4).map(s => ({ id: s.id, name: s.name, content: s.content || "" })),
@@ -6283,9 +10202,11 @@ async function openSoul() {
   } else {
     const txt = (data && data.content) || "";
     soulState = {
-      active_id: "original",
+      mode,
+      file: (data && data.file) || "",
+      active_id: def.id,
       original: txt,
-      slots: [{ id: "original", name: "Original", content: txt }],
+      slots: [{ id: def.id, name: def.name, content: txt }],
     };
   }
   renderSoulModal();
@@ -6294,10 +10215,11 @@ async function openSoul() {
 function closeSoul() { document.getElementById("soul-modal").style.display = "none"; }
 async function saveSoul() {
   syncCurrentSoulInputs();
+  const mode = soulState.mode || (appMode === "project" ? "project" : "chat");
   await fetch("/api/soul", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ active_id: soulState.active_id, slots: soulState.slots }),
+    body: JSON.stringify({ mode, active_id: soulState.active_id, slots: soulState.slots }),
   });
   closeSoul();
 }
@@ -6309,11 +10231,28 @@ let defaultChips = [
 ];
 let userChips = defaultChips.slice();
 
+let defaultProjectChips = [
+  { label: "Build Python app + tests", prompt: "Analyze this folder and build a clean modular Python CLI tool with unit tests and README.md, run the tests, and fix any issues." },
+  { label: "Review & refactor codebase", prompt: "Inspect the files in this folder, create an implementation plan to clean up bugs and structure, refactor piece by piece, and verify everything works." },
+  { label: "Create web page / dashboard", prompt: "Build a clean responsive HTML/CSS/JS app in this folder, test that the JS syntax and assets work properly, and summarize the walkthrough." },
+];
+let projectChips = defaultProjectChips.slice();
+let chipsModalMode = "chat";
+
 function renderChips() {
   const row = document.getElementById("chips-row");
   if (!row) return;
+  const showChips = (typeof appSettings === "undefined") || appSettings.show_prompt_chips !== false;
+  if (!showChips) {
+    row.style.display = "none";
+    row.innerHTML = "";
+    return;
+  }
+  row.style.display = "";
   row.innerHTML = "";
-  for (const c of userChips) {
+  const isProj = appMode === "project";
+  const items = isProj ? projectChips : userChips;
+  for (const c of items) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "chip";
@@ -6326,7 +10265,7 @@ function renderChips() {
   edit.type = "button";
   edit.className = "chip chip-edit";
   edit.textContent = "Edit";
-  edit.title = "Customize quick buttons";
+  edit.title = isProj ? "Customize quick project buttons" : "Customize quick buttons";
   edit.onclick = openChipsModal;
   row.appendChild(edit);
 }
@@ -6338,8 +10277,14 @@ async function loadChips() {
     const data = await res.json();
     if (Array.isArray(data.defaults)) defaultChips = data.defaults;
     if (Array.isArray(data.chips)) userChips = data.chips;
-    renderChips();
   } catch (_) {}
+  try {
+    const pRes = await fetch("/api/chips?mode=project");
+    const pData = await pRes.json();
+    if (pData && Array.isArray(pData.defaults)) defaultProjectChips = pData.defaults;
+    if (pData && pData.mode === "project" && Array.isArray(pData.chips)) projectChips = pData.chips;
+  } catch (_) {}
+  renderChips();
 }
 
 function addChipRow(label = "", prompt = "") {
@@ -6373,9 +10318,13 @@ function addChipRow(label = "", prompt = "") {
 }
 
 function openChipsModal() {
+  chipsModalMode = appMode === "project" ? "project" : "chat";
+  const subEl = document.getElementById("chips-modal-sub");
+  if (subEl) subEl.textContent = chipsModalMode === "project" ? "Shown under new project bar" : "Shown under new chat bar";
   const box = document.getElementById("chips-rows");
   box.innerHTML = "";
-  const list = userChips.length ? userChips : [{ label: "", prompt: "" }];
+  const activeList = chipsModalMode === "project" ? projectChips : userChips;
+  const list = activeList.length ? activeList : [{ label: "", prompt: "" }];
   for (const c of list) addChipRow(c.label, c.prompt);
   document.getElementById("chips-modal").style.display = "flex";
 }
@@ -6387,7 +10336,8 @@ function closeChipsModal() {
 function resetChipRows() {
   const box = document.getElementById("chips-rows");
   box.innerHTML = "";
-  for (const c of defaultChips) addChipRow(c.label, c.prompt);
+  const defs = chipsModalMode === "project" ? defaultProjectChips : defaultChips;
+  for (const c of defs) addChipRow(c.label, c.prompt);
 }
 
 async function saveChipsModal() {
@@ -6399,15 +10349,68 @@ async function saveChipsModal() {
     const prompt = inputs[1].value.trim();
     if (label && prompt) items.push({ label, prompt });
   }
+  const mode = chipsModalMode === "project" ? "project" : "chat";
   const res = await fetch("/api/chips", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chips: items }),
+    body: JSON.stringify({ mode, chips: items }),
   });
   const data = await res.json();
-  if (Array.isArray(data.chips)) userChips = data.chips;
+  if (Array.isArray(data.chips)) {
+    if (mode === "project") projectChips = data.chips;
+    else userChips = data.chips;
+  }
   renderChips();
   closeChipsModal();
+}
+
+let rightPanelPrefOpen = localStorage.getItem("local_agent_right_open") !== "0";
+let _rpSavedTimer = null;
+
+function syncRightSidebarVisibility() {
+  const rs = document.getElementById("right-sidebar");
+  const btn = document.getElementById("right-sidebar-btn");
+  const isProj = appMode === "project";
+  if (btn) btn.style.display = isProj ? "grid" : "none";
+  if (!rs) return;
+  if (!isProj) {
+    rs.classList.add("collapsed");
+    if (btn) btn.classList.remove("active");
+    return;
+  }
+  const wantOpen = rightPanelPrefOpen && (typeof window === "undefined" || !window.innerWidth || window.innerWidth > 720);
+  rs.classList.toggle("collapsed", !wantOpen);
+  if (btn) btn.classList.toggle("active", wantOpen);
+}
+
+function toggleRightSidebar() {
+  const rs = document.getElementById("right-sidebar");
+  const btn = document.getElementById("right-sidebar-btn");
+  if (!rs || appMode !== "project") return;
+  const isCollapsed = rs.classList.contains("collapsed");
+  const nextOpen = isCollapsed;
+  rs.classList.toggle("collapsed", !nextOpen);
+  if (btn) btn.classList.toggle("active", nextOpen);
+  rightPanelPrefOpen = nextOpen;
+  try { localStorage.setItem("local_agent_right_open", nextOpen ? "1" : "0"); } catch (_) {}
+}
+
+function openRightSidebar() {
+  const rs = document.getElementById("right-sidebar");
+  const btn = document.getElementById("right-sidebar-btn");
+  if (!rs || appMode !== "project") return;
+  rs.classList.remove("collapsed");
+  if (btn) btn.classList.add("active");
+  rightPanelPrefOpen = true;
+  try { localStorage.setItem("local_agent_right_open", "1"); } catch (_) {}
+}
+
+function flashRightSavedBadge() {
+  const el = document.getElementById("rp-saved-badge");
+  if (!el) return;
+  el.classList.add("show");
+  clearTimeout(_rpSavedTimer);
+  _rpSavedTimer = setTimeout(() => el.classList.remove("show"), 1300);
 }
 
 async function loadSettings() {
@@ -6421,8 +10424,20 @@ async function loadSettings() {
       appSettings.tts_model = data.tts_model || "lfm3-audio:2b";
       appSettings.tts_voice = data.tts_voice || "";
       appSettings.tts_auto = !!data.tts_auto;
+      appSettings.project_workers = Math.max(1, Math.min(4, Number(data.project_workers) || 1));
+      appSettings.project_num_ctx = Number(data.project_num_ctx) || MAX_CTX;
+      appSettings.project_orchestrator_model = appMode === "project" ? (currentModel || data.project_orchestrator_model || "") : (data.project_orchestrator_model || "");
+      appSettings.project_worker_model = data.project_worker_model || "";
+      appSettings.project_worker_pool = Array.isArray(data.project_worker_pool) ? data.project_worker_pool.slice() : [];
+      appSettings.project_max_review_cycles = (data.project_max_review_cycles === undefined || data.project_max_review_cycles === null)
+        ? 1
+        : Math.max(0, Number(data.project_max_review_cycles) || 0);
+      appSettings.show_prompt_chips = data.show_prompt_chips !== false;
+      renderChips();
       syncPlusMenuState();
+      syncRightPanelFromSettings();
       renderComposerBar();
+      refreshProjectBarIndicators();
     }
   } catch (_) {}
 }
@@ -6432,26 +10447,147 @@ function updateStepsLabel(v) {
   if (el) el.textContent = String(v);
 }
 
-function openSettings() {
-  const selModel = document.getElementById("set-default-model");
-  selModel.innerHTML = "";
-  const autoOpt = document.createElement("option");
-  autoOpt.value = "";
-  autoOpt.textContent = "Auto (first installed)";
-  selModel.appendChild(autoOpt);
+function updateProjWorkersLabel(v) {
+  const n = Math.max(1, Math.min(4, Number(v) || 1));
+  const el = document.getElementById("rp-proj-workers-val");
+  if (el) el.textContent = n === 1 ? "1 (Sequential)" : `${n} (Parallel)`;
+}
 
-  const list = availableModels.slice();
-  if (appSettings.default_model && !list.includes(appSettings.default_model)) {
-    list.unshift(appSettings.default_model);
+function populateModelSelectOptions(sel, emptyLabel, currentVal, list) {
+  if (!sel) return;
+  sel.innerHTML = "";
+  if (emptyLabel) {
+    const opt0 = document.createElement("option");
+    opt0.value = "";
+    opt0.textContent = emptyLabel;
+    sel.appendChild(opt0);
   }
-  for (const m of list) {
+
+  const merged = list.slice();
+  if (currentVal && !merged.includes(currentVal)) merged.unshift(currentVal);
+  for (const m of merged) {
     const opt = document.createElement("option");
     opt.value = m;
     const p = getModelParamLabel(m);
     opt.textContent = p ? `${m} · ${p}` : m;
-    selModel.appendChild(opt);
+    sel.appendChild(opt);
   }
-  selModel.value = appSettings.default_model || "";
+  sel.value = currentVal || "";
+}
+
+function renderProjPoolPills(models, selectedList) {
+  const box = document.getElementById("rp-proj-pool");
+  if (!box) return;
+  box.innerHTML = "";
+  const chosen = new Set(Array.isArray(selectedList) ? selectedList : []);
+  const uniq = Array.from(new Set([...(models || []), ...chosen].filter(Boolean)));
+  for (const m of uniq) {
+    const pal = getModelPalette(m);
+    const p = getModelParamLabel(m);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "pool-pill" + (chosen.has(m) ? " on" : "");
+    btn.dataset.model = m;
+    btn.innerHTML = `<span class="opt-dot" style="background:${pal[2]};"></span><span class="pool-pill-name"></span>`;
+    btn.querySelector(".pool-pill-name").textContent = p ? `${m} (${p})` : m;
+    btn.onclick = () => {
+      btn.classList.toggle("on");
+      saveRightPanelSettings();
+    };
+    box.appendChild(btn);
+  }
+}
+
+function syncRightPanelFromSettings() {
+  const llmChoices = installedModels.length ? installedModels : availableModels;
+  const activeOrch = getActiveOrchestratorModel();
+  populateModelSelectOptions(
+    document.getElementById("rp-proj-orch"),
+    "",
+    activeOrch,
+    llmChoices
+  );
+  populateModelSelectOptions(
+    document.getElementById("rp-proj-worker"),
+    "Same as orchestrator",
+    appSettings.project_worker_model || "",
+    llmChoices
+  );
+  renderProjPoolPills(llmChoices, appSettings.project_worker_pool || []);
+
+  const wEl = document.getElementById("rp-proj-workers");
+  const wVal = Math.max(1, Math.min(4, Number(appSettings.project_workers) || 1));
+  if (wEl) wEl.value = String(wVal);
+  updateProjWorkersLabel(wVal);
+
+  const ctxEl = document.getElementById("rp-proj-ctx");
+  if (ctxEl) ctxEl.value = String(appSettings.project_num_ctx || MAX_CTX);
+
+  const cycEl = document.getElementById("rp-proj-cycles");
+  const cycVal = (appSettings.project_max_review_cycles === undefined || appSettings.project_max_review_cycles === null)
+    ? 1
+    : Math.max(0, Number(appSettings.project_max_review_cycles) || 0);
+  if (cycEl) cycEl.value = String(cycVal);
+
+  const rpChipsEl = document.getElementById("rp-show-chips");
+  if (rpChipsEl) rpChipsEl.checked = appSettings.show_prompt_chips !== false;
+}
+
+async function saveRightPanelSettings() {
+  const projOrchEl = document.getElementById("rp-proj-orch");
+  const projWorkerEl = document.getElementById("rp-proj-worker");
+  const projWorkersEl = document.getElementById("rp-proj-workers");
+  const projCtxEl = document.getElementById("rp-proj-ctx");
+  const projCycEl = document.getElementById("rp-proj-cycles");
+  const rpChipsEl = document.getElementById("rp-show-chips");
+  const projPool = Array.from(document.querySelectorAll("#rp-proj-pool .pool-pill.on"))
+    .map(b => b.dataset.model)
+    .filter(Boolean);
+
+  const nextOrch = (projOrchEl && projOrchEl.value ? projOrchEl.value.trim() : "") || currentModel;
+  appSettings.project_orchestrator_model = nextOrch;
+  appSettings.project_worker_model = projWorkerEl ? projWorkerEl.value : "";
+  appSettings.project_worker_pool = projPool;
+  appSettings.project_workers = projWorkersEl ? (Number(projWorkersEl.value) || 1) : 1;
+  appSettings.project_num_ctx = projCtxEl ? (Number(projCtxEl.value) || MAX_CTX) : MAX_CTX;
+  appSettings.project_max_review_cycles = (projCycEl && projCycEl.value !== "") ? Math.max(0, Number(projCycEl.value) || 0) : 1;
+  if (rpChipsEl) appSettings.show_prompt_chips = !!rpChipsEl.checked;
+  const setChipsEl = document.getElementById("set-show-chips");
+  if (setChipsEl) setChipsEl.checked = appSettings.show_prompt_chips !== false;
+  renderChips();
+
+  if (appMode === "project" && typeof syncProjectOrchestratorModel === "function") {
+    syncProjectOrchestratorModel(nextOrch, { save: false });
+  } else {
+    renderComposerBar();
+    refreshProjectBarIndicators();
+  }
+
+  try {
+    const res = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_orchestrator_model: appSettings.project_orchestrator_model,
+        project_worker_model: appSettings.project_worker_model,
+        project_worker_pool: appSettings.project_worker_pool,
+        project_workers: appSettings.project_workers,
+        project_num_ctx: appSettings.project_num_ctx,
+        project_max_review_cycles: appSettings.project_max_review_cycles,
+        show_prompt_chips: appSettings.show_prompt_chips !== false,
+      }),
+    });
+    const data = await res.json();
+    if (data && data.settings) appSettings = data.settings;
+    renderChips();
+    flashRightSavedBadge();
+  } catch (_) {}
+}
+
+function openSettings() {
+  const selModel = document.getElementById("set-default-model");
+  populateModelSelectOptions(selModel, "Auto (first installed)", appSettings.default_model || "", availableModels);
+
   document.getElementById("set-sound").value = appSettings.sound || "chime";
   const steps = Number(appSettings.max_tool_steps) || 8;
   const stepsEl = document.getElementById("set-max-steps");
@@ -6474,6 +10610,9 @@ function openSettings() {
   }
   const voiceEl = document.getElementById("set-tts-voice");
   if (voiceEl) voiceEl.value = appSettings.tts_voice || "";
+
+  const showChipsEl = document.getElementById("set-show-chips");
+  if (showChipsEl) showChipsEl.checked = appSettings.show_prompt_chips !== false;
 
   document.getElementById("settings-modal").style.display = "flex";
 }
@@ -6498,25 +10637,35 @@ async function saveSettings() {
   const tts_model = ttsEl ? (ttsEl.value || "lfm3-audio:2b") : "lfm3-audio:2b";
   const voiceEl = document.getElementById("set-tts-voice");
   const tts_voice = voiceEl ? voiceEl.value.trim() : "";
+  const showChipsEl = document.getElementById("set-show-chips");
+  const show_prompt_chips = showChipsEl ? !!showChipsEl.checked : (appSettings.show_prompt_chips !== false);
+
+  const payload = {
+    default_model,
+    sound,
+    max_tool_steps,
+    tts_model,
+    tts_voice,
+    tts_auto: !!appSettings.tts_auto,
+    show_prompt_chips,
+  };
+
   const res = await fetch("/api/settings", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      default_model,
-      sound,
-      max_tool_steps,
-      tts_model,
-      tts_voice,
-      tts_auto: !!appSettings.tts_auto,
-    }),
+    body: JSON.stringify(payload),
   });
   const data = await res.json();
   if (data && data.settings) appSettings = data.settings;
-  if (default_model && !currentChatId) {
+  if (default_model && !currentChatId && !currentProjectId) {
     selectModel(default_model);
   }
+  const rpChipsEl = document.getElementById("rp-show-chips");
+  if (rpChipsEl) rpChipsEl.checked = appSettings.show_prompt_chips !== false;
+  renderChips();
   renderPlusMenu();
   renderComposerBar();
+  refreshProjectBarIndicators();
   closeSettings();
   if (tts_model.trim() !== prevTts) {
     unloadTtsModel(prevTts);
@@ -6534,8 +10683,12 @@ async function quitServer() {
 }
 
 const inpEl = document.getElementById("input");
-inpEl.addEventListener("input", () => autoResize(inpEl));
+inpEl.addEventListener("input", () => {
+  autoResize(inpEl);
+  if (appMode === "project") wakeCubeMascot(4500);
+});
 inpEl.addEventListener("keydown", (e) => {
+  if (appMode === "project" && e.key !== "Enter") wakeCubeMascot(4500);
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     if (!busy) sendMsg();
@@ -6621,6 +10774,7 @@ const MODAL_CLOSERS = [
   ["pull-modal", closePullModal],
   ["models-modal", closeModelsModal],
   ["files-modal", closeFilesModal],
+  ["folder-modal", closeFolderModal],
 ];
 for (const [id, closeFn] of MODAL_CLOSERS) {
   const el = document.getElementById(id);
@@ -6633,6 +10787,9 @@ for (const [id, closeFn] of MODAL_CLOSERS) {
   });
 }
 
+document.addEventListener("pointerdown", () => {
+  if (appMode === "project" && !busy) wakeCubeMascot(4500);
+}, { passive: true });
 document.addEventListener("click", (e) => {
   const menu = document.getElementById("plus-menu");
   const btn = document.getElementById("plus-btn");
@@ -6684,11 +10841,15 @@ document.getElementById("empty-spacer").addEventListener("transitionend", (e) =>
   }
 });
 
+appMode = "chat";
+document.getElementById("sidebar")?.classList.add("collapsed");
+document.getElementById("right-sidebar")?.classList.add("collapsed");
 renderPlusMenu();
 renderComposerBar();
 setSendBtnState(false);
 initWelcomeMascot();
 updateCtxBadge(0, MAX_CTX);
+applyAppModeUI(false);
 let _appRevealed = false;
 function revealApp() {
   if (_appRevealed) return;
@@ -6702,7 +10863,7 @@ const _bootFallback = setTimeout(revealApp, 1500);
 Promise.allSettled([
   _bootMinDelay,
   loadChips(),
-  loadChatList(),
+  loadHistoryList(),
   loadSettings().then(() => loadModels()),
 ]).then(() => {
   clearTimeout(_bootFallback);
@@ -6727,13 +10888,15 @@ def render_web_html() -> bytes:
     return page.encode("utf-8")
 
 
-def load_mascot_js() -> bytes:
+def load_mascot_js(filename: str = "lfm3-mascot.js") -> bytes:
+    if filename not in ("lfm3-mascot.js", "cube-mascot.js"):
+        return b""
     candidates = []
     bundled = getattr(sys, "_MEIPASS", None)
     if bundled:
-        candidates.extend([Path(bundled) / "web" / "lfm3-mascot.js", Path(bundled) / "lfm3-mascot.js"])
+        candidates.extend([Path(bundled) / "web" / filename, Path(bundled) / filename])
     here = Path(__file__).resolve().parent
-    candidates.extend([here / "lfm3-mascot.js", here.parent / "lfm3-mascot.js"])
+    candidates.extend([here / filename, here.parent / filename])
     for p in candidates:
         if p.is_file():
             return p.read_bytes()
@@ -6752,6 +10915,18 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_js_asset(self, filename: str):
+        body = load_mascot_js(filename)
+        if not body:
+            self.send_json(404, {"error": "Mascot script not found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/javascript; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -6775,27 +10950,32 @@ class WebHandler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def make_cancel_check(self, cancelled: threading.Event):
+        chk_lock = threading.Lock()
+
         def is_cancelled() -> bool:
             if cancelled.is_set():
                 return True
-            try:
-                readable, _, exceptional = select.select(
-                    [self.connection], [], [self.connection], 0
-                )
-                if exceptional:
-                    cancelled.set()
+            with chk_lock:
+                if cancelled.is_set():
                     return True
-                if readable:
-                    peek = self.connection.recv(1, socket.MSG_PEEK)
-                    if peek == b"":
+                try:
+                    readable, _, exceptional = select.select(
+                        [self.connection], [], [self.connection], 0
+                    )
+                    if exceptional:
                         cancelled.set()
                         return True
-            except BlockingIOError:
+                    if readable:
+                        peek = self.connection.recv(1, socket.MSG_PEEK)
+                        if peek == b"":
+                            cancelled.set()
+                            return True
+                except BlockingIOError:
+                    return False
+                except (OSError, ValueError):
+                    cancelled.set()
+                    return True
                 return False
-            except (OSError, ValueError):
-                cancelled.set()
-                return True
-            return False
 
         return is_cancelled
 
@@ -6813,17 +10993,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if path == "/lfm3-mascot.js":
-            body = load_mascot_js()
-            if not body:
-                self.send_json(404, {"error": "Mascot script not found"})
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/javascript; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(body)
+        if path in ("/lfm3-mascot.js", "/cube-mascot.js"):
+            self._send_js_asset(path.lstrip("/"))
             return
 
         if path == "/api/models":
@@ -6840,6 +11011,62 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid chat ID"})
                 return
             self.send_json(200, load_chat(cid))
+            return
+
+        if path == "/api/projects":
+            self.send_json(200, list_projects())
+            return
+
+        if path.startswith("/api/projects/"):
+            rest = path[len("/api/projects/"):]
+            parts = rest.split("/", 2)
+            pid = parts[0]
+            if not valid_chat_id(pid):
+                self.send_json(400, {"error": "Invalid project ID"})
+                return
+            if len(parts) == 1 or not parts[1]:
+                self.send_json(200, load_project(pid))
+                return
+            sub = parts[1]
+            if sub == "artifacts" and len(parts) == 3:
+                art_name = parts[2]
+                if art_name not in ("implementation_plan.md", "walkthrough.md"):
+                    self.send_json(404, {"error": "Artifact not found"})
+                    return
+                art_path = project_dir(pid) / art_name
+                if not art_path.is_file():
+                    self.send_json(404, {"error": "Artifact not generated yet"})
+                    return
+                self._send_download_file(art_path)
+                return
+            if sub == "files":
+                proj = load_project(pid)
+                ws_raw = proj.get("workspace_dir") or ""
+                if not ws_raw:
+                    self.send_json(404, {"error": "Project workspace not set"})
+                    return
+                rel = qs.get("path", [""])[0] or (parts[2] if len(parts) == 3 else "")
+                rel = urllib.parse.unquote(rel)
+                try:
+                    ws_root = validate_project_workspace(ws_raw)
+                    target = resolve_confined_path(rel, ws_root)
+                except Exception:
+                    self.send_json(400, {"error": "Invalid project file path"})
+                    return
+                if not target.is_file():
+                    self.send_json(404, {"error": "File not found"})
+                    return
+                self._send_download_file(target)
+                return
+            self.send_json(404, {"error": "Not found"})
+            return
+
+        if path == "/api/fs/list":
+            raw_dir = qs.get("path", [""])[0]
+            try:
+                self.send_json(200, list_directory_entries(raw_dir))
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
             return
 
         if path == "/api/files":
@@ -6863,27 +11090,20 @@ class WebHandler(BaseHTTPRequestHandler):
             if not cdir.is_dir() or target.parent != cdir.resolve() or not target.is_file():
                 self.send_json(404, {"error": "File not found"})
                 return
-            size = target.stat().st_size
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
-            self.send_header("Content-Length", str(size))
-            self.end_headers()
-            with target.open("rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+            self._send_download_file(target)
             return
 
         if path == "/api/soul":
-            souls = load_souls()
-            self.send_json(200, {"content": load_soul(), **souls})
+            mode = (qs.get("mode") or ["chat"])[0]
+            souls = load_souls(mode)
+            self.send_json(200, {"content": load_soul(mode), **souls})
             return
 
         if path == "/api/chips":
-            self.send_json(200, {"chips": load_chips(), "defaults": DEFAULT_CHIPS})
+            mode = (qs.get("mode") or ["chat"])[0]
+            clean_mode = "project" if str(mode or "").strip().lower() == "project" else "chat"
+            defaults = DEFAULT_PROJECT_CHIPS if clean_mode == "project" else DEFAULT_CHIPS
+            self.send_json(200, {"mode": clean_mode, "chips": load_chips(clean_mode), "defaults": defaults})
             return
 
         if path == "/api/settings":
@@ -6891,6 +11111,21 @@ class WebHandler(BaseHTTPRequestHandler):
             return
 
         self.send_json(404, {"error": "Not found"})
+
+    def _send_download_file(self, target: Path, download_name: str = ""):
+        size = target.stat().st_size
+        name = download_name or target.name
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with target.open("rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def _handle_delete_model(self, model_name: str):
         model_name = (model_name or "").strip()
@@ -6918,6 +11153,16 @@ class WebHandler(BaseHTTPRequestHandler):
                 p.unlink()
             delete_chat_uploads(cid)
             self.send_json(200, {"deleted": cid})
+            return
+
+        if path.startswith("/api/projects/"):
+            pid = path[len("/api/projects/"):]
+            if not valid_chat_id(pid):
+                self.send_json(400, {"error": "Invalid project ID"})
+                return
+            delete_project(pid)
+            delete_chat_uploads(pid)
+            self.send_json(200, {"deleted": pid})
             return
 
         if path.startswith("/api/files/"):
@@ -6998,7 +11243,8 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/soul":
             data = self.read_json()
-            saved = save_souls(data)
+            mode = str((data or {}).get("mode") or (qs.get("mode") or ["chat"])[0] or "chat")
+            saved = save_souls(data, mode=mode)
             self.send_json(200, {"ok": True, **saved})
             return
 
@@ -7072,8 +11318,9 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/chips":
             data = self.read_json()
-            saved = save_chips(data.get("chips", []))
-            self.send_json(200, {"ok": True, "chips": saved})
+            mode = str((data or {}).get("mode") or (qs.get("mode") or ["chat"])[0] or "chat")
+            saved = save_chips(data.get("chips", []), mode=mode)
+            self.send_json(200, {"ok": True, "mode": mode, "chips": saved})
             return
 
         if path == "/api/settings":
@@ -7161,19 +11408,26 @@ class WebHandler(BaseHTTPRequestHandler):
                     cancelled.set()
 
             t0 = time.monotonic()
-            emit({"type": "phase", "phase": "thinking" if is_model_loaded(model) else "loading"})
             user_ui = {"role": "user", "text": raw_msg or "(attached files)"}
             if attached_files:
                 user_ui["attachments"] = attached_files
+            title_seed = raw_msg or (attached_files[0] if attached_files else "New chat")
             if is_new_chat:
-                title_seed = raw_msg or (attached_files[0] if attached_files else "New chat")
+                chat["title"] = clean_chat_title(title_seed, "New chat")
+            chat["ui_messages"].append(user_ui)
+            save_chat(chat)
+
+            emit({
+                "type": "phase",
+                "phase": "thinking" if is_model_loaded(model) else "loading",
+                "chat_id": cid,
+                "title": chat.get("title", ""),
+            })
+            if is_new_chat:
                 chat["title"] = generate_chat_title(title_seed, model, cancel_check=is_cancelled)
-                chat["ui_messages"].append(user_ui)
                 save_chat(chat)
                 emit({"type": "title", "chat_id": cid, "title": chat["title"]})
-                emit({"type": "phase", "phase": "thinking"})
-            else:
-                chat["ui_messages"].append(user_ui)
+                emit({"type": "phase", "phase": "thinking", "chat_id": cid})
 
             try:
                 res = run_agent_stream(
@@ -7219,6 +11473,200 @@ class WebHandler(BaseHTTPRequestHandler):
                     "reply": res["reply"],
                     "outputs": res.get("outputs", []),
                     "tokens": res["tokens"],
+                    "elapsed": elapsed,
+                })
+            return
+
+        if path == "/api/pick-folder":
+            data = self.read_json()
+            initial = str(data.get("initial_dir") or "").strip()
+            self.send_json(200, pick_os_folder(initial))
+            return
+
+        if path == "/api/fs/mkdir":
+            data = self.read_json()
+            parent = str(data.get("parent") or "").strip()
+            name = str(data.get("name") or "").strip()
+            try:
+                created = create_directory_entry(parent, name)
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
+                return
+            self.send_json(200, {"ok": True, **created})
+            return
+
+        if path == "/api/project":
+            data = self.read_json()
+            raw_msg = (data.get("message") or "").strip()
+            attached_files = [
+                safe_upload_name(x)
+                for x in (data.get("attached_files") if isinstance(data.get("attached_files"), list) else [])
+                if str(x).strip()
+            ]
+            if not raw_msg and not attached_files:
+                self.send_json(400, {"error": "Empty project prompt"})
+                return
+
+            pid = (data.get("project_id") or "").strip()
+            if not valid_chat_id(pid):
+                pid = new_chat_id()
+            proj = load_project(pid)
+
+            raw_ws = str(data.get("workspace_dir") or proj.get("workspace_dir") or "").strip()
+            try:
+                ws_path = validate_project_workspace(raw_ws)
+            except ValueError as e:
+                self.send_json(400, {"error": str(e)})
+                return
+
+            st = load_settings()
+            top_model = str(data.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+            orch_model = str(
+                data.get("orchestrator_model")
+                or st.get("project_orchestrator_model")
+                or top_model
+            ).strip() or top_model
+            worker_model = str(
+                data.get("worker_model")
+                or st.get("project_worker_model")
+                or orch_model
+            ).strip() or orch_model
+            raw_pool = data.get("worker_pool") if isinstance(data.get("worker_pool"), list) else st.get("project_worker_pool", [])
+            worker_pool = [str(m).strip() for m in raw_pool if str(m).strip()]
+            workers_count = normalize_project_workers(data.get("workers_count", st.get("project_workers", 1)))
+            proj_ctx = normalize_project_ctx(data.get("num_ctx", st.get("project_num_ctx", NUM_CTX)))
+            max_cycles = normalize_project_cycles(data.get("max_review_cycles", st.get("project_max_review_cycles", 1)))
+
+            active_packs = parse_active_packs(data)
+            if not active_packs:
+                active_packs = ["files", "system"]
+
+            proj["workspace_dir"] = str(ws_path)
+            proj["orchestrator_model"] = orch_model
+            proj["worker_model"] = worker_model
+            proj["worker_pool"] = worker_pool
+            is_new_proj = not proj.get("ui_messages")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            cancelled = threading.Event()
+            is_cancelled = self.make_cancel_check(cancelled)
+            emit_lock = threading.Lock()
+
+            def emit(ev: dict):
+                if cancelled.is_set():
+                    return
+                line = (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+                with emit_lock:
+                    if cancelled.is_set():
+                        return
+                    try:
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        cancelled.set()
+
+            t0 = time.monotonic()
+            user_ui = {"role": "user", "text": raw_msg or "(attached files)"}
+            if attached_files:
+                user_ui["attachments"] = attached_files
+                copy_uploads_to_workspace(pid, attached_files, ws_path)
+
+            title_seed = raw_msg or ws_path.name
+            if is_new_proj:
+                proj["title"] = clean_chat_title(title_seed, "New project")
+            proj["ui_messages"].append(user_ui)
+            save_project(proj)
+
+            emit({
+                "type": "project_phase",
+                "phase": "initializing",
+                "label": "Preparing project workspace...",
+                "project_id": pid,
+                "title": proj.get("title", ""),
+                "workspace_dir": str(ws_path),
+            })
+
+            if is_new_proj:
+                proj["title"] = generate_chat_title(title_seed, orch_model, cancel_check=is_cancelled)
+                save_project(proj)
+                emit({
+                    "type": "title",
+                    "project_id": pid,
+                    "title": proj["title"],
+                    "workspace_dir": str(ws_path),
+                })
+
+            msg = raw_msg or "Inspect and process the attached file(s) inside this project folder."
+            try:
+                res = run_project_stream(
+                    project_id=pid,
+                    user_text=msg,
+                    proj=proj,
+                    workspace_dir=ws_path,
+                    orchestrator_model=orch_model,
+                    default_worker_model=worker_model,
+                    worker_pool=worker_pool,
+                    workers_count=workers_count,
+                    active_packs=active_packs,
+                    attached_files=attached_files,
+                    num_ctx=proj_ctx,
+                    max_review_cycles=max_cycles,
+                    emit=emit,
+                    cancel_check=is_cancelled,
+                )
+            except Exception as e:
+                res = {
+                    "reply": f"**Project Error:** `{e}`",
+                    "status": "error",
+                    "understanding": "",
+                    "plan_md": proj.get("plan_md", ""),
+                    "walkthrough_md": proj.get("walkthrough_md", ""),
+                    "tasks": [],
+                    "worker_runs": [],
+                    "reviews": [],
+                    "outputs": [],
+                    "tokens": {"used": 0, "prompt": 0, "output": 0, "max": proj_ctx},
+                    "cancelled": False,
+                }
+
+            elapsed = time.monotonic() - t0
+            proj["status"] = res.get("status", "complete")
+            proj["tokens"] = res.get("tokens", proj.get("tokens", {}))
+            proj["ui_messages"].append({
+                "role": "project",
+                "orchestrator_model": orch_model,
+                "worker_model": worker_model,
+                "workers_count": workers_count,
+                "workspace_dir": str(ws_path),
+                "status": res.get("status", "complete"),
+                "understanding": res.get("understanding", ""),
+                "plan_md": res.get("plan_md", ""),
+                "walkthrough_md": res.get("walkthrough_md", ""),
+                "tasks": res.get("tasks", []),
+                "worker_runs": res.get("worker_runs", []),
+                "reviews": res.get("reviews", []),
+                "text": res.get("reply", "(done)"),
+                "outputs": res.get("outputs", []),
+                "elapsed": elapsed,
+            })
+            save_project(proj)
+
+            if not cancelled.is_set():
+                emit({
+                    "type": "done",
+                    "project_id": pid,
+                    "title": proj["title"],
+                    "workspace_dir": str(ws_path),
+                    "status": res.get("status", "complete"),
+                    "reply": res.get("reply", "(done)"),
+                    "plan_md": res.get("plan_md", ""),
+                    "walkthrough_md": res.get("walkthrough_md", ""),
+                    "outputs": res.get("outputs", []),
+                    "tokens": res.get("tokens", {}),
                     "elapsed": elapsed,
                 })
             return

@@ -1,4 +1,6 @@
 chats/
+projects/
+uploads/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -12,5 +14,7 @@ agent.py-ori
 agent-[0-9]*.py
 index.html
 chips.json
+project_chips.json
 settings.json
 souls.json
+cube_souls.json

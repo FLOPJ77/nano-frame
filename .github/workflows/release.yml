@@ -39,18 +39,18 @@ jobs:
       - name: Build Windows executable
         if: matrix.platform == 'windows'
         run: |
-          pyinstaller --onefile --windowed --name LocalAgent-Windows --add-data "soul.md;." --add-data "web/lfm3-mascot.js;web" web/local_agent.py
+          pyinstaller --onefile --windowed --name LocalAgent-Windows --add-data "soul.md;." --add-data "cube_soul.md;." --add-data "web/lfm3-mascot.js;web" --add-data "web/cube-mascot.js;web" web/local_agent.py
 
       - name: Build macOS app bundle
         if: matrix.platform == 'macos'
         run: |
-          pyinstaller --windowed --name LocalAgent --add-data "soul.md:." --add-data "web/lfm3-mascot.js:web" web/local_agent.py
+          pyinstaller --windowed --name LocalAgent --add-data "soul.md:." --add-data "cube_soul.md:." --add-data "web/lfm3-mascot.js:web" --add-data "web/cube-mascot.js:web" web/local_agent.py
           ditto -c -k --sequesterRsrc --keepParent dist/LocalAgent.app dist/LocalAgent-macOS.zip
 
       - name: Build Linux binary
         if: matrix.platform == 'linux'
         run: |
-          pyinstaller --onefile --name LocalAgent-Linux --add-data "soul.md:." --add-data "web/lfm3-mascot.js:web" web/local_agent.py
+          pyinstaller --onefile --name LocalAgent-Linux --add-data "soul.md:." --add-data "cube_soul.md:." --add-data "web/lfm3-mascot.js:web" --add-data "web/cube-mascot.js:web" web/local_agent.py
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
