@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal, fast terminal AI assistant backed by local Ollama."""
+"""Minimal, fast terminal AI assistant backed by Hugging Face GGUF + llama.cpp."""
 
 import json
 import os
@@ -24,14 +24,24 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent.parent
 SOUL_FILE = Path(os.environ.get("AGENT_SOUL", str(BASE_DIR / "soul.md"))).expanduser()
 CHATS_DIR = Path(os.environ.get("AGENT_CHATS", str(BASE_DIR / "chats"))).expanduser()
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
-OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "lfm3:1.7b")
 NUM_CTX = int(os.environ.get("AGENT_CTX", "16384"))
 MAX_HISTORY = 16
 MAX_HISTORY_CHARS = 28000
 MAX_STEPS = 8
+
+_BACKEND_MOD = None
+
+
+def _load_backend():
+    global _BACKEND_MOD
+    if _BACKEND_MOD is None:
+        web_dir = str((BASE_DIR / "web").resolve())
+        if web_dir not in sys.path:
+            sys.path.insert(0, web_dir)
+        import local_agent as la
+        _BACKEND_MOD = la
+    return _BACKEND_MOD
 
 PRESET_MODELS = ["lfm3:1.7b", "granite4.2:3b", "qwen3.5:4b", "gemma4:e2b"]
 KNOWN_MODEL_PARAMS = {
@@ -325,48 +335,19 @@ def trim_history(history: list):
             history.pop(0)
 
 
-def call_ollama(messages: list, model: str, use_tools: bool = True) -> dict:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "keep_alive": "15m",
-        "options": {
-            "temperature": 0.1,
-            "top_k": 50,
-            "repeat_penalty": 1.1,
-            "num_ctx": NUM_CTX,
-        },
-    }
-    if use_tools:
-        payload["tools"] = TOOLS_SCHEMA
-
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+def call_model(messages: list, model: str, use_tools: bool = True) -> dict:
+    la = _load_backend()
+    msg = la.stream_ollama(
+        messages,
+        model=model,
+        tools_enabled=use_tools,
+        tools=TOOLS_SCHEMA if use_tools else [],
+        num_ctx=NUM_CTX,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"Cannot reach Ollama at {OLLAMA_HOST} ({e.reason}). Is 'ollama serve' running?"
-        ) from e
-
-    msg = data.get("message") or {}
-    prompt_tokens = int(data.get("prompt_eval_count") or 0)
-    eval_tokens = int(data.get("eval_count") or 0)
-    used = prompt_tokens + eval_tokens
-    if used <= 0:
-        used = (
-            sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
-            + len(msg.get("content") or "")
-        ) // 4
     return {
         "content": msg.get("content") or "",
         "tool_calls": msg.get("tool_calls") or [],
-        "tokens": {"used": used, "max": NUM_CTX},
+        "tokens": msg.get("tokens") or {"used": 0, "max": NUM_CTX},
     }
 
 
@@ -388,15 +369,12 @@ def _model_family_rank(name: str) -> int:
 def list_models_detailed() -> list:
     items = []
     try:
-        with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=3) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        for m in data.get("models", []):
-            raw_name = str(m.get("name") or "").strip()
-            name = raw_name[:-7] if raw_name.endswith(":latest") else raw_name
+        la = _load_backend()
+        for m in la.discover_local_gguf_models():
+            name = str(m.get("name") or "").strip()
             if not name:
                 continue
-            det = m.get("details") if isinstance(m.get("details"), dict) else {}
-            ps = str(det.get("parameter_size") or "").strip()
+            ps = str(m.get("parameter_size") or "").strip()
             items.append({
                 "name": name,
                 "param": infer_model_param(name, ps),
@@ -411,9 +389,50 @@ def list_models() -> list:
     return [d["name"] for d in list_models_detailed()]
 
 
+def pull_model(model_name: str) -> str:
+    la = _load_backend()
+    target = (model_name or DEFAULT_MODEL).strip()
+    last_status = [""]
+    is_tty = sys.stdout.isatty()
+
+    def _emit(ev: dict):
+        if not isinstance(ev, dict):
+            return
+        st = str(ev.get("status") or "").strip()
+        comp = ev.get("completed") or 0
+        tot = ev.get("total") or 0
+        if tot > 0 and comp >= 0:
+            pct = min(100, int(comp * 100 / tot))
+            mb_c = comp / (1024 * 1024)
+            mb_t = tot / (1024 * 1024)
+            line = f"  {C.CYAN}[pull]{C.RESET} {pct:3d}% ({mb_c:.1f}/{mb_t:.1f} MB) {st}"
+            if is_tty:
+                sys.stdout.write(f"\r\033[K{line}")
+                sys.stdout.flush()
+                last_status[0] = "bar"
+            elif pct in (0, 25, 50, 75, 100) and st != last_status[0]:
+                print(line)
+                last_status[0] = st
+        elif st and st != last_status[0]:
+            if last_status[0] == "bar" and is_tty:
+                sys.stdout.write("\n")
+            print(f"  {C.GRAY}[pull] {st}{C.RESET}")
+            last_status[0] = st
+
+    try:
+        la.stream_pull_model(target, _emit)
+    finally:
+        if last_status[0] == "bar" and is_tty:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+    resolved = resolve_startup_model(target)
+    print(f"  {C.GREEN}[ready]{C.RESET} {resolved}")
+    return resolved
+
+
 def print_tool_call(name: str, args: dict):
     preview = ", ".join(f"{k}={repr(str(v)[:60])}" for k, v in args.items())
-    tool_col = {"run_bash": C.CYAN, "read_file": C.GREEN, "write_file": C.MAGENTA}.get(name, C.YELLOW)
+    tool_col = {"run_bash": C.CYAN, "run_shell": C.CYAN, "read_file": C.GREEN, "write_file": C.MAGENTA}.get(name, C.YELLOW)
     print(f"  {tool_col}[tool]{C.RESET} {tool_col}{C.BOLD}{name}{C.RESET} {C.GRAY}({preview}){C.RESET}")
 
 
@@ -432,7 +451,7 @@ def run_agent(
     for _ in range(MAX_STEPS):
         messages = [{"role": "system", "content": load_soul()}] + history
         with Spinner("thinking", enabled=use_spinner):
-            msg = call_ollama(messages, model=model, use_tools=use_tools)
+            msg = call_model(messages, model=model, use_tools=use_tools)
 
         last_tokens = msg["tokens"]
         raw_content = msg["content"]
@@ -488,7 +507,7 @@ def print_banner(model: str, use_tools: bool):
     p_lbl = infer_model_param(model)
     m_disp = f"{model} ({p_lbl})" if p_lbl else model
     line1 = f"  * {m_disp} cli   |   soul: {SOUL_FILE.name} (live)   |   tools: {t_state}"
-    line2 = "  cmds: /model [name]  /tools  /soul  /save  /clear  exit"
+    line2 = "  cmds: /model [name]  /pull [name]  /tools  /soul  /save  /clear  exit"
     width = max(len(line1), len(line2)) + 2
     border = "-" * width
     print(f"\n{C.WHITE}+{border}+{C.RESET}")
@@ -504,10 +523,12 @@ def print_help():
         "  ai                                       Start interactive terminal chat\n"
         '  ai "how do I compress a folder"          Quick one-shot answer\n'
         '  ai -n "command to list open ports"       Pure text mode (skip tools)\n'
-        '  ai -m gemma4:e2b "check disk space"      Use a specific Ollama model\n\n'
+        '  ai -m gemma4:e2b "check disk space"      Use a specific HF GGUF model\n'
+        '  ai --pull qwen3.5:4b                     Download a GGUF model from Hugging Face\n\n'
         "Options:\n"
         "  -m, --model NAME   Model name (default: AGENT_MODEL or lfm3:1.7b)\n"
-        "  -n, --no-tools     Disable local bash/file tools\n"
+        "  -p, --pull NAME    Download a GGUF model (preset, owner/repo, or URL) and exit\n"
+        "  -n, --no-tools     Disable local shell/file tools\n"
         "  -r, --raw          Disable spinner animation\n"
         "  -h, --help         Show this help message"
     )
@@ -517,6 +538,7 @@ def parse_args(argv: list) -> tuple:
     model = DEFAULT_MODEL
     use_tools = True
     raw = False
+    pull_target = ""
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -534,27 +556,51 @@ def parse_args(argv: list) -> tuple:
                 sys.exit("Error: --model requires a model name.")
             model = argv[i + 1]
             i += 2
+        elif arg in ("-p", "--pull"):
+            if i + 1 >= len(argv):
+                sys.exit("Error: --pull requires a model name, repo, or GGUF URL.")
+            pull_target = argv[i + 1]
+            i += 2
         elif arg == "--":
             i += 1
             break
         else:
             break
-    return model, use_tools, raw, " ".join(argv[i:]).strip()
+    return model, use_tools, raw, pull_target, " ".join(argv[i:]).strip()
 
 
 def resolve_startup_model(model: str) -> str:
-    if model != "lfm3:1.7b":
-        return model
+    raw = (model or "").strip() or DEFAULT_MODEL
+    norm = raw[:-7] if raw.endswith(":latest") else raw
     installed = list_models()
-    if not installed or "lfm3:1.7b" in installed:
-        return model
-    if "lfm3" in installed or "lfm3:latest" in installed:
-        return "lfm3"
-    return model
+    if not installed:
+        return raw
+    if raw in installed:
+        return raw
+    if norm in installed:
+        return norm
+    if norm in ("lfm3", "lfm3:1.7b"):
+        if "lfm3" in installed:
+            return "lfm3"
+        if "lfm3:1.7b" in installed:
+            return "lfm3:1.7b"
+    if ":" not in norm:
+        for m in installed:
+            if m.split(":", 1)[0].lower() == norm.lower() and "audio" not in m.lower():
+                return m
+    return raw
 
 
 def main():
-    model, use_tools, raw, one_shot = parse_args(sys.argv[1:])
+    model, use_tools, raw, pull_target, one_shot = parse_args(sys.argv[1:])
+    if pull_target:
+        try:
+            model = pull_model(pull_target)
+        except Exception as e:
+            print(f"{C.RED}[error] {e}{C.RESET}", file=sys.stderr)
+            sys.exit(1)
+        if not one_shot:
+            return
     model = resolve_startup_model(model)
     history = []
     ui_log = []
@@ -575,6 +621,8 @@ def main():
         return
 
     print_banner(model, use_tools)
+    if not list_models():
+        print(f"  {C.GRAY}(no local GGUF models found — run /pull lfm3 to download from Hugging Face){C.RESET}\n")
     while True:
         try:
             user_input = input(f"{C.WHITE}{C.BOLD}you >{C.RESET} ").strip()
@@ -601,10 +649,23 @@ def main():
             use_tools = not use_tools
             print(f"  {C.GRAY}(tools: {'on' if use_tools else 'off'}){C.RESET}\n")
             continue
+        if user_input.startswith("/pull"):
+            parts = user_input.split(None, 1)
+            if len(parts) < 2 or not parts[1].strip():
+                presets_str = ", ".join(PRESET_MODELS)
+                print(f"  {C.GRAY}usage: /pull <preset | owner/repo | .gguf URL>{C.RESET}")
+                print(f"  {C.GRAY}presets: {presets_str}{C.RESET}\n")
+            else:
+                try:
+                    model = pull_model(parts[1].strip())
+                    print(f"  {C.GRAY}(active model: {model}){C.RESET}\n")
+                except Exception as e:
+                    print(f"\n{C.RED}[error] {e}{C.RESET}\n")
+            continue
         if user_input.startswith("/model"):
             parts = user_input.split(None, 1)
             if len(parts) == 2 and parts[1].strip():
-                model = parts[1].strip()
+                model = resolve_startup_model(parts[1].strip())
                 p_lbl = infer_model_param(model)
                 suffix = f" ({p_lbl})" if p_lbl else ""
                 print(f"  {C.GRAY}(model switched to {model}{suffix}){C.RESET}\n")
@@ -655,4 +716,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        try:
+            if _BACKEND_MOD is not None:
+                _BACKEND_MOD.unload_all_ollama_models()
+        except Exception:
+            pass

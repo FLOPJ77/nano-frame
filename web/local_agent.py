@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform local Web UI agent backed by Ollama (Windows, macOS, Linux)."""
+"""Cross-platform local Web UI agent backed by Hugging Face GGUF & llama.cpp (Windows, macOS, Linux)."""
 
 import errno
 import hashlib
@@ -7,6 +7,7 @@ import html as html_lib
 import html.parser
 import json
 import os
+import platform
 import re
 import secrets
 import select
@@ -16,12 +17,14 @@ import socket
 import struct
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -162,6 +165,13 @@ seed_soul_if_missing()
 seed_cube_soul_if_missing()
 
 
+MODELS_DIR = DATA_DIR / "models"
+MODELS_INDEX_FILE = MODELS_DIR / "models.json"
+RUNTIME_DIR = DATA_DIR / "runtime"
+HF_API_BASE = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+LLAMA_HOST = "127.0.0.1"
+LLAMA_BASE_PORT = int(os.environ.get("AGENT_LLAMA_PORT", "18765"))
+
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
 OLLAMA_GENERATE_URL = f"{OLLAMA_HOST}/api/generate"
@@ -177,6 +187,81 @@ WEB_PORT = int(os.environ.get("AGENT_PORT", "8765"))
 MAX_HISTORY = 16
 MAX_HISTORY_CHARS = 28000
 
+HF_PRESET_CATALOG = {
+    "lfm3:1.7b": {
+        "repo": "LiquidAI/LFM3-1.7B-GGUF",
+        "file": "LFM3-1.7B-Q4_K_M.gguf",
+        "param": "1.7B",
+        "quant": "Q4_K_M",
+    },
+    "lfm3": {
+        "repo": "LiquidAI/LFM3-1.7B-GGUF",
+        "file": "LFM3-1.7B-Q4_K_M.gguf",
+        "param": "1.7B",
+        "quant": "Q4_K_M",
+    },
+    "lfm3-uncensored:1.7b": {
+        "repo": "AtomicChat/LFM3-1.7B-Uncensored-GGUF",
+        "file": "LFM3-1.7B-Uncensored-AD-Q4_K_M.gguf",
+        "param": "1.7B",
+        "quant": "Q4_K_M",
+    },
+    "granite4.2:3b": {
+        "repo": "ibm-granite/granite-4.2-3b-GGUF",
+        "file": "granite-4.2-3b-Q4_K_M.gguf",
+        "param": "3B",
+        "quant": "Q4_K_M",
+    },
+    "granite4.2:8b": {
+        "repo": "ibm-granite/granite-4.2-8b-GGUF",
+        "file": "granite-4.2-8b-Q4_K_M.gguf",
+        "param": "8B",
+        "quant": "Q4_K_M",
+    },
+    "qwen3.5:0.8b": {
+        "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+        "file": "Qwen3.5-0.8B-Q4_K_M.gguf",
+        "param": "0.8B",
+        "quant": "Q4_K_M",
+    },
+    "qwen3.5:2b": {
+        "repo": "unsloth/Qwen3.5-2B-GGUF",
+        "file": "Qwen3.5-2B-Q4_K_M.gguf",
+        "param": "2B",
+        "quant": "Q4_K_M",
+    },
+    "qwen3.5:4b": {
+        "repo": "unsloth/Qwen3.5-4B-GGUF",
+        "file": "Qwen3.5-4B-Q4_K_M.gguf",
+        "param": "4B",
+        "quant": "Q4_K_M",
+    },
+    "qwen3.5:9b": {
+        "repo": "unsloth/Qwen3.5-9B-GGUF",
+        "file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "param": "9B",
+        "quant": "Q4_K_M",
+    },
+    "gemma4:e2b": {
+        "repo": "unsloth/gemma-4-E2B-it-GGUF",
+        "file": "gemma-4-E2B-it-Q4_K_M.gguf",
+        "param": "2B eff",
+        "quant": "Q4_K_M",
+    },
+    "gemma4:e4b": {
+        "repo": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+        "file": "gemma-4-E4B_q4_0-it.gguf",
+        "param": "4B eff",
+        "quant": "Q4_0",
+    },
+    "gemma4:12b": {
+        "repo": "unsloth/gemma-4-12b-it-GGUF",
+        "file": "gemma-4-12b-it-Q4_K_M.gguf",
+        "param": "12B",
+        "quant": "Q4_K_M",
+    },
+}
+
 PRESET_MODELS = [
     "lfm3:1.7b",
     "granite4.2:3b",
@@ -186,12 +271,17 @@ PRESET_MODELS = [
 KNOWN_MODEL_PARAMS = {
     "lfm3": "1.7B",
     "lfm3:1.7b": "1.7B",
+    "lfm3-uncensored:1.7b": "1.7B",
     "granite4.2:3b": "3B",
+    "granite4.2:8b": "8B",
     "gemma4:e2b": "2B eff",
     "gemma4:e4b": "4B eff",
+    "gemma4:12b": "12B",
     "qwen3.5:0.8b": "0.8B",
     "qwen3.5:2b": "2B",
     "qwen3.5:4b": "4B",
+    "qwen3.5:9b": "9B",
+    "system-tts": "0 VRAM",
     "lfm3-audio:2b": "2B",
     "phonon": "31M",
 }
@@ -1131,22 +1221,135 @@ def build_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000, channels: int = 
     return header + pcm_bytes
 
 
-def _raise_ollama_audio_http_error(e: urllib.error.HTTPError, eff_model: str, label: str):
-    err_body = e.read().decode("utf-8", errors="replace")
-    msg = err_body
-    try:
-        parsed = json.loads(err_body)
-        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
-            msg = str(parsed["error"].get("message") or msg)
-    except Exception:
-        pass
-    if e.code == 404 or "not found" in msg.lower():
-        raise MissingSpeechModelError(eff_model, f'Speech model "{eff_model}" is not installed in Ollama yet.') from e
-    raise RuntimeError(f"Ollama {label} HTTP {e.code}: {msg}") from e
+def _iter_native_os_speech_pcm(cleaned: str, voice: str = ""):
+    """Zero-VRAM native OS TTS fallback yielding 24 kHz 16-bit LE mono PCM chunks."""
+    if IS_WINDOWS:
+        ps = shutil.which("powershell") or shutil.which("pwsh")
+        if ps:
+            esc_txt = cleaned.replace("'", "''")
+            esc_voice = (voice or "").strip().replace("'", "''")
+            voice_cmd = (
+                f"try {{ $s.SelectVoice('{esc_voice}') }} catch {{}}; "
+                if esc_voice and esc_voice.lower() != "default"
+                else ""
+            )
+            script = (
+                "Add-Type -AssemblyName System.Speech; "
+                "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                + voice_cmd
+                + "$ms = New-Object System.IO.MemoryStream; "
+                "$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo("
+                "24000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono); "
+                "$s.SetOutputToAudioStream($ms, $fmt); "
+                f"$s.Speak('{esc_txt}'); "
+                "$b = $ms.ToArray(); "
+                "[System.Console]::OpenStandardOutput().Write($b, 0, $b.Length)"
+            )
+            res = subprocess.run(
+                [ps, "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                timeout=90,
+                **_windows_subprocess_kwargs(new_group=False),
+            )
+            pcm = res.stdout or b""
+            if len(pcm) % 2:
+                pcm = pcm[:-1]
+            for off in range(0, len(pcm), 8192):
+                yield pcm[off:off + 8192]
+            return
+    elif IS_MAC and shutil.which("say"):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav_path = Path(tf.name)
+        try:
+            cmd = ["say", "-o", str(wav_path), "--file-format=WAVE", "--data-format=LEI16@24000", cleaned]
+            if voice and voice.lower() != "default":
+                cmd[1:1] = ["-v", voice]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+            if wav_path.is_file():
+                pcm = _wav_bytes_to_pcm16_mono(wav_path.read_bytes(), 24000)
+                for off in range(0, len(pcm), 8192):
+                    yield pcm[off:off + 8192]
+                return
+        finally:
+            try:
+                wav_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    else:
+        espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+        if espeak:
+            res = subprocess.run(
+                [espeak, "--stdout", cleaned],
+                capture_output=True,
+                timeout=60,
+            )
+            raw = res.stdout or b""
+            if raw[:4] == b"RIFF":
+                pcm = _wav_bytes_to_pcm16_mono(raw, 24000)
+                for off in range(0, len(pcm), 8192):
+                    yield pcm[off:off + 8192]
+                return
+
+
+def _wav_bytes_to_pcm16_mono(raw: bytes, target_rate: int = 24000) -> bytes:
+    """Extract 16-bit LE mono PCM from WAV bytes and linear-resample to target_rate."""
+    import array
+    import struct
+    src_rate = target_rate
+    channels = 1
+    pcm = b""
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        pos = 12
+        while pos + 8 <= len(raw):
+            cid = raw[pos:pos + 4]
+            csize = struct.unpack_from("<I", raw, pos + 4)[0]
+            data_start = pos + 8
+            data_end = min(len(raw), data_start + csize)
+            if cid == b"fmt " and csize >= 16:
+                channels = max(1, struct.unpack_from("<H", raw, data_start + 2)[0])
+                src_rate = max(1, struct.unpack_from("<I", raw, data_start + 4)[0])
+            elif cid == b"data":
+                pcm = raw[data_start:data_end]
+                break
+            pos = data_start + csize + (csize & 1)
+    if not pcm:
+        dpos = raw.find(b"data", 0, 128)
+        pcm = raw[dpos + 8:] if dpos != -1 else raw[44:]
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+    if not pcm:
+        return b""
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if channels > 1:
+        samples = array.array(
+            "h",
+            (sum(samples[i:i + channels]) // channels for i in range(0, len(samples) - channels + 1, channels)),
+        )
+    if src_rate != target_rate and len(samples) > 1:
+        n_in = len(samples)
+        n_out = max(1, int(round(n_in * target_rate / src_rate)))
+        step = src_rate / target_rate
+        out = array.array("h")
+        for i in range(n_out):
+            idx = i * step
+            j = int(idx)
+            if j >= n_in - 1:
+                out.append(samples[-1])
+            else:
+                frac = idx - j
+                out.append(int(round(samples[j] * (1.0 - frac) + samples[j + 1] * frac)))
+        samples = out
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
 
 
 def iter_ollama_speech_pcm(raw_text: str, model: str = DEFAULT_TTS_MODEL, voice: str = "", allow_empty: bool = False):
-    """Yield 24 kHz 16-bit LE mono PCM chunks streamed directly from Ollama /v1/audio/speech."""
+    """Yield 24 kHz 16-bit LE mono PCM chunks (supports 0-VRAM OS TTS and optional local speech server)."""
     cleaned = clean_tts_text(raw_text)
     if not cleaned:
         if allow_empty:
@@ -1154,6 +1357,11 @@ def iter_ollama_speech_pcm(raw_text: str, model: str = DEFAULT_TTS_MODEL, voice:
         raise ValueError("Nothing readable to speak.")
     eff_model = (model or DEFAULT_TTS_MODEL).strip()
     chunks = split_tts_chunks(cleaned, limit=3500)
+
+    if eff_model.lower() in ("system-tts", "os-voice", "native"):
+        for piece in chunks:
+            yield from _iter_native_os_speech_pcm(piece, voice=voice)
+        return
 
     for piece in chunks:
         payload = {"model": eff_model, "input": piece, "response_format": "pcm"}
@@ -1166,10 +1374,10 @@ def iter_ollama_speech_pcm(raw_text: str, model: str = DEFAULT_TTS_MODEL, voice:
         )
         try:
             resp = urllib.request.urlopen(req, timeout=180)
-        except urllib.error.HTTPError as e:
-            _raise_ollama_audio_http_error(e, eff_model, "TTS")
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and try again.") from e
+        except Exception:
+            # Seamless fallback to zero-VRAM native OS voice when Ollama speech endpoint is not running
+            yield from _iter_native_os_speech_pcm(piece, voice=voice)
+            continue
 
         header_checked = False
         carry = b""
@@ -1209,116 +1417,796 @@ def synthesize_ollama_speech(raw_text: str, model: str = DEFAULT_TTS_MODEL, voic
 
 def warm_ollama_model(model: str = DEFAULT_TTS_MODEL) -> dict:
     eff_model = (model or DEFAULT_TTS_MODEL).strip()
-    running, installed, _ = probe_ollama_detailed()
-    if not running:
-        raise RuntimeError(f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and try again.")
-
-    base = eff_model.split(":", 1)[0]
-    has_tag = ":" in eff_model
-    model_ok = any(
-        m == eff_model or m == f"{eff_model}:latest" or (not has_tag and m.split(":", 1)[0] == base)
-        for m in installed
-    )
-    if not model_ok:
-        raise MissingSpeechModelError(eff_model, f'Speech model "{eff_model}" is not installed in Ollama yet.')
-
-    if is_model_loaded(eff_model):
-        return {"ok": True, "model": eff_model, "already_loaded": True}
-
-    req = urllib.request.Request(
-        OLLAMA_GENERATE_URL,
-        data=json.dumps({"model": eff_model, "prompt": "", "keep_alive": "15m"}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            resp.read()
-        return {"ok": True, "model": eff_model, "loaded": True}
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        if "not found" in err_body.lower():
-            raise MissingSpeechModelError(eff_model, f'Speech model "{eff_model}" is not installed in Ollama yet.') from e
-        if e.code in (400, 404, 405, 501):
-            for _ in iter_ollama_speech_pcm(".", model=eff_model, allow_empty=True):
-                pass
-            return {"ok": True, "model": eff_model, "loaded": True, "via": "speech"}
-        raise RuntimeError(f"Ollama TTS warm HTTP {e.code}: {err_body}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and try again.") from e
+    return {"ok": True, "model": eff_model, "loaded": True}
 
 
 def unload_ollama_model(model: str = DEFAULT_TTS_MODEL) -> dict:
     eff_model = (model or DEFAULT_TTS_MODEL).strip()
-    if not eff_model:
-        return {"ok": True, "unloaded": False}
-    try:
-        if not is_model_loaded(eff_model):
-            return {"ok": True, "model": eff_model, "already_unloaded": True}
-    except Exception:
-        pass
-    req = urllib.request.Request(
-        OLLAMA_GENERATE_URL,
-        data=json.dumps({"model": eff_model, "prompt": "", "keep_alive": 0}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            resp.read()
-        return {"ok": True, "model": eff_model, "unloaded": True}
-    except Exception:
-        return {"ok": True, "model": eff_model, "unloaded": False}
+    return {"ok": True, "model": eff_model, "unloaded": True}
 
 
-def find_ollama_executable() -> str:
-    exe = shutil.which("ollama")
-    if exe:
-        return exe
-    if IS_WINDOWS:
-        cand = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
-        if cand.exists():
-            return str(cand)
-    elif IS_MAC:
-        for cand in (
-            "/Applications/Ollama.app/Contents/MacOS/Ollama",
-            "/opt/homebrew/bin/ollama",
-            "/usr/local/bin/ollama",
-        ):
-            if Path(cand).exists():
-                return cand
+# --- HUGGING FACE GGUF & LLAMA.CPP (LLAMA-SERVER) ENGINE ---
+def normalize_model_name(name: str) -> str:
+    n = (name or "").strip()
+    if n.endswith(":latest"):
+        n = n[:-7]
+    if n.lower().endswith(".gguf"):
+        n = n[:-5]
+    return n
+
+
+def _is_speech_model_name(name: str) -> bool:
+    low = (name or "").strip().lower()
+    return "audio" in low or "tts" in low or low.startswith("phonon")
+
+
+def _load_models_index() -> dict:
+    if MODELS_INDEX_FILE.is_file():
+        try:
+            data = json.loads(MODELS_INDEX_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {"models": {}, "hidden": []}
+
+
+def _save_models_index(idx_data: dict):
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    MODELS_INDEX_FILE.write_text(json.dumps(idx_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _infer_quant_from_filename(fname: str) -> str:
+    m = re.search(r"((?:UD-)?(?:IQ\d_[A-Z0-9_]+|Q\d_[A-Z0-9_]+|Q\d_0|BF16|F16|F32|NVFP4))", fname or "", re.I)
+    return m.group(1).upper() if m else ""
+
+
+def _infer_param_from_filename(fname: str) -> str:
+    em = re.search(r"(?:^|[-_:])e(\d+(?:\.\d+)?b)(?:$|[-_.])", fname or "", re.I)
+    if em:
+        return f"{em.group(1).upper()} eff"
+    sm = re.search(r"(?:^|[-_:])(\d+(?:\.\d+)?[bm])(?:$|[-_.])", fname or "", re.I)
+    if sm:
+        return sm.group(1).upper()
     return ""
 
 
-def normalize_model_name(name: str) -> str:
-    n = (name or "").strip()
-    return n[:-7] if n.endswith(":latest") else n
+def _friendly_alias_for_gguf(filename: str, repo: str = "") -> str:
+    low_f = (filename or "").lower()
+    low_r = (repo or "").lower()
+    for alias, meta in HF_PRESET_CATALOG.items():
+        if alias == "lfm3":
+            continue
+        if meta["file"].lower() == low_f or (meta["repo"].lower() == low_r and alias in low_f):
+            return alias
+    stem = Path(filename).stem
+    # Strip trailing quantization token from stem for a clean model name
+    clean = re.sub(r"[-_](?:UD-)?(?:AD-)?(?:IQ\d_[A-Z0-9_]+|Q\d_[A-Z0-9_]+|Q\d_0|BF16|F16|F32|NVFP4)(?:[-_]it)?$", "", stem, flags=re.I)
+    clean = re.sub(r"[-_]it$", "", clean, flags=re.I)
+    return clean.lower() or stem.lower()
+
+
+def discover_local_gguf_models() -> list:
+    """Scan local Hugging Face GGUF folders, HF Hub cache, and existing local GGUF blobs."""
+    idx_data = _load_models_index()
+    reg_models = idx_data.get("models") if isinstance(idx_data.get("models"), dict) else {}
+    hidden_set = set(idx_data.get("hidden") if isinstance(idx_data.get("hidden"), list) else [])
+
+    found_by_name = {}
+    seen_paths = set()
+
+    def _add_entry(name: str, path: Path, size: int, modified_ts: float, param: str = "", quant: str = "", repo: str = "", source: str = "hf"):
+        norm = normalize_model_name(name)
+        if not norm or norm in hidden_set or str(path) in hidden_set:
+            return
+        if _is_speech_model_name(norm):
+            return
+        rp = str(path.resolve())
+        if rp in seen_paths and norm in found_by_name:
+            return
+        seen_paths.add(rp)
+        mod_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(modified_ts or time.time()))
+        p_lbl = param or _infer_param_from_filename(path.name) or KNOWN_MODEL_PARAMS.get(norm.lower(), "")
+        q_lbl = quant or _infer_quant_from_filename(path.name) or "GGUF"
+        found_by_name[norm] = {
+            "name": norm,
+            "raw_name": norm,
+            "path": rp,
+            "size": int(size),
+            "modified_at": mod_iso,
+            "parameter_size": p_lbl,
+            "quantization": q_lbl,
+            "hf_repo": repo,
+            "source": source,
+        }
+
+    # 1. Registered models in models.json
+    for alias, meta in reg_models.items():
+        if not isinstance(meta, dict):
+            continue
+        p = Path(str(meta.get("path") or ""))
+        if p.is_file() and not p.name.endswith(".part"):
+            st = p.stat()
+            _add_entry(
+                alias,
+                p,
+                st.st_size,
+                st.st_mtime,
+                param=str(meta.get("parameter_size") or ""),
+                quant=str(meta.get("quantization") or ""),
+                repo=str(meta.get("hf_repo") or ""),
+                source="hf",
+            )
+
+    # 2. Scan DATA_DIR/models and ~/.local-agent/models for any .gguf files
+    scan_dirs = [MODELS_DIR]
+    home_models = Path.home() / ".local-agent" / "models"
+    if home_models != MODELS_DIR and home_models.is_dir():
+        scan_dirs.append(home_models)
+
+    for mdir in scan_dirs:
+        if not mdir.is_dir():
+            continue
+        for fp in sorted(mdir.rglob("*.gguf")):
+            if not fp.is_file() or fp.name.lower().startswith("mmproj") or fp.name.lower().startswith("mtp-"):
+                continue
+            if str(fp.resolve()) in seen_paths:
+                continue
+            st = fp.stat()
+            alias = _friendly_alias_for_gguf(fp.name)
+            _add_entry(alias, fp, st.st_size, st.st_mtime, source="hf")
+
+    # 3. Scan Hugging Face Hub cache (~/.cache/huggingface/hub/models--*)
+    hf_cache = Path(os.environ.get("HF_HUB_CACHE") or (Path.home() / ".cache" / "huggingface" / "hub"))
+    if hf_cache.is_dir():
+        for repo_dir in sorted(hf_cache.glob("models--*")):
+            snaps = repo_dir / "snapshots"
+            if not snaps.is_dir():
+                continue
+            repo_id = repo_dir.name[len("models--"):].replace("--", "/", 1)
+            for fp in sorted(snaps.rglob("*.gguf")):
+                if not fp.is_file() or fp.name.lower().startswith("mmproj") or fp.name.lower().startswith("mtp-"):
+                    continue
+                try:
+                    st = fp.stat()
+                    alias = _friendly_alias_for_gguf(fp.name, repo_id)
+                    _add_entry(alias, fp, st.st_size, st.st_mtime, repo=repo_id, source="hf-cache")
+                except OSError:
+                    continue
+
+    # 4. Zero-copy discovery of existing local GGUF blobs in ~/.ollama/models (no Ollama process needed)
+    ol_root = Path(os.environ.get("OLLAMA_MODELS") or (Path.home() / ".ollama" / "models"))
+    manifests_root = ol_root / "manifests"
+    blobs_root = ol_root / "blobs"
+    if manifests_root.is_dir() and blobs_root.is_dir():
+        for mf in sorted(manifests_root.rglob("*")):
+            if not mf.is_file():
+                continue
+            try:
+                rel = mf.relative_to(manifests_root).parts
+                if len(rel) >= 3:
+                    m_name = rel[-2] if rel[-1] == "latest" else f"{rel[-2]}:{rel[-1]}"
+                else:
+                    m_name = mf.name
+                if m_name in found_by_name or m_name in hidden_set:
+                    continue
+                data = json.loads(mf.read_text(encoding="utf-8"))
+                layers = data.get("layers") or []
+                model_layer = next((l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.model"), None)
+                if not model_layer:
+                    continue
+                digest = str(model_layer.get("digest") or "").replace(":", "-")
+                blob_path = blobs_root / digest
+                if not blob_path.is_file():
+                    continue
+                with blob_path.open("rb") as f:
+                    if f.read(4) != b"GGUF":
+                        continue
+                cfg_digest = str((data.get("config") or {}).get("digest") or "").replace(":", "-")
+                cfg_path = blobs_root / cfg_digest
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
+                if "audio" in str(cfg.get("renderer") or "").lower() or _is_speech_model_name(m_name):
+                    continue
+                st = blob_path.stat()
+                _add_entry(
+                    m_name,
+                    blob_path,
+                    st.st_size,
+                    mf.stat().st_mtime,
+                    param=str(cfg.get("model_type") or ""),
+                    quant=str(cfg.get("file_type") or "Q4_K_M"),
+                    source="local-gguf",
+                )
+            except Exception:
+                continue
+
+    return list(found_by_name.values())
+
+
+def find_llama_server_binary() -> str:
+    """Locate llama-server executable across runtime dir, PyInstaller bundle, PATH, or existing local installs."""
+    env_bin = os.environ.get("LLAMA_SERVER_BIN", "").strip()
+    if env_bin and Path(env_bin).is_file():
+        return str(Path(env_bin).resolve())
+
+    bin_name = "llama-server.exe" if IS_WINDOWS else "llama-server"
+
+    search_roots = [RUNTIME_DIR]
+    home_rt = Path.home() / ".local-agent" / "runtime"
+    if home_rt != RUNTIME_DIR:
+        search_roots.append(home_rt)
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        search_roots.append(Path(bundled) / "runtime")
+        search_roots.append(Path(bundled))
+
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        direct = root / bin_name
+        if direct.is_file():
+            return str(direct.resolve())
+        for cand in sorted(root.rglob(bin_name)):
+            if cand.is_file():
+                return str(cand.resolve())
+
+    which_bin = shutil.which("llama-server")
+    if which_bin:
+        return str(Path(which_bin).resolve())
+
+    if IS_WINDOWS:
+        win_cands = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "lib" / "ollama" / "llama-server.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Ollama" / "lib" / "ollama" / "llama-server.exe",
+            Path.home() / "scoop" / "apps" / "llama.cpp" / "current" / "llama-server.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "llama-server.exe",
+        ]
+        for c in win_cands:
+            if c.is_file():
+                return str(c.resolve())
+    elif IS_MAC:
+        for c in (
+            "/opt/homebrew/bin/llama-server",
+            "/usr/local/bin/llama-server",
+            "/Applications/Ollama.app/Contents/Resources/llama-server",
+            str(Path.home() / "Applications" / "Ollama.app" / "Contents" / "Resources" / "llama-server"),
+        ):
+            if Path(c).is_file():
+                return str(Path(c).resolve())
+    else:
+        for c in (
+            "/usr/local/bin/llama-server",
+            "/usr/bin/llama-server",
+            str(Path.home() / ".local" / "bin" / "llama-server"),
+            "/usr/local/lib/ollama/llama-server",
+            "/usr/lib/ollama/llama-server",
+            "/opt/ollama/lib/ollama/llama-server",
+        ):
+            if Path(c).is_file():
+                return str(Path(c).resolve())
+    return ""
+
+
+_HARDWARE_CACHE = {}
+_HARDWARE_LOCK = threading.Lock()
+
+
+def _apply_library_paths(env: dict, lib_dirs: list) -> dict:
+    out = dict(env)
+    if IS_WINDOWS:
+        out["PATH"] = os.pathsep.join(lib_dirs + [out.get("PATH", "")])
+    elif IS_MAC:
+        out["DYLD_LIBRARY_PATH"] = os.pathsep.join(lib_dirs + [out.get("DYLD_LIBRARY_PATH", "")])
+    else:
+        out["LD_LIBRARY_PATH"] = os.pathsep.join(lib_dirs + [out.get("LD_LIBRARY_PATH", "")])
+    return out
+
+
+def _probe_llama_devices(exe_path: Path, env: dict) -> list:
+    try:
+        res = subprocess.run(
+            [str(exe_path), "--list-devices"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            **_windows_subprocess_kwargs(new_group=False),
+        )
+    except Exception:
+        return []
+    combined = (res.stdout or "") + "\n" + (res.stderr or "")
+    devices = []
+    in_section = False
+    for raw_ln in combined.splitlines():
+        ln = raw_ln.strip()
+        if ln.lower().startswith("available devices:"):
+            in_section = True
+            continue
+        if in_section and ln:
+            low_ln = ln.lower()
+            if low_ln.startswith("(none)") or any(
+                sw in low_ln for sw in ("llvmpipe", "lavapipe", "swiftshader", "microsoft basic render", "softpipe")
+            ):
+                continue
+            if ":" in ln or any(k in low_ln for k in ("cuda", "vulkan", "rocm", "hip", "metal", "mtl", "sycl", "opencl", "gpu")):
+                devices.append(ln)
+    return devices
+
+
+def _friendly_hardware_label(raw_dev: str) -> str:
+    s = (raw_dev or "").strip()
+    if not s or s.upper() == "CPU":
+        return "CPU"
+    m = re.match(r"^([A-Za-z]+)\d*\s*:\s*([^(]+)", s)
+    if m:
+        backend_raw = m.group(1).strip().upper()
+        dev_name = m.group(2).strip()
+        backend_lbl = {
+            "CUDA": "CUDA",
+            "VULKAN": "Vulkan",
+            "ROCM": "ROCm",
+            "HIP": "ROCm",
+            "MTL": "Metal",
+            "METAL": "Metal",
+            "SYCL": "SYCL",
+        }.get(backend_raw, backend_raw)
+        return f"{dev_name} ({backend_lbl})"
+    return re.sub(r"\s*\([^)]*\)\s*$", "", s).strip() or s
+
+
+def detect_llama_hardware(exe_path: Path = None) -> dict:
+    """Auto-detect the best GPU backend (CUDA, Metal, ROCm/HIP, SYCL, Vulkan) or CPU fallback on Windows, macOS, and Linux."""
+    if exe_path is None:
+        bin_str = find_llama_server_binary()
+        if not bin_str:
+            return {"backend_path": "", "backend_dir": "", "device": "CPU", "label": "CPU", "has_gpu": False}
+        exe_path = Path(bin_str)
+    exe_resolved = exe_path.resolve()
+    key = str(exe_resolved)
+    with _HARDWARE_LOCK:
+        if key in _HARDWARE_CACHE:
+            return dict(_HARDWARE_CACHE[key])
+
+    exe_dir = exe_resolved.parent
+    sub_order = ("cuda_v13", "cuda_v12", "cuda", "rocm_v7_1", "rocm_v6", "rocm", "hip", "metal", "sycl", "openvino", "vulkan")
+    base_lib_dirs = [str(exe_dir)]
+    for sub in sub_order:
+        cand = exe_dir / sub
+        if cand.is_dir():
+            base_lib_dirs.append(str(cand))
+
+    base_env = _apply_library_paths(os.environ.copy(), base_lib_dirs)
+
+    # 1. Check if default directory already exposes a GPU device (e.g. official ggml-org/llama.cpp macOS Metal / Windows & Linux Vulkan or CUDA builds)
+    default_devs = _probe_llama_devices(exe_resolved, base_env)
+    if default_devs:
+        info = {
+            "backend_path": "",
+            "backend_dir": "",
+            "device": default_devs[0],
+            "label": _friendly_hardware_label(default_devs[0]),
+            "has_gpu": True,
+        }
+        with _HARDWARE_LOCK:
+            _HARDWARE_CACHE[key] = info
+        return dict(info)
+
+    # 2. Scan backend subdirectories (cuda_v13, cuda_v12, rocm, vulkan, metal) and probe via GGML_BACKEND_PATH
+    lib_patterns = ("*ggml-cuda*", "*ggml-hip*", "*ggml-rocm*", "*ggml-metal*", "*ggml-sycl*", "*ggml-vulkan*")
+    valid_exts = (".dll",) if IS_WINDOWS else ((".dylib", ".so") if IS_MAC else (".so",))
+    candidate_libs = []
+    for sub in sub_order:
+        sub_dir = exe_dir / sub
+        if not sub_dir.is_dir():
+            continue
+        for pat in lib_patterns:
+            for p in sorted(sub_dir.glob(pat)):
+                if p.is_file() and any(p.name.lower().endswith(ext) or (".so." in p.name.lower()) for ext in valid_exts):
+                    if p not in candidate_libs:
+                        candidate_libs.append(p)
+
+    for lib_file in candidate_libs:
+        probe_dirs = [str(lib_file.parent), str(exe_dir)] + [d for d in base_lib_dirs if d not in (str(lib_file.parent), str(exe_dir))]
+        probe_env = _apply_library_paths(os.environ.copy(), probe_dirs)
+        probe_env["GGML_BACKEND_PATH"] = str(lib_file)
+        devs = _probe_llama_devices(exe_resolved, probe_env)
+        if devs:
+            info = {
+                "backend_path": str(lib_file),
+                "backend_dir": str(lib_file.parent),
+                "device": devs[0],
+                "label": _friendly_hardware_label(devs[0]),
+                "has_gpu": True,
+            }
+            with _HARDWARE_LOCK:
+                _HARDWARE_CACHE[key] = info
+            return dict(info)
+
+    if IS_MAC and ("arm" in (platform.machine() or "").lower() or "aarch64" in (platform.machine() or "").lower()):
+        info = {"backend_path": "", "backend_dir": "", "device": "Apple Metal GPU", "label": "Apple Metal GPU", "has_gpu": True}
+    else:
+        info = {"backend_path": "", "backend_dir": "", "device": "CPU", "label": "CPU", "has_gpu": False}
+    with _HARDWARE_LOCK:
+        _HARDWARE_CACHE[key] = info
+    return dict(info)
+
+
+def _build_llama_server_env(exe_path: Path, force_cpu: bool = False) -> dict:
+    exe_dir = exe_path.resolve().parent
+    hw = detect_llama_hardware(exe_path) if not force_cpu else {"backend_path": "", "backend_dir": ""}
+    lib_dirs = [str(exe_dir)]
+    if hw.get("backend_dir"):
+        lib_dirs.insert(0, hw["backend_dir"])
+    for sub in ("cuda_v13", "cuda_v12", "vulkan", "rocm_v7_1", "rocm", "metal"):
+        cand = exe_dir / sub
+        if cand.is_dir() and str(cand) not in lib_dirs:
+            lib_dirs.append(str(cand))
+    env = _apply_library_paths(os.environ.copy(), lib_dirs)
+    if not force_cpu and hw.get("backend_path") and "GGML_BACKEND_PATH" not in env:
+        env["GGML_BACKEND_PATH"] = hw["backend_path"]
+    return env
+
+
+def install_llama_runtime(emit=None, cancel_check=None) -> str:
+    """Auto-download official prebuilt ggml-org/llama.cpp binary release for Windows, macOS, or Linux."""
+    existing = find_llama_server_binary()
+    if existing:
+        return existing
+
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    if emit:
+        emit({"status": "Fetching latest llama.cpp release metadata..."})
+
+    req = urllib.request.Request(
+        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5",
+        headers={"User-Agent": _WEB_UA},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        releases = json.loads(resp.read().decode("utf-8"))
+
+    arch = (platform.machine() or "").lower()
+    is_arm = "arm" in arch or "aarch64" in arch
+
+    if IS_WINDOWS:
+        patterns = (
+            ["bin-win-vulkan-arm64.zip", "bin-win-cpu-arm64.zip"]
+            if is_arm
+            else ["bin-win-vulkan-x64.zip", "bin-win-cpu-x64.zip"]
+        )
+    elif IS_MAC:
+        patterns = ["bin-macos-arm64.tar.gz", "bin-macos-arm64.zip"] if is_arm else ["bin-macos-x64.tar.gz", "bin-macos-x64.zip"]
+    else:
+        patterns = (
+            ["bin-ubuntu-vulkan-arm64.tar.gz", "bin-ubuntu-arm64.tar.gz"]
+            if is_arm
+            else ["bin-ubuntu-vulkan-x64.tar.gz", "bin-ubuntu-x64.tar.gz"]
+        )
+
+    chosen_asset = None
+    for rel in (releases if isinstance(releases, list) else []):
+        assets = rel.get("assets") or []
+        for pat in patterns:
+            for a in assets:
+                aname = str(a.get("name") or "")
+                if pat in aname and not aname.startswith("cudart-"):
+                    chosen_asset = a
+                    break
+            if chosen_asset:
+                break
+        if chosen_asset:
+            break
+
+    if not chosen_asset:
+        raise RuntimeError("Could not find a matching prebuilt llama.cpp release for this OS/architecture.")
+
+    dl_url = str(chosen_asset.get("browser_download_url") or "")
+    aname = str(chosen_asset.get("name") or "llama-runtime.zip")
+    archive_path = RUNTIME_DIR / aname
+
+    dl_req = urllib.request.Request(dl_url, headers={"User-Agent": _WEB_UA})
+    with urllib.request.urlopen(dl_req, timeout=300) as resp:
+        total = int(resp.headers.get("Content-Length") or chosen_asset.get("size") or 0)
+        done = 0
+        last_emit = 0.0
+        with archive_path.open("wb") as out_f:
+            while True:
+                if cancel_check and cancel_check():
+                    raise CancelledError()
+                blk = resp.read(65536)
+                if not blk:
+                    break
+                out_f.write(blk)
+                done += len(blk)
+                now = time.monotonic()
+                if emit and (now - last_emit >= 0.15 or done == total):
+                    last_emit = now
+                    emit({"status": f"Installing llama.cpp runtime ({aname})", "completed": done, "total": total})
+
+    if emit:
+        emit({"status": f"Extracting {aname}..."})
+    if aname.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(RUNTIME_DIR)
+    elif aname.endswith(".tar.gz") or aname.endswith(".tgz"):
+        with tarfile.open(archive_path, "r:gz") as tf:
+            tf.extractall(RUNTIME_DIR)
+    try:
+        archive_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    bin_path = find_llama_server_binary()
+    if bin_path and not IS_WINDOWS:
+        try:
+            os.chmod(bin_path, 0o755)
+            for p in Path(bin_path).parent.iterdir():
+                if p.is_file() and (p.name.startswith("llama-") or ".so" in p.name or p.name.endswith(".dylib")):
+                    os.chmod(p, 0o755)
+        except OSError:
+            pass
+        # On headless Linux machines without libvulkan.so.1, remove libggml-vulkan.so if it blocks startup
+        if not IS_MAC:
+            try:
+                chk_env = _apply_library_paths(os.environ.copy(), [str(Path(bin_path).parent)])
+                chk = subprocess.run([bin_path, "--version"], env=chk_env, capture_output=True, text=True, timeout=5)
+                if chk.returncode != 0 and "libvulkan" in ((chk.stderr or "") + (chk.stdout or "")).lower():
+                    for vk in Path(bin_path).parent.glob("*ggml-vulkan*"):
+                        vk.unlink(missing_ok=True)
+            except Exception:
+                pass
+    with _HARDWARE_LOCK:
+        _HARDWARE_CACHE.clear()
+    if not bin_path:
+        raise RuntimeError("llama-server binary was not found after extracting runtime archive.")
+    return bin_path
+
+
+class LlamaServerManager:
+    """Manages local llama.cpp llama-server subprocess for Hugging Face GGUF models with instant VRAM unload."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.proc: subprocess.Popen = None
+        self.port: int = LLAMA_BASE_PORT
+        self.loaded_model: str = ""
+        self.loaded_path: str = ""
+        self.loaded_ctx: int = 0
+        self.loaded_slots: int = 0
+
+    def is_running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def is_model_loaded(self, model_name: str) -> bool:
+        if not self.is_running() or not self.loaded_model:
+            return False
+        norm_req = normalize_model_name(model_name)
+        norm_cur = normalize_model_name(self.loaded_model)
+        if norm_req == norm_cur:
+            return True
+        if norm_req in ("lfm3", "lfm3:1.7b") and norm_cur in ("lfm3", "lfm3:1.7b"):
+            return True
+        return False
+
+    def _health_ok(self, port: int) -> bool:
+        try:
+            with urllib.request.urlopen(f"http://{LLAMA_HOST}:{port}/health", timeout=1.2) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pick_free_port(preferred: int) -> int:
+        host = LLAMA_HOST or "127.0.0.1"
+        for cand in (preferred, 0):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind((host, cand))
+                    return int(s.getsockname()[1])
+            except OSError:
+                continue
+        return preferred
+
+    def unload(self) -> list:
+        with self._lock:
+            return self._unload_unlocked()
+
+    def _unload_unlocked(self) -> list:
+        unloaded = []
+        if self.proc is not None:
+            if self.loaded_model:
+                unloaded.append(self.loaded_model)
+            try:
+                if self.proc.poll() is None:
+                    terminate_process_tree(self.proc)
+                    try:
+                        self.proc.wait(timeout=3)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self.proc = None
+        self.loaded_model = ""
+        self.loaded_path = ""
+        self.loaded_ctx = 0
+        self.loaded_slots = 0
+        return unloaded
+
+    def ensure_running(
+        self,
+        model_name: str,
+        num_ctx: int = NUM_CTX,
+        parallel_slots: int = 1,
+        cancel_check=None,
+    ) -> int:
+        details = discover_local_gguf_models()
+        installed_names = [d["name"] for d in details]
+        resolved_name = resolve_ollama_model(model_name, installed_names)
+        entry = next((d for d in details if d["name"] == resolved_name), None)
+        if not entry:
+            raise RuntimeError(
+                f'Model "{model_name}" is not downloaded on this PC yet. Click Pull / Download in the UI to fetch it from Hugging Face.'
+            )
+        gguf_path = Path(entry["path"])
+        if not gguf_path.is_file():
+            raise RuntimeError(f"GGUF model file not found on disk: {gguf_path}")
+
+        req_ctx = max(4096, int(num_ctx or NUM_CTX))
+        req_slots = max(1, min(4, int(parallel_slots or 1)))
+
+        with self._lock:
+            if (
+                self.is_running()
+                and self.loaded_path == str(gguf_path)
+                and self.loaded_ctx >= req_ctx
+                and self.loaded_slots >= req_slots
+                and self._health_ok(self.port)
+            ):
+                self.loaded_model = resolved_name
+                return self.port
+
+            self._unload_unlocked()
+
+            exe_str = find_llama_server_binary()
+            if not exe_str:
+                exe_str = install_llama_runtime(cancel_check=cancel_check)
+            exe_path = Path(exe_str)
+            gpu_env = _build_llama_server_env(exe_path, force_cpu=False)
+            cpu_env = _build_llama_server_env(exe_path, force_cpu=True)
+
+            total_ctx = req_ctx * req_slots
+            port = self._pick_free_port(LLAMA_BASE_PORT)
+            ngl = os.environ.get("AGENT_NGL", "auto").strip() or "auto"
+
+            launch_attempts = [
+                (
+                    gpu_env,
+                    [
+                        str(exe_path),
+                        "-m", str(gguf_path),
+                        "--host", LLAMA_HOST,
+                        "--port", str(port),
+                        "-c", str(total_ctx),
+                        "-ngl", ngl,
+                        "-fa", "auto",
+                        "-np", str(req_slots),
+                        "--jinja",
+                        "--reasoning-format", "deepseek",
+                        "--no-webui",
+                        "--log-disable",
+                    ],
+                ),
+                (
+                    gpu_env,
+                    [
+                        str(exe_path),
+                        "-m", str(gguf_path),
+                        "--host", LLAMA_HOST,
+                        "--port", str(port),
+                        "-c", str(total_ctx),
+                        "-ngl", "99" if ngl == "auto" else ngl,
+                        "-np", str(req_slots),
+                        "--jinja",
+                    ],
+                ),
+                (
+                    cpu_env,
+                    [
+                        str(exe_path),
+                        "-m", str(gguf_path),
+                        "--host", LLAMA_HOST,
+                        "--port", str(port),
+                        "-c", str(total_ctx),
+                        "-ngl", "0",
+                        "-np", str(req_slots),
+                        "--jinja",
+                    ],
+                ),
+            ]
+
+            for attempt_env, argv in launch_attempts:
+                popen_kw = {
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                    "env": attempt_env,
+                }
+                if IS_WINDOWS:
+                    popen_kw.update(_windows_subprocess_kwargs(new_group=True))
+                else:
+                    popen_kw["start_new_session"] = True
+
+                proc = subprocess.Popen(argv, **popen_kw)
+                self.proc = proc
+                deadline = time.monotonic() + 120.0
+                started_ok = False
+                while time.monotonic() < deadline:
+                    if cancel_check and cancel_check():
+                        self._unload_unlocked()
+                        raise CancelledError()
+                    if proc.poll() is not None:
+                        break
+                    if self._health_ok(port):
+                        started_ok = True
+                        break
+                    time.sleep(0.18)
+
+                if started_ok:
+                    self.port = port
+                    self.loaded_model = resolved_name
+                    self.loaded_path = str(gguf_path)
+                    self.loaded_ctx = req_ctx
+                    self.loaded_slots = req_slots
+                    return port
+
+                self._unload_unlocked()
+
+            raise RuntimeError(f'Failed to start llama-server for "{resolved_name}" ({gguf_path.name}).')
+
+
+LLAMA_MANAGER = LlamaServerManager()
+
+
+def unload_all_ollama_models() -> list:
+    """Immediately unload active GGUF model from llama-server (and any Ollama model if running) to free GPU VRAM."""
+    unloaded = LLAMA_MANAGER.unload()
+    try:
+        with urllib.request.urlopen(OLLAMA_PS_URL, timeout=0.6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        loaded = [
+            str(m.get("name") or "").strip()
+            for m in data.get("models", [])
+            if str(m.get("name") or "").strip()
+        ]
+        for name in loaded:
+            req = urllib.request.Request(
+                OLLAMA_GENERATE_URL,
+                data=json.dumps({"model": name, "prompt": "", "keep_alive": 0}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=2.5) as r:
+                    r.read()
+                if name not in unloaded:
+                    unloaded.append(name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return unloaded
+
+
+def find_ollama_executable() -> str:
+    return find_llama_server_binary()
 
 
 def probe_ollama_detailed() -> tuple:
-    installed = []
-    details_list = []
-    seen = set()
-    try:
-        with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=2.5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            for m in data.get("models", []):
-                raw_name = str(m.get("name") or "").strip()
-                name = normalize_model_name(raw_name)
-                if not name or name in seen:
-                    continue
-                seen.add(name)
-                installed.append(name)
-                det = m.get("details") if isinstance(m.get("details"), dict) else {}
-                details_list.append({
-                    "name": name,
-                    "raw_name": raw_name,
-                    "size": int(m.get("size") or 0),
-                    "modified_at": str(m.get("modified_at") or ""),
-                    "parameter_size": str(det.get("parameter_size") or ""),
-                    "quantization": str(det.get("quantization_level") or ""),
-                })
-        return True, installed, details_list
-    except Exception:
-        return False, [], []
+    details_list = discover_local_gguf_models()
+    installed = [d["name"] for d in details_list]
+    has_bin = bool(find_llama_server_binary())
+    return has_bin, installed, details_list
 
 
 def probe_ollama() -> tuple:
@@ -1326,45 +2214,44 @@ def probe_ollama() -> tuple:
     return running, installed
 
 
-def try_start_ollama() -> bool:
-    running, _ = probe_ollama()
-    if running:
+def resolve_ollama_model(model_name: str, installed: list = None) -> str:
+    """Resolve model alias/tag mismatches (e.g. 'lfm3:1.7b' <-> 'lfm3') against installed local GGUF models."""
+    raw = (model_name or "").strip() or DEFAULT_MODEL
+    norm = normalize_model_name(raw)
+    if installed is None:
+        _, installed = probe_ollama()
+    if not installed:
+        return raw
+    if raw in installed:
+        return raw
+    if norm in installed:
+        return norm
+    if norm in ("lfm3", "lfm3:1.7b"):
+        if "lfm3:1.7b" in installed:
+            return "lfm3:1.7b"
+        if "lfm3" in installed:
+            return "lfm3"
+        for m in installed:
+            if m.lower().startswith("lfm3") and not _is_speech_model_name(m):
+                return m
+    if ":" not in norm:
+        for m in installed:
+            if m.split(":", 1)[0].lower() == norm.lower() and not _is_speech_model_name(m):
+                return m
+    base = norm.split(":", 1)[0]
+    for m in installed:
+        if m.lower() == base.lower():
+            return m
+    return raw
+
+
+def try_start_ollama(wait_seconds: float = 6.0) -> bool:
+    if find_llama_server_binary():
         return True
-    exe = find_ollama_executable()
-    if not exe:
-        return False
-    ol_env = os.environ.copy()
-    ol_env.setdefault("OLLAMA_NUM_PARALLEL", "2")
-    ol_env.setdefault("OLLAMA_MAX_LOADED_MODELS", "2")
     try:
-        if IS_MAC and Path("/Applications/Ollama.app").exists():
-            subprocess.Popen(["open", "-a", "Ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ol_env)
-        elif IS_WINDOWS:
-            subprocess.Popen(
-                [exe, "serve"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=ol_env,
-                **_windows_subprocess_kwargs(new_group=False),
-            )
-        else:
-            subprocess.Popen(
-                [exe, "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=ol_env,
-                start_new_session=True,
-            )
+        return bool(install_llama_runtime())
     except Exception:
         return False
-
-    for _ in range(12):
-        time.sleep(0.25)
-        ok, _ = probe_ollama()
-        if ok:
-            return True
-    return False
 
 
 def infer_model_param_label(model_name: str, details_map: dict = None) -> str:
@@ -1380,6 +2267,8 @@ def infer_model_param_label(model_name: str, details_map: dict = None) -> str:
     low = n.lower()
     if low in KNOWN_MODEL_PARAMS:
         return KNOWN_MODEL_PARAMS[low]
+    if low in HF_PRESET_CATALOG:
+        return HF_PRESET_CATALOG[low]["param"]
     if ":" in low:
         tag = low.split(":", 1)[1]
         em = re.search(r"(?:^|-)e(\d+(?:\.\d+)?b)(?:$|-)", tag, re.I)
@@ -1388,6 +2277,9 @@ def infer_model_param_label(model_name: str, details_map: dict = None) -> str:
         sm = re.search(r"(?:^|-)(\d+(?:\.\d+)?[bm])(?:$|-)", tag, re.I)
         if sm:
             return sm.group(1).upper()
+    sm2 = _infer_param_from_filename(low)
+    if sm2:
+        return sm2
     base = low.split(":", 1)[0]
     if base in KNOWN_MODEL_PARAMS:
         return KNOWN_MODEL_PARAMS[base]
@@ -1404,7 +2296,9 @@ def _parse_param_b(label: str) -> float:
 
 def _model_family_rank(name: str) -> int:
     low = (name or "").lower()
-    if low.startswith("lfm3") and "audio" not in low:
+    if _is_speech_model_name(low):
+        return 9
+    if low.startswith("lfm3"):
         return 0
     if low.startswith("granite4.2") or low.startswith("granite"):
         return 1
@@ -1418,9 +2312,10 @@ def _model_family_rank(name: str) -> int:
 
 
 def get_models_info() -> dict:
-    running, installed, installed_details = probe_ollama_detailed()
+    has_bin, installed, installed_details = probe_ollama_detailed()
     settings = load_settings()
-    saved_default = settings.get("default_model", "").strip()
+    raw_saved_default = settings.get("default_model", "").strip()
+    saved_default = resolve_ollama_model(raw_saved_default, installed) if raw_saved_default else ""
 
     details_by_name = {}
     for d in installed_details:
@@ -1439,7 +2334,7 @@ def get_models_info() -> dict:
         merged.insert(0, saved_default)
 
     model_params = {}
-    for m in merged + [saved_default, DEFAULT_TTS_MODEL, "phonon", "phonon:en"]:
+    for m in merged + [saved_default, "system-tts", DEFAULT_TTS_MODEL, "phonon", "phonon:en"]:
         if m and m not in model_params:
             lbl = infer_model_param_label(m, details_by_name)
             if lbl:
@@ -1453,17 +2348,26 @@ def get_models_info() -> dict:
         m.lower(),
     ))
 
-    active_default = saved_default or DEFAULT_MODEL
+    active_default = resolve_ollama_model(saved_default or DEFAULT_MODEL, installed)
     if not saved_default and "AGENT_MODEL" not in os.environ and installed:
-        if not any(m == DEFAULT_MODEL or m == f"{DEFAULT_MODEL}:latest" or (DEFAULT_MODEL == "lfm3:1.7b" and m == "lfm3") for m in installed):
-            ordered_installed = sorted(installed, key=lambda m: (_model_family_rank(m), _parse_param_b(model_params.get(m, "")), m.lower()))
+        if active_default not in installed_set:
+            chat_installed = [m for m in installed if not _is_speech_model_name(m)] or installed
+            ordered_installed = sorted(
+                chat_installed,
+                key=lambda m: (_model_family_rank(m), _parse_param_b(model_params.get(m, "")), m.lower()),
+            )
             active_default = ordered_installed[0]
-        elif DEFAULT_MODEL not in installed and "lfm3" in installed and DEFAULT_MODEL == "lfm3:1.7b":
-            active_default = "lfm3"
 
+    hw = detect_llama_hardware() if has_bin else {"label": "CPU", "device": "CPU", "has_gpu": False}
     return {
-        "ollama_running": running,
-        "has_ollama_bin": bool(find_ollama_executable()),
+        "ollama_running": has_bin,
+        "has_ollama_bin": True,
+        "engine": "huggingface-llamacpp",
+        "hardware": hw.get("label", "CPU"),
+        "hardware_raw": hw.get("device", "CPU"),
+        "has_gpu": bool(hw.get("has_gpu")),
+        "loaded_model": LLAMA_MANAGER.loaded_model if LLAMA_MANAGER.is_running() else "",
+        "loaded_models": [LLAMA_MANAGER.loaded_model] if (LLAMA_MANAGER.is_running() and LLAMA_MANAGER.loaded_model) else [],
         "installed": installed,
         "installed_details": installed_details,
         "models": merged,
@@ -1509,17 +2413,7 @@ def trim_history(history: list):
 
 
 def is_model_loaded(model: str) -> bool:
-    try:
-        with urllib.request.urlopen(OLLAMA_PS_URL, timeout=1.5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        loaded = [m.get("name", "") for m in data.get("models", [])]
-        target = model.split(":")[0]
-        return any(
-            n == model or n == f"{model}:latest" or (":" not in model and n.split(":")[0] == target)
-            for n in loaded
-        )
-    except Exception:
-        return True
+    return LLAMA_MANAGER.is_model_loaded(model)
 
 
 class _StreamTagFilter:
@@ -1611,6 +2505,55 @@ class _StreamTagFilter:
         self._buf = ""
 
 
+def _format_openai_messages(messages: list) -> list:
+    """Normalize internal chat/tool history to OpenAI /v1/chat/completions schema for llama-server."""
+    out = []
+    pending_tc_ids = []
+    call_seq = 0
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content") or ""
+        if role == "assistant" and m.get("tool_calls"):
+            norm_tcs = []
+            pending_tc_ids = []
+            for tc in m["tool_calls"]:
+                call_seq += 1
+                tc_id = str(tc.get("id") or f"call_{call_seq}")
+                fn = tc.get("function") or {}
+                fn_name = str(fn.get("name") or "")
+                fn_args = fn.get("arguments")
+                if isinstance(fn_args, dict):
+                    args_str = json.dumps(fn_args, ensure_ascii=False)
+                elif fn_args is None:
+                    args_str = "{}"
+                else:
+                    args_str = str(fn_args)
+                norm_tcs.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {"name": fn_name, "arguments": args_str},
+                })
+                pending_tc_ids.append((tc_id, fn_name))
+            out.append({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": norm_tcs,
+            })
+        elif role == "tool":
+            tc_id, fn_name = pending_tc_ids.pop(0) if pending_tc_ids else (f"call_{call_seq}", "")
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": str(m.get("tool_call_id") or tc_id),
+                "content": str(content),
+            }
+            if fn_name:
+                tool_msg["name"] = fn_name
+            out.append(tool_msg)
+        else:
+            out.append({"role": role, "content": str(content)})
+    return out
+
+
 def stream_ollama(
     messages: list,
     model: str,
@@ -1625,33 +2568,11 @@ def stream_ollama(
     max_parallel_slots: int = 1,
 ) -> dict:
     eff_ctx = int(num_ctx or NUM_CTX)
-    opts = {
-        "temperature": 0.1,
-        "top_k": 50,
-        "repeat_penalty": 1.1,
-        "num_ctx": eff_ctx,
-    }
-    if num_predict is not None:
-        opts["num_predict"] = int(num_predict)
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "keep_alive": "15m",
-        "options": opts,
-    }
     eff_tools = tools if tools is not None else (build_tools_schema(["system"]) if tools_enabled else [])
-    if eff_tools:
-        payload["tools"] = eff_tools
 
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
     full_thinking = []
     full_content = []
-    tool_calls = []
+    tc_accum = {}
     prompt_tokens = 0
     eval_tokens = 0
     current_phase = None
@@ -1671,27 +2592,74 @@ def stream_ollama(
     tag_filter = _StreamTagFilter(on_content=emit_clean)
 
     with acquire_ollama_slot(max_slots=max_parallel_slots, cancel_check=cancel_check):
+        if not LLAMA_MANAGER.is_model_loaded(model):
+            set_phase("loading")
+        port = LLAMA_MANAGER.ensure_running(
+            model,
+            num_ctx=eff_ctx,
+            parallel_slots=max_parallel_slots,
+            cancel_check=cancel_check,
+        )
+        payload = {
+            "model": model,
+            "messages": _format_openai_messages(messages),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": 0.1,
+            "top_k": 50,
+            "repeat_penalty": 1.1,
+        }
+        if num_predict is not None and int(num_predict) > 0:
+            payload["max_tokens"] = int(num_predict)
+        if eff_tools:
+            payload["tools"] = eff_tools
+
+        req = urllib.request.Request(
+            f"http://{LLAMA_HOST}:{port}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 for raw_line in resp:
                     if cancel_check and cancel_check():
                         raise CancelledError()
-                    line = raw_line.decode("utf-8").strip()
+                    line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
-                    chunk = json.loads(line)
-                    if chunk.get("error"):
-                        raise RuntimeError(chunk["error"])
-                    m = chunk.get("message") or {}
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            tag_filter.flush()
+                            break
+                        chunk = json.loads(data_str)
+                    else:
+                        chunk = json.loads(line)
 
-                    t_delta = m.get("thinking") or ""
+                    if chunk.get("error"):
+                        err_obj = chunk["error"]
+                        err_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+                        raise RuntimeError(err_msg)
+
+                    usage = chunk.get("usage")
+                    if isinstance(usage, dict):
+                        prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens)
+                        eval_tokens = int(usage.get("completion_tokens") or eval_tokens)
+
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    choice0 = choices[0]
+                    delta = choice0.get("delta") or choice0.get("message") or {}
+
+                    t_delta = delta.get("reasoning_content") or delta.get("thinking") or ""
                     if t_delta:
                         set_phase("thinking")
                         full_thinking.append(t_delta)
                         if on_thinking:
                             on_thinking(t_delta)
 
-                    c_delta = m.get("content") or ""
+                    c_delta = delta.get("content") or ""
                     if c_delta:
                         full_content.append(c_delta)
                         tag_filter.feed(c_delta)
@@ -1701,22 +2669,51 @@ def stream_ollama(
                         elif pend == "tool_call" or current_phase is None:
                             set_phase("working")
 
-                    if m.get("tool_calls"):
+                    if delta.get("tool_calls"):
                         set_phase("working")
-                        tool_calls.extend(m["tool_calls"])
+                        for tc_d in delta["tool_calls"]:
+                            idx = int(tc_d.get("index") or 0)
+                            cur = tc_accum.get(idx)
+                            if cur is None:
+                                cur = {
+                                    "id": str(tc_d.get("id") or f"call_{idx + 1}"),
+                                    "name": "",
+                                    "arguments_raw": "",
+                                }
+                                tc_accum[idx] = cur
+                            elif tc_d.get("id"):
+                                cur["id"] = str(tc_d["id"])
+                            fn_d = tc_d.get("function") or {}
+                            if fn_d.get("name"):
+                                cur["name"] += str(fn_d["name"])
+                            if fn_d.get("arguments"):
+                                cur["arguments_raw"] += str(fn_d["arguments"])
 
-                    if chunk.get("done"):
+                    if choice0.get("finish_reason"):
                         tag_filter.flush()
-                        prompt_tokens = int(chunk.get("prompt_eval_count") or 0)
-                        eval_tokens = int(chunk.get("eval_count") or 0)
-                        break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Ollama HTTP {e.code}: {err_body}") from e
+            raise RuntimeError(f"llama-server HTTP {e.code}: {err_body}") from e
         except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and try again."
-            ) from e
+            raise RuntimeError(f"Local llama-server connection error: {e}") from e
+
+    tool_calls = []
+    for idx in sorted(tc_accum.keys()):
+        item = tc_accum[idx]
+        raw_args = (item["arguments_raw"] or "").strip()
+        parsed_args = {}
+        if raw_args:
+            try:
+                parsed_args = json.loads(raw_args)
+            except Exception:
+                parsed_args = {}
+        if not isinstance(parsed_args, dict):
+            parsed_args = {}
+        if item["name"]:
+            tool_calls.append({
+                "id": item["id"],
+                "function": {"name": item["name"], "arguments": parsed_args},
+            })
 
     used = prompt_tokens + eval_tokens
     if used <= 0:
@@ -1737,45 +2734,271 @@ def stream_ollama(
     }
 
 
+def search_huggingface_gguf(query: str, limit: int = 10) -> list:
+    """Search Hugging Face Hub API for GGUF repositories."""
+    q = (query or "").strip()
+    search_term = f"{q} GGUF" if q and "gguf" not in q.lower() else (q or "GGUF")
+    url = f"{HF_API_BASE}/api/models?" + urllib.parse.urlencode({
+        "search": search_term,
+        "filter": "gguf",
+        "sort": "downloads",
+        "direction": "-1",
+        "limit": str(max(1, min(20, int(limit or 10)))),
+    })
+    req = urllib.request.Request(url, headers={"User-Agent": _WEB_UA})
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        items = json.loads(resp.read().decode("utf-8"))
+    out = []
+    for it in (items if isinstance(items, list) else []):
+        repo_id = str(it.get("id") or "").strip()
+        if not repo_id:
+            continue
+        out.append({
+            "id": repo_id,
+            "downloads": int(it.get("downloads") or 0),
+            "likes": int(it.get("likes") or 0),
+            "param": _infer_param_from_filename(repo_id),
+        })
+    return out
+
+
+def _select_best_gguf_from_repo(repo_id: str, quant_hint: str = "") -> tuple:
+    """Query Hugging Face repo metadata and pick the best matching .gguf file."""
+    url = f"{HF_API_BASE}/api/models/{repo_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": _WEB_UA})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        info = json.loads(resp.read().decode("utf-8"))
+    siblings = info.get("siblings") or []
+    ggufs = []
+    for s in siblings:
+        rf = str(s.get("rfilename") or "").strip()
+        low = rf.lower()
+        if not low.endswith(".gguf"):
+            continue
+        base_name = Path(rf).name.lower()
+        if base_name.startswith("mmproj") or base_name.startswith("mtp-") or "/mtp-" in low:
+            continue
+        ggufs.append(rf)
+    if not ggufs:
+        raise RuntimeError(f'No GGUF model files found in Hugging Face repo "{repo_id}".')
+
+    if quant_hint:
+        qh = quant_hint.strip().lower()
+        for rf in ggufs:
+            if rf.lower() == qh or Path(rf).name.lower() == qh:
+                return rf, _infer_quant_from_filename(rf) or quant_hint.upper()
+        for rf in ggufs:
+            if qh in rf.lower():
+                return rf, _infer_quant_from_filename(rf) or quant_hint.upper()
+
+    pref_order = ("q4_k_m", "q4_k_s", "q4_0", "iq4_nl", "iq4_xs", "q5_k_m", "q5_k_s", "q6_k", "q8_0")
+    for pq in pref_order:
+        for rf in ggufs:
+            if pq in rf.lower():
+                return rf, pq.upper()
+    return ggufs[0], _infer_quant_from_filename(ggufs[0]) or "GGUF"
+
+
+def resolve_hf_pull_target(model_spec: str) -> dict:
+    """Resolve a preset alias, 'owner/repo[:quant]', direct HF URL, or search keyword to a downloadable HF GGUF."""
+    spec = (model_spec or "").strip()
+    if not spec:
+        spec = DEFAULT_MODEL
+    low = spec.lower()
+
+    if low in HF_PRESET_CATALOG:
+        meta = HF_PRESET_CATALOG[low]
+        alias = "lfm3:1.7b" if low == "lfm3" else low
+        return {
+            "alias": alias,
+            "repo": meta["repo"],
+            "file": meta["file"],
+            "param": meta["param"],
+            "quant": meta["quant"],
+            "url": f"{HF_API_BASE}/{meta['repo']}/resolve/main/{urllib.parse.quote(meta['file'])}",
+        }
+
+    # Direct Hugging Face URL
+    m_url = re.match(r"^https?://huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+\.gguf)$", spec, re.I)
+    if m_url:
+        repo_id, rev, rfile = m_url.group(1), m_url.group(2), m_url.group(3)
+        fname = Path(rfile).name
+        alias = _friendly_alias_for_gguf(fname, repo_id)
+        return {
+            "alias": alias,
+            "repo": repo_id,
+            "file": rfile,
+            "param": _infer_param_from_filename(fname),
+            "quant": _infer_quant_from_filename(fname) or "GGUF",
+            "url": f"{HF_API_BASE}/{repo_id}/resolve/{rev}/{rfile}",
+        }
+
+    # owner/repo[:quant] or owner/repo/file.gguf
+    if "/" in spec:
+        quant_hint = ""
+        repo_part = spec
+        if ":" in spec:
+            repo_part, quant_hint = spec.split(":", 1)
+        parts = [p for p in repo_part.split("/") if p]
+        if len(parts) >= 3 and repo_part.lower().endswith(".gguf"):
+            repo_id = f"{parts[0]}/{parts[1]}"
+            rfile = "/".join(parts[2:])
+            quant = _infer_quant_from_filename(rfile) or "GGUF"
+        else:
+            repo_id = f"{parts[0]}/{parts[1]}"
+            rfile, quant = _select_best_gguf_from_repo(repo_id, quant_hint)
+        fname = Path(rfile).name
+        alias = _friendly_alias_for_gguf(fname, repo_id)
+        return {
+            "alias": alias,
+            "repo": repo_id,
+            "file": rfile,
+            "param": _infer_param_from_filename(fname) or _infer_param_from_filename(repo_id),
+            "quant": quant,
+            "url": f"{HF_API_BASE}/{repo_id}/resolve/main/{urllib.parse.quote(rfile)}",
+        }
+
+    # Free-text keyword -> search Hugging Face Hub for top GGUF repo
+    quant_hint = ""
+    q_term = spec
+    if ":" in spec:
+        q_term, quant_hint = spec.split(":", 1)
+    hits = search_huggingface_gguf(f"{q_term} {quant_hint}".strip(), limit=5)
+    if not hits:
+        raise RuntimeError(f'No Hugging Face GGUF repository found for "{spec}". Try owner/repo format.')
+    repo_id = hits[0]["id"]
+    rfile, quant = _select_best_gguf_from_repo(repo_id, quant_hint)
+    fname = Path(rfile).name
+    return {
+        "alias": spec.lower(),
+        "repo": repo_id,
+        "file": rfile,
+        "param": _infer_param_from_filename(fname) or _infer_param_from_filename(repo_id),
+        "quant": quant,
+        "url": f"{HF_API_BASE}/{repo_id}/resolve/main/{urllib.parse.quote(rfile)}",
+    }
+
+
 def stream_pull_model(model_name: str, emit, cancel_check=None):
-    req = urllib.request.Request(
-        OLLAMA_PULL_URL,
-        data=json.dumps({"name": model_name, "stream": True}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=1800) as resp:
-        for raw_line in resp:
-            if cancel_check and cancel_check():
-                return
-            line = raw_line.decode("utf-8").strip()
-            if not line:
-                continue
-            ev = json.loads(line)
-            emit(ev)
-            if ev.get("status") == "success":
-                break
+    """Download a GGUF model directly from Hugging Face Hub (and auto-install llama-server if missing)."""
+    spec = (model_name or DEFAULT_MODEL).strip()
+    if spec == "__runtime__":
+        install_llama_runtime(emit=emit, cancel_check=cancel_check)
+        emit({"status": "success"})
+        return
+
+    if not find_llama_server_binary():
+        install_llama_runtime(emit=emit, cancel_check=cancel_check)
+
+    emit({"status": f"Resolving {spec} on Hugging Face Hub..."})
+    target = resolve_hf_pull_target(spec)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    local_fname = Path(target["file"]).name
+    final_path = MODELS_DIR / local_fname
+    part_path = MODELS_DIR / (local_fname + ".part")
+
+    existing_bytes = part_path.stat().st_size if part_path.is_file() else 0
+    headers = {"User-Agent": _WEB_UA}
+    hf_token = os.environ.get("HF_TOKEN", "").strip()
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+    if existing_bytes > 0:
+        headers["Range"] = f"bytes={existing_bytes}-"
+
+    req = urllib.request.Request(target["url"], headers=headers)
+    try:
+        resp = urllib.request.urlopen(req, timeout=1800)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and existing_bytes > 0:
+            part_path.replace(final_path)
+            resp = None
+        else:
+            raise RuntimeError(f"Hugging Face HTTP {e.code} downloading {target['repo']}/{target['file']}") from e
+
+    if resp is not None:
+        with resp:
+            is_partial = resp.status == 206
+            content_len = int(resp.headers.get("Content-Length") or 0)
+            total = (existing_bytes + content_len) if (is_partial and content_len) else content_len
+            done = existing_bytes if is_partial else 0
+            mode = "ab" if is_partial else "wb"
+            last_emit = 0.0
+            with part_path.open(mode) as out_f:
+                while True:
+                    if cancel_check and cancel_check():
+                        return
+                    blk = resp.read(131072)
+                    if not blk:
+                        break
+                    out_f.write(blk)
+                    done += len(blk)
+                    now = time.monotonic()
+                    if now - last_emit >= 0.15 or (total and done >= total):
+                        last_emit = now
+                        emit({
+                            "status": f"Downloading {target['repo']} ({local_fname})",
+                            "completed": done,
+                            "total": total,
+                        })
+        part_path.replace(final_path)
+
+    idx_data = _load_models_index()
+    if not isinstance(idx_data.get("models"), dict):
+        idx_data["models"] = {}
+    hidden = idx_data.get("hidden") if isinstance(idx_data.get("hidden"), list) else []
+    if target["alias"] in hidden:
+        hidden.remove(target["alias"])
+    idx_data["hidden"] = hidden
+    idx_data["models"][target["alias"]] = {
+        "name": target["alias"],
+        "path": str(final_path.resolve()),
+        "hf_repo": target["repo"],
+        "hf_file": target["file"],
+        "parameter_size": target["param"],
+        "quantization": target["quant"],
+    }
+    _save_models_index(idx_data)
+    emit({"status": "success", "model": target["alias"]})
 
 
 def delete_ollama_model(model_name: str):
-    req = urllib.request.Request(
-        OLLAMA_DELETE_URL,
-        data=json.dumps({"name": model_name}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="DELETE",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp.read()
-    except urllib.error.HTTPError as e:
-        body = ""
+    norm = normalize_model_name(model_name)
+    if LLAMA_MANAGER.is_model_loaded(norm):
+        LLAMA_MANAGER.unload()
+
+    details = discover_local_gguf_models()
+    entry = next((d for d in details if d["name"] == norm or d["raw_name"] == model_name), None)
+
+    idx_data = _load_models_index()
+    reg_models = idx_data.get("models") if isinstance(idx_data.get("models"), dict) else {}
+    hidden = idx_data.get("hidden") if isinstance(idx_data.get("hidden"), list) else []
+
+    if norm in reg_models:
+        reg_models.pop(norm, None)
+    if entry:
+        p = Path(entry["path"])
         try:
-            body = e.read().decode("utf-8", "ignore").strip()
-        except Exception:
-            pass
-        raise RuntimeError(body or f"Ollama HTTP {e.code}")
+            p.relative_to(MODELS_DIR.resolve())
+            is_owned = True
+        except ValueError:
+            is_owned = False
+        if is_owned and p.is_file():
+            p.unlink(missing_ok=True)
+        else:
+            if norm not in hidden:
+                hidden.append(norm)
+            if entry["path"] not in hidden:
+                hidden.append(entry["path"])
+    else:
+        if norm not in hidden:
+            hidden.append(norm)
+
+    idx_data["models"] = reg_models
+    idx_data["hidden"] = hidden
+    _save_models_index(idx_data)
 
     settings = load_settings()
-    if normalize_model_name(settings.get("default_model", "")) == normalize_model_name(model_name):
+    if normalize_model_name(settings.get("default_model", "")) == norm:
         settings["default_model"] = ""
         save_settings(settings)
 
@@ -1837,18 +3060,26 @@ def run_agent_stream(
 
     settings = load_settings()
     step_limit = normalize_tool_steps(settings.get("max_tool_steps", MAX_STEPS))
+    is_uncapped = (step_limit == 0)
     all_thinking = []
     all_tools = []
     all_outputs = []
     seen_outputs = set()
     seen_call_counts = {}
+    consecutive_skips = 0
     tool_counter = 0
+    turn_idx = 0
     last_tokens = {"used": 0, "prompt": 0, "output": 0, "max": NUM_CTX}
 
     try:
-        for _ in range(step_limit):
+        while True:
             if cancel_check and cancel_check():
                 raise CancelledError()
+
+            allow_tools_now = has_tools and (is_uncapped or tool_counter < step_limit)
+            if not is_uncapped and turn_idx > step_limit:
+                break
+            turn_idx += 1
 
             messages = [{"role": "system", "content": sys_prompt}] + history
 
@@ -1867,8 +3098,8 @@ def run_agent_stream(
             msg = stream_ollama(
                 messages,
                 model=model,
-                tools_enabled=has_tools,
-                tools=tools,
+                tools_enabled=allow_tools_now,
+                tools=tools if allow_tools_now else [],
                 on_thinking=on_think,
                 on_phase=on_phase,
                 on_content=on_content,
@@ -1886,11 +3117,15 @@ def run_agent_stream(
                 if not msg["thinking"] and emit:
                     emit({"type": "thinking_delta", "text": step_thinking + "\n"})
 
-            tool_calls = msg["tool_calls"]
-            if has_tools and not tool_calls and "<tool_call>" in raw_content:
+            tool_calls = msg["tool_calls"] if allow_tools_now else []
+            if allow_tools_now and not tool_calls and "<tool_call>" in raw_content:
                 tool_calls = parse_xml_tool_fallback(raw_content)
 
-            if not tool_calls or not has_tools:
+            if not is_uncapped and tool_calls:
+                remaining = max(0, step_limit - tool_counter)
+                tool_calls = tool_calls[:remaining]
+
+            if not tool_calls or not allow_tools_now:
                 reply = clean_text or "(done)"
                 history.append({"role": "assistant", "content": reply})
                 return {
@@ -1911,6 +3146,8 @@ def run_agent_stream(
             for tc in tool_calls:
                 if cancel_check and cancel_check():
                     raise CancelledError()
+                if not is_uncapped and tool_counter >= step_limit:
+                    break
 
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
@@ -1931,9 +3168,11 @@ def run_agent_stream(
                 sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
                 seen_call_counts[sig] = seen_call_counts.get(sig, 0) + 1
                 if seen_call_counts[sig] > 2:
+                    consecutive_skips += 1
                     result = "Repeated identical tool call skipped; summarize the prior result or explain the issue without retrying the same command."
                     file_meta = None
                 else:
+                    consecutive_skips = 0
                     result, file_meta = execute_tool_with_meta(name, args, chat_id=chat_id, cancel_check=cancel_check)
 
                 tool_record = {"id": tid, "name": name, "args": args, "result": result}
@@ -1951,8 +3190,20 @@ def run_agent_stream(
 
                 history.append({"role": "tool", "content": result})
 
+            if consecutive_skips >= 6:
+                reply = clean_text or "Stopped repeated identical tool calls."
+                history.append({"role": "assistant", "content": reply})
+                return {
+                    "reply": reply,
+                    "thinking": "\n\n".join(all_thinking).strip(),
+                    "tools": all_tools,
+                    "outputs": all_outputs,
+                    "tokens": last_tokens,
+                    "cancelled": False,
+                }
+
         return {
-            "reply": f"Stopped: reached max tool steps ({step_limit}). You can raise this limit in Settings.",
+            "reply": f"Stopped: reached max tool steps ({step_limit}). You can raise this limit or slide it to Uncapped in Settings.",
             "thinking": "\n\n".join(all_thinking).strip(),
             "tools": all_tools,
             "outputs": all_outputs,
@@ -1997,37 +3248,37 @@ def generate_chat_title(user_msg: str, model: str, cancel_check=None) -> str:
         {"role": "user", "content": snippet},
     ]
 
-    def _call(disable_think: bool) -> str:
+    def _call(port: int, disable_think: bool) -> str:
         payload = {
             "model": model,
             "messages": messages,
             "stream": False,
-            "options": {
-                "temperature": 0.2,
-                "num_predict": 24 if disable_think else 96,
-                "num_ctx": NUM_CTX,
-            },
+            "temperature": 0.2,
+            "max_tokens": 24 if disable_think else 96,
         }
         if disable_think:
-            payload["think"] = False
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         req = urllib.request.Request(
-            OLLAMA_URL,
+            f"http://{LLAMA_HOST}:{port}/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return (data.get("message") or {}).get("content") or ""
+        choices = data.get("choices") or []
+        msg = (choices[0].get("message") if choices else {}) or {}
+        return msg.get("content") or ""
 
     try:
         if cancel_check and cancel_check():
             return fallback
+        port = LLAMA_MANAGER.ensure_running(model, num_ctx=NUM_CTX, parallel_slots=2, cancel_check=cancel_check)
         with acquire_ollama_slot(max_slots=2, cancel_check=cancel_check):
             try:
-                raw = _call(disable_think=True)
+                raw = _call(port, disable_think=True)
             except urllib.error.HTTPError as e:
                 if e.code == 400:
-                    raw = _call(disable_think=False)
+                    raw = _call(port, disable_think=False)
                 else:
                     return fallback
         return clean_chat_title(raw, fallback)
@@ -2083,10 +3334,14 @@ VALID_SOUNDS = ("chime", "ping", "double", "chord", "off")
 
 
 def normalize_tool_steps(val, default: int = MAX_STEPS) -> int:
+    if isinstance(val, str) and val.strip().lower() in ("0", "uncapped", "unlimited", "inf"):
+        return 0
     try:
         n = int(val)
     except (TypeError, ValueError):
         n = default
+    if n <= 0 or n > MAX_TOOL_STEPS_LIMIT:
+        return 0
     return max(MIN_TOOL_STEPS, min(MAX_TOOL_STEPS_LIMIT, n))
 
 
@@ -3776,14 +5031,15 @@ WEB_HTML = r"""<!doctype html>
   .del-btn:hover { opacity: 1 !important; color: var(--white); background: rgba(255,255,255,0.1); }
   .side-foot {
     padding: 8px 10px 10px; border-top: 1px solid var(--border);
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 6px;
     font-size: 11px; color: var(--muted);
   }
   .quit-btn {
     background: transparent; border: 1px solid var(--border); color: var(--muted);
-    padding: 4px 8px; border-radius: 6px; font-size: 11px;
+    padding: 5px 8px; border-radius: 6px; font-size: 11.5px; width: 100%;
+    white-space: nowrap; text-align: center;
   }
-  .quit-btn:hover { color: var(--white); border-color: rgba(255,255,255,0.4); }
+  .quit-btn:hover { color: var(--white); border-color: rgba(255,255,255,0.4); background: var(--surface); }
 
   /* Main & Header */
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -4342,19 +5598,42 @@ WEB_HTML = r"""<!doctype html>
   .drop-box span { color: var(--muted); font-size: 12.5px; }
 
   /* Modals (Soul, Quick Buttons, Settings, Pull Model, Manage Models, Manage Files, Choose Folder, Confirm Delete) */
-  #soul-modal, #chips-modal, #settings-modal, #pull-modal, #models-modal, #files-modal, #folder-modal {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.72); display: none;
+  #soul-modal, #chips-modal, #settings-modal, #pull-modal, #models-modal, #files-modal, #folder-modal, #confirm-modal {
+    position: fixed; inset: 0; display: none;
     align-items: center; justify-content: center; padding: 20px; z-index: 40;
+    background: rgba(0, 0, 0, 0);
+    -webkit-backdrop-filter: blur(0px); backdrop-filter: blur(0px);
+    opacity: 0;
+    transition:
+      opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+      background 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+      backdrop-filter 0.22s ease,
+      -webkit-backdrop-filter 0.22s ease;
   }
-  #confirm-modal {
-    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.56);
+  #confirm-modal { z-index: 60; }
+  #soul-modal.is-open, #chips-modal.is-open, #settings-modal.is-open, #pull-modal.is-open, #models-modal.is-open, #files-modal.is-open, #folder-modal.is-open {
+    opacity: 1;
+    background: rgba(0, 0, 0, 0.72);
+    -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+  }
+  #confirm-modal.is-open {
+    opacity: 1;
+    background: rgba(0, 0, 0, 0.56);
     -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
-    display: none; align-items: center; justify-content: center; padding: 20px; z-index: 60;
   }
   #soul-box, #chips-box, #settings-box, #pull-box, #models-box, #files-box, #folder-box, #confirm-box {
     width: 100%; max-width: 640px; background: var(--surface); border: 1px solid var(--border);
     border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 14px;
-    animation: modalIn 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+    opacity: 0;
+    transform: translateY(10px) scale(0.96);
+    transition:
+      opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .is-open > #soul-box, .is-open > #chips-box, .is-open > #settings-box, .is-open > #pull-box,
+  .is-open > #models-box, .is-open > #files-box, .is-open > #folder-box, .is-open > #confirm-box {
+    opacity: 1;
+    transform: translateY(0) scale(1);
   }
   #confirm-box { max-width: 400px; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.65); }
   .confirm-head { display: flex; align-items: center; justify-content: space-between; font-size: 14px; color: var(--white); }
@@ -4365,10 +5644,6 @@ WEB_HTML = r"""<!doctype html>
     font-weight: 600;
   }
   .btn-danger:hover { background: rgba(239, 68, 68, 0.32); color: var(--white); border-color: rgba(248, 113, 113, 0.9); }
-  @keyframes modalIn {
-    from { opacity: 0; transform: translateY(6px) scale(0.985); }
-    to   { opacity: 1; transform: translateY(0) scale(1); }
-  }
   #settings-box { max-width: 540px; max-height: 86vh; overflow-y: auto; }
   #pull-box { max-width: 440px; }
   #models-box { max-width: 560px; }
@@ -4450,7 +5725,7 @@ WEB_HTML = r"""<!doctype html>
     accent-color: var(--m-2); background: var(--bg);
   }
   .setting-val {
-    min-width: 26px; text-align: right; font-family: var(--font-mono);
+    min-width: 68px; text-align: right; font-family: var(--font-mono);
     font-size: 12.5px; color: var(--white); font-weight: 500;
   }
   .chip-del { padding: 6px 9px; color: var(--muted); }
@@ -4496,20 +5771,30 @@ WEB_HTML = r"""<!doctype html>
   body.mode-project #welcome-mascot {
     width: clamp(116px, 16vh, 152px); height: clamp(116px, 16vh, 152px);
   }
-  .proj-cube-slot {
+  .proj-cube-slot, .chat-mascot-slot {
     width: 64px; height: 64px; flex-shrink: 0;
     display: inline-flex; align-items: center; justify-content: center;
     margin: -10px 0;
   }
+  .chat-mascot-slot { width: 56px; height: 56px; margin: -9px 0; }
   body.mode-project .proj-cube-slot #welcome-mascot {
     width: 64px; height: 64px;
   }
+  .chat-mascot-slot #welcome-mascot {
+    width: 56px; height: 56px;
+  }
   .proj-cube-static { display: block; width: 60px; height: 60px; }
+  .chat-boo-static { display: block; width: 48px; height: 48px; }
   .proj-turn-row .proj-shell,
   .proj-turn-row .proj-loader,
   .proj-turn-row > .prose,
   .proj-turn-row > .file-dl-row,
   .proj-turn-row > .msg-actions { padding-left: 72px; }
+  .msg-row.assistant:not(.proj-turn-row) .steps-wrap,
+  .msg-row.assistant:not(.proj-turn-row) .css-loader,
+  .msg-row.assistant:not(.proj-turn-row) > .prose,
+  .msg-row.assistant:not(.proj-turn-row) > .file-dl-row,
+  .msg-row.assistant:not(.proj-turn-row) > .msg-actions { padding-left: 64px; }
   .toggle-switch {
     position: relative; display: inline-flex; align-items: center;
     width: 36px; height: 20px; cursor: pointer; flex-shrink: 0;
@@ -4757,7 +6042,7 @@ WEB_HTML = r"""<!doctype html>
       <div class="side-label" id="side-history-label">Saved chats</div>
       <div id="chat-list"></div>
       <div class="side-foot">
-        <span>__OS_NAME__</span>
+        <span id="side-os-hw" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">__OS_NAME__</span>
         <button type="button" class="quit-btn" onclick="quitServer()" title="Stop local server">Quit app</button>
       </div>
     </div>
@@ -4792,7 +6077,7 @@ WEB_HTML = r"""<!doctype html>
 
     <div id="setup-banner">
       <div class="setup-msg">
-        <span id="setup-text">Checking Ollama...</span>
+        <span id="setup-text">Checking local GGUF engine...</span>
         <div class="pull-bar" id="pull-bar"><div class="pull-fill" id="pull-fill"></div></div>
       </div>
       <div class="setup-actions" id="setup-actions"></div>
@@ -4809,7 +6094,7 @@ WEB_HTML = r"""<!doctype html>
           <div class="q-rotator" aria-live="polite">
             <h1 id="rotating-q">What are we working on?</h1>
           </div>
-          <p id="welcome-sub">Running locally via Ollama <b id="welcome-model">__MODEL__</b></p>
+          <p id="welcome-sub">Running locally via Hugging Face · <b id="welcome-model">__MODEL__</b></p>
         </div>
 
         <form class="composer" onsubmit="event.preventDefault(); handleSendOrStop();">
@@ -4882,7 +6167,7 @@ WEB_HTML = r"""<!doctype html>
               <span class="rp-val" id="rp-proj-workers-val">1 (Sequential)</span>
             </div>
             <input type="range" id="rp-proj-workers" min="1" max="4" step="1" value="1" oninput="updateProjWorkersLabel(this.value)" onchange="saveRightPanelSettings()" />
-            <div class="rp-hint">1 = CPU safe · 2–4 = parallel wave lanes.</div>
+            <div class="rp-hint">1 = Single lane (low memory) · 2–4 = parallel wave lanes.</div>
           </div>
           <div class="rp-field">
             <label for="rp-proj-ctx">Context window</label>
@@ -4996,14 +6281,14 @@ WEB_HTML = r"""<!doctype html>
           <span>Tool calls allowed per reply</span>
         </div>
         <div class="setting-ctrl setting-range-wrap">
-          <input type="range" id="set-max-steps" min="2" max="40" step="1" value="8" oninput="updateStepsLabel(this.value)" />
+          <input type="range" id="set-max-steps" min="2" max="41" step="1" value="8" oninput="updateStepsLabel(this.value)" />
           <span class="setting-val" id="set-max-steps-val">8</span>
         </div>
       </div>
       <div class="setting-row">
         <div class="setting-meta">
           <b>Speech model</b>
-          <span>Local Ollama TTS model</span>
+          <span>OS Voice (0 VRAM) or local TTS</span>
         </div>
         <div class="setting-ctrl">
           <select id="set-tts-model"></select>
@@ -5043,18 +6328,23 @@ WEB_HTML = r"""<!doctype html>
   <div id="pull-modal">
     <div id="pull-box">
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>Download Ollama model</b>
-        <span style="color:var(--muted);font-size:12px;">Pick light 2B–4B or type larger tag</span>
+        <b>Download Hugging Face GGUF</b>
+        <span style="color:var(--muted);font-size:12px;">Pick a preset or search any HF GGUF</span>
       </div>
-      <input id="pull-input" type="text" placeholder="e.g. lfm3:1.7b, granite4.2:3b, qwen3.5:4b, gemma4:e2b (or :9b, :12b)" onkeydown="if(event.key==='Enter'){event.preventDefault();submitPullModal();}" />
+      <div style="display:flex;gap:6px;">
+        <input id="pull-input" style="flex:1;" type="text" placeholder="Type any model (e.g. llama 3.2, qwen3.5, LiquidAI/LFM3-1.7B-GGUF)..." oninput="scheduleHfSearch()" onkeydown="if(event.key==='Enter'){event.preventDefault();submitPullModal();}" />
+        <button type="button" id="hf-search-btn" onclick="searchHuggingFaceModal()" title="Search Hugging Face Hub for GGUF models">Search HF</button>
+      </div>
       <div class="pull-presets">
         <button type="button" class="pull-preset-btn" onclick="pickPullModel('lfm3:1.7b')">lfm3:1.7b <span>1.7B</span></button>
         <button type="button" class="pull-preset-btn" onclick="pickPullModel('granite4.2:3b')">granite4.2:3b <span>3B</span></button>
         <button type="button" class="pull-preset-btn" onclick="pickPullModel('qwen3.5:4b')">qwen3.5:4b <span>4B</span></button>
         <button type="button" class="pull-preset-btn" onclick="pickPullModel('gemma4:e2b')">gemma4:e2b <span>2B eff</span></button>
-        <button type="button" class="pull-preset-btn" onclick="pickPullModel('lfm3-audio:2b')">lfm3-audio:2b <span>2B TTS</span></button>
-        <button type="button" class="pull-preset-btn" onclick="pickPullModel('phonon')">phonon <span>31M TTS</span></button>
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('qwen3.5:2b')">qwen3.5:2b <span>2B</span></button>
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('gemma4:e4b')">gemma4:e4b <span>4B eff</span></button>
+        <button type="button" class="pull-preset-btn" onclick="pickPullModel('lfm3-uncensored:1.7b')">lfm3-uncensored <span>1.7B</span></button>
       </div>
+      <div id="hf-search-results" style="display:none;flex-direction:column;gap:5px;max-height:170px;overflow-y:auto;"></div>
       <div class="modal-row">
         <button type="button" onclick="closePullModal()">Cancel</button>
         <button type="button" class="btn-white" onclick="submitPullModal()">Download</button>
@@ -5065,7 +6355,7 @@ WEB_HTML = r"""<!doctype html>
   <div id="models-modal">
     <div id="models-box">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
-        <b>Manage installed models</b>
+        <b>Manage installed GGUF models</b>
         <span id="models-summary" style="color:var(--muted);font-size:12px;"></span>
       </div>
       <div class="models-status-row" id="models-status-row" style="display:none;">
@@ -5075,8 +6365,9 @@ WEB_HTML = r"""<!doctype html>
       <div id="models-rows"></div>
       <div class="modal-split">
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button type="button" id="models-unload-btn" onclick="freeGpuVram(true)" title="Unload active model from RAM and GPU VRAM immediately">Clear RAM - VRAM</button>
           <button type="button" id="models-update-all-btn" onclick="updateAllModels()">Update all</button>
-          <button type="button" onclick="closeModelsModal(); openPullModal();">+ Download model</button>
+          <button type="button" onclick="closeModelsModal(); openPullModal();">+ Download HF model</button>
         </div>
         <div class="modal-row">
           <button type="button" class="btn-white" onclick="closeModelsModal()">Done</button>
@@ -5175,6 +6466,8 @@ let currentModel = "__MODEL__";
 let availableModels = ["__MODEL__"];
 let installedModels = [];
 let installedModelDetails = [];
+let loadedModels = [];
+let activeHardware = "";
 let modelParams = {};
 let ollamaRunning = true;
 let pullingModel = false;
@@ -5227,14 +6520,19 @@ function getModelPalette(name) {
 const CLIENT_KNOWN_PARAMS = {
   "lfm3": "1.7B",
   "lfm3:1.7b": "1.7B",
+  "lfm3-uncensored:1.7b": "1.7B",
   "granite4.2:3b": "3B",
+  "granite4.2:8b": "8B",
   "gemma4:e2b": "2B eff",
   "gemma4:e4b": "4B eff",
+  "gemma4:12b": "12B",
   "qwen3.5:0.8b": "0.8B",
   "qwen3.5:2b": "2B",
   "qwen3.5:4b": "4B",
+  "qwen3.5:9b": "9B",
   "lfm3-audio:2b": "2B",
   "phonon": "31M",
+  "system-tts": "0 VRAM",
 };
 
 function getModelParamLabel(name) {
@@ -5283,12 +6581,25 @@ function applyModelTheme(modelName) {
   if (typeof syncCubeLight === "function") syncCubeLight();
 }
 
+function resolveClientModel(name) {
+  const n = String(name || "").trim();
+  if (!n || !installedModels.length) return n;
+  if (installedModels.includes(n)) return n;
+  const norm = n.endsWith(":latest") ? n.slice(0, -7) : n;
+  if (installedModels.includes(norm)) return norm;
+  if ((norm === "lfm3:1.7b" || norm === "lfm3") && installedModels.includes("lfm3")) return "lfm3";
+  if ((norm === "lfm3" || norm === "lfm3:1.7b") && installedModels.includes("lfm3:1.7b")) return "lfm3:1.7b";
+  if (!norm.includes(":")) {
+    const match = installedModels.find(m => m.split(":")[0].toLowerCase() === norm.toLowerCase() && !m.toLowerCase().includes("audio"));
+    if (match) return match;
+  }
+  return n;
+}
+
 function isModelInstalled(name) {
   if (!name) return false;
-  if (name.includes(":")) {
-    return installedModels.some(m => m === name || m === name + ":latest" || (name === "lfm3:1.7b" && m === "lfm3"));
-  }
-  return installedModels.some(m => m === name || m.startsWith(name + ":"));
+  const resolved = resolveClientModel(name);
+  return installedModels.some(m => m === resolved || m === resolved + ":latest");
 }
 
 function updateSetupBanner() {
@@ -5303,16 +6614,15 @@ function updateSetupBanner() {
 
   if (!ollamaRunning) {
     banner.classList.add("show");
-    textEl.textContent = "Ollama is not running yet. Install or launch Ollama to run models locally.";
-    const dl = document.createElement("a");
-    dl.className = "setup-link";
-    dl.href = "https://ollama.com/download";
-    dl.target = "_blank";
-    dl.rel = "noopener";
-    dl.textContent = "Get Ollama";
+    textEl.textContent = "llama.cpp local GGUF engine binary is not installed yet.";
+    const instBtn = document.createElement("button");
+    instBtn.type = "button";
+    instBtn.className = "btn-white";
+    instBtn.textContent = "Install llama.cpp runtime";
+    instBtn.onclick = () => pullModel("__runtime__", false);
     const retry = document.createElement("button");
     retry.type = "button";
-    retry.textContent = "Start / Retry";
+    retry.textContent = "Re-check";
     retry.onclick = async () => {
       retry.disabled = true;
       retry.textContent = "Checking...";
@@ -5320,7 +6630,7 @@ function updateSetupBanner() {
       await loadModels();
       retry.disabled = false;
     };
-    actEl.appendChild(dl);
+    actEl.appendChild(instBtn);
     actEl.appendChild(retry);
     return;
   }
@@ -5331,7 +6641,7 @@ function updateSetupBanner() {
     const pullBtn = document.createElement("button");
     pullBtn.type = "button";
     pullBtn.className = "btn-white";
-    pullBtn.textContent = `Pull ${currentModel}`;
+    pullBtn.textContent = `Download ${currentModel} (HF)`;
     pullBtn.onclick = () => pullModel(currentModel);
     actEl.appendChild(pullBtn);
     return;
@@ -5378,27 +6688,30 @@ async function pullModel(modelName, switchChatModel = true) {
   actEl.innerHTML = "";
   bar.classList.add("show");
   fill.style.width = "0%";
-  textEl.textContent = `Downloading ${modelName}...`;
+  const label = modelName === "__runtime__" ? "llama.cpp runtime" : modelName;
+  textEl.textContent = `Downloading ${label} from Hugging Face...`;
+  let resolvedAlias = modelName;
 
   try {
     await streamPullRequest(modelName, (ev) => {
+      if (ev.model) resolvedAlias = ev.model;
       if (ev.total && ev.completed) {
         const pct = Math.min(100, Math.round((ev.completed / ev.total) * 100));
         fill.style.width = pct + "%";
-        textEl.textContent = `Downloading ${modelName}: ${pct}%`;
+        textEl.textContent = `${ev.status || "Downloading " + label}: ${pct}%`;
       } else if (ev.status) {
-        textEl.textContent = `${modelName}: ${ev.status}`;
+        textEl.textContent = `${label}: ${ev.status}`;
       }
     });
   } catch (err) {
-    textEl.textContent = `Failed to pull ${modelName}: ${err.message || err}`;
+    textEl.textContent = `Failed to download ${label}: ${err.message || err}`;
     pullingModel = false;
     return;
   }
 
   pullingModel = false;
-  if (switchChatModel) {
-    currentModel = modelName;
+  if (switchChatModel && modelName !== "__runtime__") {
+    currentModel = resolvedAlias || modelName;
     modelChosenByUser = true;
   }
   await loadModels(false);
@@ -5848,14 +7161,45 @@ function clearArmedFileDeletes() {
   if (armedDeleteAllFilesTimer) { clearTimeout(armedDeleteAllFilesTimer); armedDeleteAllFilesTimer = null; }
 }
 
+const _modalHideTimers = {};
+function showModal(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (_modalHideTimers[id]) {
+    clearTimeout(_modalHideTimers[id]);
+    delete _modalHideTimers[id];
+  }
+  el.style.display = "flex";
+  void el.offsetWidth;
+  el.classList.add("is-open");
+}
+
+function hideModal(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove("is-open");
+  if (_modalHideTimers[id]) clearTimeout(_modalHideTimers[id]);
+  _modalHideTimers[id] = setTimeout(() => {
+    delete _modalHideTimers[id];
+    if (!el.classList.contains("is-open")) {
+      el.style.display = "none";
+    }
+  }, 230);
+}
+
+function isModalOpen(id) {
+  const el = document.getElementById(id);
+  return Boolean(el && (el.classList.contains("is-open") || el.style.display === "flex"));
+}
+
 function closeFilesModal() {
   clearArmedFileDeletes();
-  document.getElementById("files-modal").style.display = "none";
+  hideModal("files-modal");
 }
 
 async function openFilesModal() {
   clearArmedFileDeletes();
-  document.getElementById("files-modal").style.display = "flex";
+  showModal("files-modal");
   await refreshFilesModal();
 }
 
@@ -6042,7 +7386,7 @@ function renderModelMenu() {
         <span class="opt-name"></span>
       </span>
       <span class="opt-param"></span>
-      <span class="opt-status">${m === currentModel ? SVG_CHECK : (!installed && ollamaRunning ? "pull" : "")}</span>
+      <span class="opt-status">${m === currentModel ? SVG_CHECK : (!installed && ollamaRunning ? "HF" : "")}</span>
     `;
     btn.querySelector(".opt-name").textContent = m;
     const pEl = btn.querySelector(".opt-param");
@@ -6057,7 +7401,7 @@ function renderModelMenu() {
   const addBtn = document.createElement("button");
   addBtn.type = "button";
   addBtn.className = "model-opt model-add";
-  addBtn.innerHTML = `<span class="model-opt-left"><span>+</span><span>Download new model...</span></span>`;
+  addBtn.innerHTML = `<span class="model-opt-left"><span>+</span><span>Download Hugging Face GGUF...</span></span>`;
   addBtn.onclick = (e) => {
     e.stopPropagation();
     menu.classList.remove("open");
@@ -6075,6 +7419,35 @@ function renderModelMenu() {
     openModelsModal();
   };
   menu.appendChild(mgrBtn);
+
+  const vramBtn = document.createElement("button");
+  vramBtn.type = "button";
+  vramBtn.className = "model-opt model-add";
+  const vramNote = (Array.isArray(loadedModels) && loadedModels.length) ? ` (${loadedModels[0]})` : "";
+  vramBtn.innerHTML = `<span class="model-opt-left"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg><span>Clear RAM - VRAM${escHtml(vramNote)}</span></span>`;
+  vramBtn.onclick = async (e) => {
+    e.stopPropagation();
+    menu.classList.remove("open");
+    await freeGpuVram(false);
+  };
+  menu.appendChild(vramBtn);
+}
+
+async function freeGpuVram(fromModal = false) {
+  if (fromModal) setModelsStatus("Clearing active model from RAM - VRAM...", null);
+  try {
+    const res = await fetch("/api/models/unload", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    const list = Array.isArray(data.unloaded) && data.unloaded.length ? data.unloaded.join(", ") : "none loaded";
+    await loadModels(false);
+    if (fromModal) {
+      setModelsStatus(`RAM - VRAM cleared (${list}).`, null);
+    } else {
+      setUploadNotice(`RAM - VRAM cleared (${list})`);
+    }
+  } catch (err) {
+    if (fromModal) setModelsStatus(`Unload failed: ${err.message || err}`, null);
+  }
 }
 
 function fmtModelSize(bytes) {
@@ -6128,14 +7501,14 @@ function clearArmedDelete() {
 function openModelsModal() {
   clearArmedDelete();
   if (!pullingModel) setModelsStatus("");
-  document.getElementById("models-modal").style.display = "flex";
+  showModal("models-modal");
   renderModelsManager();
   loadModels(false);
 }
 
 function closeModelsModal() {
   clearArmedDelete();
-  document.getElementById("models-modal").style.display = "none";
+  hideModal("models-modal");
 }
 
 function renderModelsManager() {
@@ -6145,20 +7518,18 @@ function renderModelsManager() {
   rowsEl.innerHTML = "";
 
   if (!ollamaRunning) {
-    summaryEl.textContent = "Ollama offline";
+    summaryEl.textContent = "llama.cpp runtime missing";
     updateAllBtn.disabled = true;
     const msg = document.createElement("div");
     msg.style.cssText = "color:var(--muted);font-size:13px;padding:12px 4px;display:flex;align-items:center;justify-content:space-between;gap:10px;";
-    msg.innerHTML = `<span>Ollama is not running yet. Start it to update or remove local models.</span>`;
+    msg.innerHTML = `<span>llama.cpp local engine binary is not installed yet.</span>`;
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.textContent = "Start / Retry";
-    btn.onclick = async () => {
-      btn.disabled = true;
-      btn.textContent = "Checking...";
-      await fetch("/api/ollama/start", { method: "POST" }).catch(() => {});
-      await loadModels(false);
-      renderModelsManager();
+    btn.className = "btn-white";
+    btn.textContent = "Install runtime";
+    btn.onclick = () => {
+      closeModelsModal();
+      pullModel("__runtime__", false);
     };
     msg.appendChild(btn);
     rowsEl.appendChild(msg);
@@ -6173,15 +7544,16 @@ function renderModelsManager() {
 
   const totalBytes = items.reduce((acc, m) => acc + (m.size || 0), 0);
   const totalTxt = fmtModelSize(totalBytes);
+  const hwTxt = activeHardware ? ` · ${activeHardware}` : "";
   summaryEl.textContent = items.length
-    ? `${items.length} installed${totalTxt ? " · " + totalTxt : ""} · oldest first`
-    : "0 installed";
+    ? `${items.length} installed${totalTxt ? " · " + totalTxt : ""}${hwTxt}`
+    : `0 installed${hwTxt}`;
   updateAllBtn.disabled = pullingModel || items.length === 0;
 
   if (!items.length) {
     const empty = document.createElement("div");
     empty.style.cssText = "color:var(--muted);font-size:13px;padding:12px 4px;";
-    empty.textContent = "No models downloaded on this PC yet.";
+    empty.textContent = "No GGUF models downloaded on this PC yet.";
     rowsEl.appendChild(empty);
     return;
   }
@@ -6212,6 +7584,13 @@ function renderModelsManager() {
       tag.textContent = "active";
       title.appendChild(tag);
     }
+    if (Array.isArray(loadedModels) && (loadedModels.includes(m.name) || loadedModels.includes(m.raw_name))) {
+      const tag = document.createElement("span");
+      tag.className = "model-mgr-tag";
+      tag.style.cssText = "border-color:var(--m-3);color:var(--m-1);background:var(--m-glow);";
+      tag.textContent = "in VRAM";
+      title.appendChild(tag);
+    }
     if (typeof appSettings !== "undefined" && appSettings.default_model && (appSettings.default_model === m.name || appSettings.default_model === m.raw_name)) {
       const tag = document.createElement("span");
       tag.className = "model-mgr-tag";
@@ -6222,7 +7601,7 @@ function renderModelsManager() {
 
     const meta = document.createElement("div");
     meta.className = "model-mgr-meta";
-    meta.textContent = [fmtModelSize(m.size), m.parameter_size, m.quantization, fmtModelAge(m.modified_at)].filter(Boolean).join(" · ") || "Installed locally";
+    meta.textContent = [fmtModelSize(m.size), m.parameter_size, m.quantization, m.hf_repo, fmtModelAge(m.modified_at)].filter(Boolean).join(" · ") || "Installed locally";
     info.appendChild(meta);
 
     const acts = document.createElement("div");
@@ -6336,15 +7715,64 @@ function pickPullModel(tag) {
   inp.focus();
 }
 
+let _hfSearchDebounce = null;
+function scheduleHfSearch() {
+  if (_hfSearchDebounce) clearTimeout(_hfSearchDebounce);
+  const inp = document.getElementById("pull-input");
+  const q = inp ? inp.value.trim() : "";
+  if (q.length < 2 || q in CLIENT_KNOWN_PARAMS) return;
+  _hfSearchDebounce = setTimeout(() => {
+    searchHuggingFaceModal();
+  }, 420);
+}
+
+async function searchHuggingFaceModal() {
+  const inp = document.getElementById("pull-input");
+  const box = document.getElementById("hf-search-results");
+  const btn = document.getElementById("hf-search-btn");
+  if (!box || !inp) return;
+  const q = inp.value.trim();
+  box.style.display = "flex";
+  box.innerHTML = `<div style="color:var(--muted);font-size:12px;padding:6px 4px;">Searching Hugging Face Hub for GGUF models...</div>`;
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch("/api/hf/search?q=" + encodeURIComponent(q));
+    const data = await res.json();
+    const results = Array.isArray(data.results) ? data.results : [];
+    box.innerHTML = "";
+    if (!results.length) {
+      box.innerHTML = `<div style="color:var(--muted);font-size:12px;padding:6px 4px;">No GGUF repositories found for "${escHtml(q)}".</div>`;
+      return;
+    }
+    for (const r of results) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "model-mgr-row";
+      b.style.cssText = "padding:7px 10px;text-align:left;cursor:pointer;width:100%;";
+      const dl = r.downloads ? `${r.downloads.toLocaleString()} dl` : "";
+      const p = r.param ? `${r.param} · ` : "";
+      b.innerHTML = `<span style="font-size:12.5px;color:var(--white);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(r.id)}</span><span style="font-size:11px;color:var(--muted);flex-shrink:0;font-family:var(--font-mono);">${escHtml(p + dl)}</span>`;
+      b.onclick = () => pickPullModel(r.id);
+      box.appendChild(b);
+    }
+  } catch (err) {
+    box.innerHTML = `<div style="color:#ff9b9b;font-size:12px;padding:6px 4px;">Search error: ${escHtml(String(err))}</div>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function openPullModal() {
   const inp = document.getElementById("pull-input");
   inp.value = "";
-  document.getElementById("pull-modal").style.display = "flex";
+  const box = document.getElementById("hf-search-results");
+  if (box) { box.style.display = "none"; box.innerHTML = ""; }
+  showModal("pull-modal");
   inp.focus();
 }
 
 function closePullModal() {
-  document.getElementById("pull-modal").style.display = "none";
+  hideModal("pull-modal");
 }
 
 function submitPullModal() {
@@ -6360,14 +7788,15 @@ function submitPullModal() {
 }
 
 function selectModel(m) {
-  currentModel = m;
+  const resolved = resolveClientModel(m);
+  currentModel = resolved;
   modelChosenByUser = true;
   if (appMode === "project" && typeof syncProjectOrchestratorModel === "function") {
-    syncProjectOrchestratorModel(m, { save: true });
+    syncProjectOrchestratorModel(resolved, { save: true });
     document.getElementById("model-menu").classList.remove("open");
     return;
   }
-  applyModelTheme(m);
+  applyModelTheme(resolved);
   renderModelMenu();
   updateSetupBanner();
   refreshProjectBarIndicators();
@@ -6383,7 +7812,7 @@ document.addEventListener("click", () => {
   document.getElementById("model-menu").classList.remove("open");
 });
 
-async function loadModels(retryOnBoot = true) {
+async function loadModels(retryOnBoot = true, retryAttempt = 0) {
   let hasBin = false;
   try {
     const res = await fetch("/api/models");
@@ -6392,12 +7821,19 @@ async function loadModels(retryOnBoot = true) {
     hasBin = Boolean(info.has_ollama_bin);
     installedModels = Array.isArray(info.installed) ? info.installed : [];
     installedModelDetails = Array.isArray(info.installed_details) ? info.installed_details : [];
+    loadedModels = Array.isArray(info.loaded_models) ? info.loaded_models : [];
+    activeHardware = String(info.hardware || "");
+    const osHwEl = document.getElementById("side-os-hw");
+    if (osHwEl && info.os) {
+      osHwEl.textContent = activeHardware ? `${info.os} · ${activeHardware}` : info.os;
+      osHwEl.title = info.hardware_raw || osHwEl.textContent;
+    }
     modelParams = (info && info.model_params && typeof info.model_params === "object") ? info.model_params : {};
     if (Array.isArray(info.models) && info.models.length) availableModels = info.models;
     if (!currentChatId && !currentProjectId && !modelChosenByUser && info.default_model) {
-      if ((typeof appSettings !== "undefined" && appSettings.default_model) || !isModelInstalled(currentModel)) {
-        currentModel = info.default_model;
-      }
+      currentModel = resolveClientModel(info.default_model);
+    } else if (installedModels.length) {
+      currentModel = resolveClientModel(currentModel);
     }
   } catch (_) {}
   applyModelTheme(currentModel);
@@ -6408,11 +7844,11 @@ async function loadModels(retryOnBoot = true) {
   if (ollamaRunning && typeof appSettings !== "undefined" && appSettings.tts_auto && !_bootTtsWarmed) {
     warmTtsModel(false);
   }
-  if (document.getElementById("models-modal").style.display === "flex") {
+  if (isModalOpen("models-modal")) {
     renderModelsManager();
   }
-  if (!ollamaRunning && hasBin && retryOnBoot) {
-    setTimeout(() => loadModels(false), 1500);
+  if (!ollamaRunning && hasBin && retryOnBoot && retryAttempt < 5) {
+    setTimeout(() => loadModels(true, retryAttempt + 1), 1200);
   }
 }
 
@@ -7334,7 +8770,7 @@ async function warmTtsModel(showMissingBanner = true) {
       ttsWarmState = "";
       renderComposerBar();
       if (res.status === 404 && data.missing_model && showMissingBanner) {
-        showSpeechBanner(data.error || `Speech model "${data.missing_model}" is not installed in Ollama yet.`, data.missing_model);
+        showSpeechBanner(data.error || `Speech model "${data.missing_model}" is not downloaded locally yet.`, data.missing_model);
       }
       return;
     }
@@ -7499,13 +8935,12 @@ function openConfirmModal({ title = "Are you sure?", message = "", yesLabel = "Y
   if (msgEl) msgEl.textContent = message;
   if (yesBtn) yesBtn.textContent = yesLabel;
   if (noBtn) noBtn.textContent = noLabel;
-  modal.style.display = "flex";
+  showModal("confirm-modal");
 }
 
 function closeConfirmModal() {
   _pendingConfirmFn = null;
-  const modal = document.getElementById("confirm-modal");
-  if (modal) modal.style.display = "none";
+  hideModal("confirm-modal");
 }
 
 async function confirmModalAccept() {
@@ -7700,16 +9135,10 @@ let welcomeMascotPauseTimer = null;
 let cubeWakeTimer = null;
 
 function getActiveOrchestratorModel() {
-  if (appMode === "project" && currentModel) {
-    const customOrch = (typeof appSettings !== "undefined" && appSettings.project_orchestrator_model)
-      ? String(appSettings.project_orchestrator_model).trim()
-      : "";
-    return customOrch || currentModel;
-  }
   const customOrch = (typeof appSettings !== "undefined" && appSettings.project_orchestrator_model)
     ? String(appSettings.project_orchestrator_model).trim()
     : "";
-  return customOrch || currentModel;
+  return resolveClientModel(customOrch || currentModel);
 }
 
 function getCubeColorKey(modelName) {
@@ -7733,7 +9162,7 @@ function syncCubeLight(modelOverride) {
 }
 
 function syncProjectOrchestratorModel(modelName, { save = true, refreshBanner = true } = {}) {
-  const nextModel = String(modelName || currentModel || "").trim();
+  const nextModel = resolveClientModel(String(modelName || currentModel || "").trim());
   if (!nextModel) return;
   currentModel = nextModel;
   modelChosenByUser = true;
@@ -7780,6 +9209,24 @@ function buildStaticCubeSvg(modelName) {
   return `<svg class="proj-cube-static" viewBox="0 0 32 32" width="60" height="60" aria-hidden="true"><defs><radialGradient id="${gid}" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="${pal[0] || "#ffffff"}" stop-opacity="0.95"/><stop offset="55%" stop-color="${cGlow}" stop-opacity="0.5"/><stop offset="100%" stop-color="${cMid}" stop-opacity="0"/></radialGradient></defs><circle cx="16" cy="16" r="12" fill="url(#${gid})"/><polygon points="16,4 27,10.2 16,16.4 5,10.2" fill="#22232a" stroke="#4a4c58" stroke-width="1"/><polygon points="5,10.2 16,16.4 16,28 5,21.8" fill="#121216" stroke="#3c3e48" stroke-width="1"/><polygon points="27,10.2 16,16.4 16,28 27,21.8" fill="#191a20" stroke="#424450" stroke-width="1"/><line x1="16" y1="16.4" x2="16" y2="28" stroke="${cGlow}" stroke-width="1.2" stroke-opacity="0.75"/></svg>`;
 }
 
+let _booSvgSeq = 0;
+function buildStaticBooSvg(modelName) {
+  const pal = getModelPalette(modelName);
+  const cRingTop = pal[2] || "#a78bfa";
+  const cRingBot = pal[4] || "#7c3aed";
+  const id = ++_booSvgSeq;
+  return `<svg class="chat-boo-static" viewBox="0 0 36 36" width="48" height="48" aria-hidden="true"><defs><linearGradient id="br-${id}" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="${cRingTop}" stop-opacity="0.72"/><stop offset="100%" stop-color="${cRingBot}" stop-opacity="0.72"/></linearGradient><linearGradient id="bh-${id}" x1="25%" y1="10%" x2="75%" y2="92%"><stop offset="0%" stop-color="#f8f2ff"/><stop offset="100%" stop-color="${pal[1] || "#d6c8f7"}"/></linearGradient></defs><circle cx="18" cy="18" r="13.8" fill="url(#br-${id})"/><circle cx="18" cy="18" r="10.2" fill="url(#bh-${id})"/><ellipse cx="14.6" cy="16.6" rx="1.25" ry="1.8" transform="rotate(-8 14.6 16.6)" fill="#3a3560"/><ellipse cx="21.4" cy="16.6" rx="1.25" ry="1.8" transform="rotate(8 21.4 16.6)" fill="#3a3560"/><path d="M16.1 20.1 Q18 21.8 19.9 20.1" fill="none" stroke="#58537e" stroke-width="1.35" stroke-linecap="round"/></svg>`;
+}
+
+function syncBooState() {
+  if (!welcomeMascot || welcomeMascotKind !== "boo") return;
+  if (typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
+  if (typeof welcomeMascot.setMood === "function") {
+    const activeViewed = (typeof getViewedActiveRun === "function") ? Boolean(getViewedActiveRun("chat")) : busy;
+    welcomeMascot.setMood((activeViewed && appMode === "chat") ? "thinking" : "auto");
+  }
+}
+
 function syncCubeState() {
   if (!welcomeMascot || welcomeMascotKind !== "cube" || typeof welcomeMascot.setState !== "function") return;
   const activeViewed = (typeof getViewedActiveRun === "function") ? Boolean(getViewedActiveRun("project")) : busy;
@@ -7823,6 +9270,19 @@ function _getProjectCubeSlots() {
   return slots;
 }
 
+function _getChatMascotSlots() {
+  const col = document.getElementById("chat-col");
+  if (!col) return [];
+  const slots = [];
+  for (const ch of Array.from(col.children || [])) {
+    if (ch && ch.classList && ch.classList.contains("assistant") && !ch.classList.contains("proj-turn-row") && typeof ch.querySelector === "function") {
+      const s = ch.querySelector(".chat-mascot-slot");
+      if (s) slots.push(s);
+    }
+  }
+  return slots;
+}
+
 function _resizeWelcomeMascot() {
   if (welcomeMascot && typeof welcomeMascot._resize === "function") {
     welcomeMascot._resize();
@@ -7832,6 +9292,26 @@ function _resizeWelcomeMascot() {
       });
     }
   }
+}
+
+function _animateMascotGlide(box, prevRect) {
+  if (!box || !prevRect || prevRect.width <= 0 || typeof box.getBoundingClientRect !== "function" || typeof box.animate !== "function") return;
+  const nextRect = box.getBoundingClientRect();
+  if (!nextRect || nextRect.width <= 0) return;
+  const dx = (prevRect.left + prevRect.width / 2) - (nextRect.left + nextRect.width / 2);
+  const dy = (prevRect.top + prevRect.height / 2) - (nextRect.top + nextRect.height / 2);
+  if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+  const sx = Math.max(0.45, Math.min(2.2, prevRect.width / nextRect.width));
+  const sy = Math.max(0.45, Math.min(2.2, prevRect.height / nextRect.height));
+  try {
+    box.animate([
+      { transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) scale(${sx.toFixed(3)}, ${sy.toFixed(3)})` },
+      { transform: "translate(0px, 0px) scale(1, 1)" },
+    ], {
+      duration: 420,
+      easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+    });
+  } catch (_) {}
 }
 
 function syncMascotDockPosition(isEmpty) {
@@ -7846,31 +9326,53 @@ function syncMascotDockPosition(isEmpty) {
     welcomeMascotKind = "";
   }
   if (!box) return;
-  const slots = _getProjectCubeSlots();
-  const activeSlot = (appMode === "project" && !isEmpty && slots.length) ? slots[slots.length - 1] : null;
+
+  const isProj = appMode === "project";
+  const slots = isProj ? _getProjectCubeSlots() : _getChatMascotSlots();
+  const activeSlot = (!isEmpty && slots.length) ? slots[slots.length - 1] : null;
+
   for (const s of slots) {
     if (s === activeSlot) continue;
     if (!s.contains(box) && (!s.children || !s.children.length)) {
-      s.innerHTML = buildStaticCubeSvg(s.dataset.orchModel || currentModel);
+      s.innerHTML = isProj
+        ? buildStaticCubeSvg(s.dataset.orchModel || currentModel)
+        : buildStaticBooSvg(s.dataset.msgModel || currentModel);
     }
   }
+
   if (activeSlot) {
     if (box.parentElement !== activeSlot) {
+      const prevRect = (typeof box.getBoundingClientRect === "function") ? box.getBoundingClientRect() : null;
       const prevParent = box.parentElement;
       activeSlot.innerHTML = "";
       activeSlot.appendChild(box);
-      if (prevParent && prevParent.classList && prevParent.classList.contains("proj-cube-slot") && prevParent !== activeSlot) {
-        prevParent.innerHTML = buildStaticCubeSvg(prevParent.dataset.orchModel || currentModel);
+      if (prevParent && prevParent !== activeSlot && prevParent.classList) {
+        if (prevParent.classList.contains("proj-cube-slot")) {
+          prevParent.innerHTML = buildStaticCubeSvg(prevParent.dataset.orchModel || currentModel);
+        } else if (prevParent.classList.contains("chat-mascot-slot")) {
+          prevParent.innerHTML = buildStaticBooSvg(prevParent.dataset.msgModel || currentModel);
+        }
+      }
+      if (!isProj && welcomeMascot && welcomeMascotKind === "boo" && typeof welcomeMascot.setRingColors === "function") {
+        const pal = getModelPalette(activeSlot.dataset.msgModel || currentModel);
+        welcomeMascot.setRingColors(pal[3], pal[4]);
       }
       _resizeWelcomeMascot();
+      _animateMascotGlide(box, prevRect);
     }
   } else if (box.parentElement !== welcome) {
+    const prevRect = (typeof box.getBoundingClientRect === "function") ? box.getBoundingClientRect() : null;
     const prevParent = box.parentElement;
     welcome.insertBefore(box, welcome.firstChild);
-    if (prevParent && prevParent.classList && prevParent.classList.contains("proj-cube-slot")) {
-      prevParent.innerHTML = buildStaticCubeSvg(prevParent.dataset.orchModel || currentModel);
+    if (prevParent && prevParent.classList) {
+      if (prevParent.classList.contains("proj-cube-slot")) {
+        prevParent.innerHTML = buildStaticCubeSvg(prevParent.dataset.orchModel || currentModel);
+      } else if (prevParent.classList.contains("chat-mascot-slot")) {
+        prevParent.innerHTML = buildStaticBooSvg(prevParent.dataset.msgModel || currentModel);
+      }
     }
     _resizeWelcomeMascot();
+    _animateMascotGlide(box, prevRect);
   }
 }
 
@@ -7906,8 +9408,8 @@ function initWelcomeMascot() {
       if (typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
       syncCubeLight();
       syncCubeState();
-    } else if (typeof welcomeMascot.setPaused === "function") {
-      welcomeMascot.setPaused(!isEmpty);
+    } else {
+      syncBooState();
     }
     return;
   }
@@ -7944,10 +9446,11 @@ function initWelcomeMascot() {
       ringBottom: pal[4],
     });
     welcomeMascotKind = "boo";
+    syncBooState();
   }
 
   if (welcomeMascot && typeof welcomeMascot.setPaused === "function") {
-    welcomeMascot.setPaused(wantKind === "boo" && !isEmpty);
+    welcomeMascot.setPaused(false);
   }
 }
 
@@ -7968,29 +9471,18 @@ function setEmptyState(isEmpty) {
       el.textContent = activeWelcomeList()[0];
     }
   }
-  if (appMode === "project" && welcomeMascotKind === "cube") {
-    if (isEmpty) {
-      if (!wasEmpty || !qTimer) startQuestionRotation();
-    } else {
-      stopQuestionRotation();
-    }
-    if (welcomeMascot && typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
-    syncCubeState();
-    return;
-  }
-  if (isEmpty && !wasEmpty) {
-    startQuestionRotation();
-    if (welcomeMascot && typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
-  } else if (isEmpty) {
-    if (!qTimer) startQuestionRotation();
-    if (welcomeMascot && typeof welcomeMascot.setPaused === "function") welcomeMascot.setPaused(false);
+  if (isEmpty) {
+    if (!wasEmpty || !qTimer) startQuestionRotation();
   } else {
     stopQuestionRotation();
-    if (welcomeMascot && typeof welcomeMascot.setPaused === "function") {
-      welcomeMascotPauseTimer = setTimeout(() => {
-        if (welcomeMascot) welcomeMascot.setPaused(true);
-      }, 320);
-    }
+  }
+  if (welcomeMascot && typeof welcomeMascot.setPaused === "function") {
+    welcomeMascot.setPaused(false);
+  }
+  if (appMode === "project" && welcomeMascotKind === "cube") {
+    syncCubeState();
+  } else if (welcomeMascotKind === "boo") {
+    syncBooState();
   }
 }
 
@@ -8101,7 +9593,9 @@ function renderMessage(m) {
   row.style.setProperty("--msg-accent", getModelPalette(msgModel)[2]);
   const head = document.createElement("div");
   head.className = "asst-head";
-  head.innerHTML = `<div class="m-mark"><span></span><span></span><span></span><span></span><span></span></div><span class="asst-name"></span>`;
+  head.innerHTML = `<div class="chat-mascot-slot" title="LFM3 mascot (click to poke)"></div><span class="asst-name"></span>`;
+  const mSlot = head.querySelector(".chat-mascot-slot");
+  if (mSlot) mSlot.dataset.msgModel = msgModel;
   head.querySelector(".asst-name").textContent = msgModel;
   if (m.elapsed) {
     const tm = document.createElement("span");
@@ -8130,6 +9624,7 @@ function renderMessage(m) {
   row.appendChild(buildMsgActions(m.text));
 
   col.appendChild(row);
+  if (appMode === "chat") syncMascotDockPosition(false);
   scrollBottom();
   return row;
 }
@@ -8205,7 +9700,7 @@ function applyAppModeUI(reloadList = true) {
     const shownModel = isProj ? getActiveOrchestratorModel() : currentModel;
     welcomeSub.innerHTML = isProj
       ? `Long-Horizon Orchestrator via <b id="welcome-model">${escHtml(shownModel)}</b>`
-      : `Running locally via Ollama <b id="welcome-model">${escHtml(shownModel)}</b>`;
+      : `Running locally via Hugging Face · <b id="welcome-model">${escHtml(shownModel)}</b>`;
   }
   const hint = document.getElementById("composer-hint");
   if (hint) {
@@ -8227,7 +9722,14 @@ function applyAppModeUI(reloadList = true) {
 
 function setAppMode(mode) {
   const next = mode === "project" ? "project" : "chat";
-  if (next === appMode) return;
+  if (next === "project") {
+    rightPanelPrefOpen = true;
+    try { localStorage.setItem("local_agent_right_open", "1"); } catch (_) {}
+  }
+  if (next === appMode) {
+    if (next === "project" && typeof syncRightSidebarVisibility === "function") syncRightSidebarVisibility();
+    return;
+  }
   currentViewToken += 1;
   if (activeStreamFlush) activeStreamFlush();
   stopTtsPlayback();
@@ -8314,9 +9816,13 @@ function newChat() {
 
 async function openProject(id) {
   const viewTok = ++currentViewToken;
+  rightPanelPrefOpen = true;
+  try { localStorage.setItem("local_agent_right_open", "1"); } catch (_) {}
   if (appMode !== "project") {
     appMode = "project";
     applyAppModeUI(false);
+  } else if (typeof syncRightSidebarVisibility === "function") {
+    syncRightSidebarVisibility();
   }
   if (activeStreamFlush) activeStreamFlush();
   stopTtsPlayback();
@@ -8380,8 +9886,7 @@ let folderBrowserPath = "";
 let folderBrowserParent = "";
 
 function closeFolderModal() {
-  const modal = document.getElementById("folder-modal");
-  if (modal) modal.style.display = "none";
+  hideModal("folder-modal");
 }
 
 async function openFolderModal(noticeText = "") {
@@ -8391,7 +9896,7 @@ async function openFolderModal(noticeText = "") {
   if (errEl) errEl.textContent = noticeText || "";
   const mkWrap = document.getElementById("folder-mkdir-row");
   if (mkWrap) mkWrap.style.display = "none";
-  modal.style.display = "flex";
+  showModal("folder-modal");
   await browseFolder(getActiveProjectWorkspace() || "");
 }
 
@@ -9092,6 +10597,7 @@ function syncBusyUI() {
   currentAbort = viewed ? viewed.abortCtrl : null;
   setSendBtnState(busy);
   syncCubeState();
+  syncBooState();
   syncWorkingIndicators();
 }
 
@@ -9627,7 +11133,7 @@ function createChatLiveRow(activeModel, tStart) {
   row.style.setProperty("--msg-accent", pal[2]);
   row.innerHTML = `
     <div class="asst-head">
-      <div class="m-mark"><span></span><span></span><span></span><span></span><span></span></div>
+      <div class="chat-mascot-slot" title="LFM3 mascot (click to poke)"></div>
       <span class="asst-name"></span>
       <span class="asst-time"></span>
     </div>
@@ -9638,8 +11144,11 @@ function createChatLiveRow(activeModel, tStart) {
       <span class="loader-sec">Thinking... 0.0s</span>
     </div>
   `;
+  const mSlot = row.querySelector(".chat-mascot-slot");
+  if (mSlot) mSlot.dataset.msgModel = activeModel;
   row.querySelector(".asst-name").textContent = activeModel;
   col.appendChild(row);
+  if (appMode === "chat") syncMascotDockPosition(false);
   const stepsWrap = row.querySelector(".steps-wrap");
   const loaderEl = row.querySelector(".css-loader");
   const loaderSec = row.querySelector(".loader-sec");
@@ -10210,9 +11719,9 @@ async function openSoul() {
     };
   }
   renderSoulModal();
-  document.getElementById("soul-modal").style.display = "flex";
+  showModal("soul-modal");
 }
-function closeSoul() { document.getElementById("soul-modal").style.display = "none"; }
+function closeSoul() { hideModal("soul-modal"); }
 async function saveSoul() {
   syncCurrentSoulInputs();
   const mode = soulState.mode || (appMode === "project" ? "project" : "chat");
@@ -10326,11 +11835,11 @@ function openChipsModal() {
   const activeList = chipsModalMode === "project" ? projectChips : userChips;
   const list = activeList.length ? activeList : [{ label: "", prompt: "" }];
   for (const c of list) addChipRow(c.label, c.prompt);
-  document.getElementById("chips-modal").style.display = "flex";
+  showModal("chips-modal");
 }
 
 function closeChipsModal() {
-  document.getElementById("chips-modal").style.display = "none";
+  hideModal("chips-modal");
 }
 
 function resetChipRows() {
@@ -10420,7 +11929,8 @@ async function loadSettings() {
     if (data && typeof data === "object") {
       appSettings.default_model = data.default_model || "";
       appSettings.sound = data.sound || "chime";
-      appSettings.max_tool_steps = Number(data.max_tool_steps) || 8;
+      const rawSteps = Number(data.max_tool_steps);
+      appSettings.max_tool_steps = (data.max_tool_steps === 0 || data.max_tool_steps === "0" || rawSteps > 40) ? 0 : (rawSteps || 8);
       appSettings.tts_model = data.tts_model || "lfm3-audio:2b";
       appSettings.tts_voice = data.tts_voice || "";
       appSettings.tts_auto = !!data.tts_auto;
@@ -10444,7 +11954,9 @@ async function loadSettings() {
 
 function updateStepsLabel(v) {
   const el = document.getElementById("set-max-steps-val");
-  if (el) el.textContent = String(v);
+  if (!el) return;
+  const n = Number(v);
+  el.textContent = (n === 0 || n >= 41) ? "Uncapped" : String(n || 8);
 }
 
 function updateProjWorkersLabel(v) {
@@ -10589,16 +12101,17 @@ function openSettings() {
   populateModelSelectOptions(selModel, "Auto (first installed)", appSettings.default_model || "", availableModels);
 
   document.getElementById("set-sound").value = appSettings.sound || "chime";
-  const steps = Number(appSettings.max_tool_steps) || 8;
+  const rawSteps = Number(appSettings.max_tool_steps);
+  const sliderSteps = (appSettings.max_tool_steps === 0 || rawSteps >= 41) ? 41 : (rawSteps || 8);
   const stepsEl = document.getElementById("set-max-steps");
-  if (stepsEl) stepsEl.value = String(steps);
-  updateStepsLabel(steps);
+  if (stepsEl) stepsEl.value = String(sliderSteps);
+  updateStepsLabel(sliderSteps);
 
   const selTts = document.getElementById("set-tts-model");
   if (selTts) {
     selTts.innerHTML = "";
     const curTts = appSettings.tts_model || "lfm3-audio:2b";
-    const ttsOpts = Array.from(new Set(["lfm3-audio:2b", "phonon", "phonon:en", curTts, ...installedModels].filter(Boolean)));
+    const ttsOpts = Array.from(new Set(["system-tts", "lfm3-audio:2b", "phonon", "phonon:en", curTts, ...installedModels].filter(Boolean)));
     for (const m of ttsOpts) {
       const opt = document.createElement("option");
       opt.value = m;
@@ -10614,11 +12127,11 @@ function openSettings() {
   const showChipsEl = document.getElementById("set-show-chips");
   if (showChipsEl) showChipsEl.checked = appSettings.show_prompt_chips !== false;
 
-  document.getElementById("settings-modal").style.display = "flex";
+  showModal("settings-modal");
 }
 
 function closeSettings() {
-  document.getElementById("settings-modal").style.display = "none";
+  hideModal("settings-modal");
 }
 
 function testSound() {
@@ -10632,7 +12145,8 @@ async function saveSettings() {
   const default_model = document.getElementById("set-default-model").value;
   const sound = document.getElementById("set-sound").value;
   const stepsEl = document.getElementById("set-max-steps");
-  const max_tool_steps = stepsEl ? (Number(stepsEl.value) || 8) : 8;
+  const sliderSteps = stepsEl ? (Number(stepsEl.value) || 8) : 8;
+  const max_tool_steps = (sliderSteps >= 41 || sliderSteps <= 0) ? 0 : sliderSteps;
   const ttsEl = document.getElementById("set-tts-model");
   const tts_model = ttsEl ? (ttsEl.value || "lfm3-audio:2b") : "lfm3-audio:2b";
   const voiceEl = document.getElementById("set-tts-voice");
@@ -10775,6 +12289,7 @@ const MODAL_CLOSERS = [
   ["models-modal", closeModelsModal],
   ["files-modal", closeFilesModal],
   ["folder-modal", closeFolderModal],
+  ["confirm-modal", closeConfirmModal],
 ];
 for (const [id, closeFn] of MODAL_CLOSERS) {
   const el = document.getElementById(id);
@@ -10801,8 +12316,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     closePlusMenu();
     for (const [id, closeFn] of MODAL_CLOSERS) {
-      const m = document.getElementById(id);
-      if (m && m.style.display === "flex") closeFn();
+      if (isModalOpen(id)) closeFn();
     }
   }
 });
@@ -10877,8 +12391,9 @@ Promise.allSettled([
 
 def render_web_html() -> bytes:
     ctx_k = f"{NUM_CTX // 1000}k" if NUM_CTX >= 1000 else str(NUM_CTX)
+    initial_model = get_models_info().get("default_model") or DEFAULT_MODEL
     page = (
-        WEB_HTML.replace("__MODEL__", html_lib.escape(DEFAULT_MODEL))
+        WEB_HTML.replace("__MODEL__", html_lib.escape(initial_model))
         .replace("__SOUL_PATH__", html_lib.escape(str(SOUL_FILE)))
         .replace("__CHATS_PATH__", html_lib.escape(str(CHATS_DIR)))
         .replace("__OS_NAME__", html_lib.escape(os_label()))
@@ -10999,6 +12514,14 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/models":
             self.send_json(200, get_models_info())
+            return
+
+        if path == "/api/hf/search":
+            q = (qs.get("q") or [""])[0]
+            try:
+                self.send_json(200, {"results": search_huggingface_gguf(q, limit=10)})
+            except Exception as e:
+                self.send_json(502, {"error": str(e), "results": []})
             return
 
         if path == "/api/chats":
@@ -11241,6 +12764,11 @@ class WebHandler(BaseHTTPRequestHandler):
             self._handle_delete_model(data.get("model", ""))
             return
 
+        if path == "/api/models/unload":
+            unloaded = unload_all_ollama_models()
+            self.send_json(200, {"ok": True, "unloaded": unloaded})
+            return
+
         if path == "/api/soul":
             data = self.read_json()
             mode = str((data or {}).get("mode") or (qs.get("mode") or ["chat"])[0] or "chat")
@@ -11335,7 +12863,8 @@ class WebHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/quit":
-            self.send_json(200, {"ok": True})
+            unloaded = unload_all_ollama_models()
+            self.send_json(200, {"ok": True, "unloaded": unloaded})
             srv = SERVER_REF.get("server")
             if srv is not None:
                 threading.Timer(0.15, srv.shutdown).start()
@@ -11379,7 +12908,11 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Empty message"})
                 return
             msg = raw_msg or "Inspect and summarize the attached file(s)."
-            model = (data.get("model") or DEFAULT_MODEL).strip()
+            running, inst_models = probe_ollama()
+            if not running:
+                try_start_ollama()
+                _, inst_models = probe_ollama()
+            model = resolve_ollama_model((data.get("model") or DEFAULT_MODEL).strip(), inst_models)
             active_packs = parse_active_packs(data)
             tools_enabled = bool(active_packs or attached_files)
             cid = data.get("chat_id") or new_chat_id()
@@ -11520,19 +13053,29 @@ class WebHandler(BaseHTTPRequestHandler):
                 return
 
             st = load_settings()
-            top_model = str(data.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-            orch_model = str(
-                data.get("orchestrator_model")
-                or st.get("project_orchestrator_model")
-                or top_model
-            ).strip() or top_model
-            worker_model = str(
-                data.get("worker_model")
-                or st.get("project_worker_model")
-                or orch_model
-            ).strip() or orch_model
+            running, inst_models = probe_ollama()
+            if not running:
+                try_start_ollama()
+                _, inst_models = probe_ollama()
+            top_model = resolve_ollama_model(str(data.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL, inst_models)
+            orch_model = resolve_ollama_model(
+                str(
+                    data.get("orchestrator_model")
+                    or st.get("project_orchestrator_model")
+                    or top_model
+                ).strip() or top_model,
+                inst_models,
+            )
+            worker_model = resolve_ollama_model(
+                str(
+                    data.get("worker_model")
+                    or st.get("project_worker_model")
+                    or orch_model
+                ).strip() or orch_model,
+                inst_models,
+            )
             raw_pool = data.get("worker_pool") if isinstance(data.get("worker_pool"), list) else st.get("project_worker_pool", [])
-            worker_pool = [str(m).strip() for m in raw_pool if str(m).strip()]
+            worker_pool = [resolve_ollama_model(str(m).strip(), inst_models) for m in raw_pool if str(m).strip()]
             workers_count = normalize_project_workers(data.get("workers_count", st.get("project_workers", 1)))
             proj_ctx = normalize_project_ctx(data.get("num_ctx", st.get("project_num_ctx", NUM_CTX)))
             max_cycles = normalize_project_cycles(data.get("max_review_cycles", st.get("project_max_review_cycles", 1)))
@@ -11681,11 +13224,15 @@ def is_port_in_use_error(err: OSError) -> bool:
     return err.errno in in_use or getattr(err, "winerror", None) == 10048
 
 
+class LocalAgentHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = not IS_WINDOWS
+
+
 def run_web(open_browser: bool = True):
     ensure_chats_dir()
     url = f"http://{WEB_HOST}:{WEB_PORT}"
     try:
-        server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), WebHandler)
+        server = LocalAgentHTTPServer((WEB_HOST, WEB_PORT), WebHandler)
     except OSError as e:
         if is_port_in_use_error(e):
             print(f"Local Agent already running at {url}")
@@ -11695,10 +13242,10 @@ def run_web(open_browser: bool = True):
         raise
 
     SERVER_REF["server"] = server
-    threading.Thread(target=try_start_ollama, daemon=True).start()
 
-    print(f"Local Agent ({os_label()}) running at {url}")
+    print(f"Local Agent ({os_label()} · Hugging Face GGUF Engine) running at {url}")
     print(f"Data directory: {DATA_DIR}")
+    print(f"Models directory: {MODELS_DIR}")
     print("Close this window or press Ctrl+C to stop.")
     if open_browser:
         threading.Timer(0.35, lambda: webbrowser.open(url)).start()
@@ -11707,6 +13254,7 @@ def run_web(open_browser: bool = True):
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
+        unload_all_ollama_models()
         server.server_close()
 
 

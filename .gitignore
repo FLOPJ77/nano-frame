@@ -1,3 +1,6 @@
+models/
+runtime/
+*.part
 chats/
 projects/
 uploads/
